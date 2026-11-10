@@ -586,6 +586,16 @@ $(BUILD_DIR)/test_remote_proto: tests/test_remote_proto.c src/drivers/esp_comm.c
 test-remote-proto: $(BUILD_DIR)/test_remote_proto test-esp-comm
 	$<
 
+# Endpoint flag-clear fix behind the CDC hangs (#39): models the register's
+# write semantics; the vendor macro is the negative control and must lose the
+# completion that lands mid-write.
+.PHONY: test-usb-ept-flags
+$(BUILD_DIR)/test_usb_ept_flags: tests/test_usb_ept_flags.c src/drivers/usb_ept_flags.h | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror $< -o $@
+
+test-usb-ept-flags: $(BUILD_DIR)/test_usb_ept_flags
+	$<
+
 $(BUILD_DIR)/test_scope_timebase: tests/test_scope_timebase.c src/ui/scope_timebase.c src/ui/scope_timebase.h | $(BUILD_DIR)
 	$(HOST_CC) -std=gnu11 -Wall -Wextra -Isrc/ui $< src/ui/scope_timebase.c -lm -o $@
 

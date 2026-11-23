@@ -40,7 +40,13 @@ capture — it never sends its demo trace. `scope --frames N` counts only new ca
 (or `python -m openscope.gui.app`). Live CH1/CH2 traces in raw ADC counts, two cursors (Δt,
 Δcounts), an FFT tab, a meter strip chart with CSV log, device screenshot, and the unit's buttons.
 It follows the unit's mode, shows the frame's trust flags (rate measured or not, uncalibrated),
-and recovers by itself after an unplug. v1 is read-only except button presses. Bench options:
+and recovers by itself after an unplug. "Scope settings" sets run/stop, mode, timebase,
+volts/div per channel and trigger (mode, edge, source, level) through the same commands as
+`openscope set`; the panel shows the state the unit reports back after each set, and a refusal
+appears as a note with its reason. The status bar says STOPPED, and "record taken at …" when
+the shown frame is a held record taken with other settings. Volts include the unit's probe
+setting, which is not on the wire. "Hold scope for screenshot" (on by default) stops the scope
+for the dump and runs it again, so the screenshot passes the CRC. Bench options:
 `--stats CSV` (rates once a second), `--events TXT`, `--meter-log CSV`, `--grab PNG`,
 `--quit-after S`. One reader thread (`gui/worker.py`) owns the port; a 30 Hz timer draws.
 
@@ -59,6 +65,7 @@ python3 tests/test_proto.py        # framing + rejection paths + a mutation
 python3 tests/test_end_to_end.py   # host tool vs the REAL firmware esp_comm.c (compiled into a shim, via ctypes)
 python3 tests/test_gui_worker.py   # GUI reader thread vs a fake Device (needs the gui extra; skipped without)
 python3 tests/test_gui_views.py    # FFT/period helpers, cursor readout, meter CSV (offscreen Qt)
+python3 tests/test_gui_app.py      # the window offscreen: scope settings panel, held-record notes
 ```
 The end-to-end suite checks the §6 acceptance criteria against the firmware's own parser and encoder: `info` shows the live mode and battery and follows a mode change, "no device" is a clean exit 1, button presses reach the injector, a full input queue is a NAK and not a false success, the ASCII shell keeps working next to the protocol, and an abandoned frame does not poison the next request.
 

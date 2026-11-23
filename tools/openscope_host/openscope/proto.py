@@ -371,7 +371,8 @@ class Waveform:
 
     @property
     def volts_per_count(self) -> Optional[float]:
-        """Gain only (bench unit #1, at the BNC, no probe factor); None if unmeasured."""
+        """Gain (bench unit #1) INCLUDING the channel's probe setting, which is not on the
+        wire (C-100, G-280: x10 on CH1 of the bench unit); None if unmeasured."""
         if not self.uv_per_div or not self.counts_per_div:
             return None
         return self.uv_per_div / 1e6 / self.counts_per_div

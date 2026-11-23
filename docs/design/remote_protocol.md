@@ -227,6 +227,8 @@ Existing codes are kept as-is. New codes for remote view/control start at `0x20`
 | `0x27` | `SET_TRIGGER` | `u8 mode`, `u8 edge`, `u8 source`, `i16 level` | mirrors `trigger_state_t` |
 | `0x28` | `SET_METER_MODE` | `u8 submode`, `u8 layout` | submode 0..9, layout 0..3 |
 | `0x29` | `RUN_STOP` | `u8 running` | mirrors `scope_state.running` |
+| `0x2A` | `GET_DESCRIPTION` | — | the unit's tables in one reply (`DESCRIPTION`, §9.1) |
+| `0x2B` | `SET_PROBE` | `u8 channel`, `u8 factor` | channel 1\|2, factor 1\|10; `BAD_ARG` otherwise (§9.1) |
 
 #### Device → host
 
@@ -240,6 +242,7 @@ Existing codes are kept as-is. New codes for remote view/control start at `0x20`
 | `0x91` | `WAVEFORM_FRAME` | see §3.5 |
 | `0x92` | `SCOPE_STATE` | packed `scope_state_t` |
 | `0x93` | `EVENT` | `u8 event_id`, `u8 detail` — mode change, button press, capture armed |
+| `0x94` | `DESCRIPTION` | version + sections (§9.1) |
 
 Add error codes to the existing `ESP_ERR_*` list for `UNSUPPORTED_IN_MODE` and
 `NO_CAPTURE_DATA`. **`NO_CAPTURE_DATA` is the correct reply when `fpga_data_ready()` is false.**
@@ -501,3 +504,66 @@ EXP-61 could not reproduce the wedge on demand (48 MB clean); EXP-66 (PR #48's b
 one two hours into a session — two consecutive lost-completion stalls during an `opread` dump — and the
 heal fired once: the port re-enumerated by itself, no reset, no replug. One occurrence; the wedge's
 mechanism is still open, and PR #48 keeps the triggering stall's snapshot in its own fields.
+
+### 9.1 Device description, probe, remote badge (stage-086)
+
+**`GET_DESCRIPTION` (`0x2A`, no payload) → `DESCRIPTION` (`0x94`).** One reply holds what a
+host needs to show practical values instead of codes. `0x94`, not `0x93`: `0x93` is the
+planned `EVENT` above. Payload, little-endian:
+
+```
+u8   version             1
+then sections to the end of the payload:
+u8   id
+u16  len                 bytes of data that follow
+u8[] data
+```
+
+A host skips a section whose id it does not know, and ignores bytes at the end of a known
+section that it does not read. A later stage appends a section (meter functions, generator)
+without a version change. Sections in version 1 (239 bytes in total):
+
+| id | Section | Data |
+|---|---|---|
+| 1 | timebase | `u16 samples_per_div` (32), `u8 n` (21), then per reg `0x01` code 0..n-1: `u32 sample_rate_hz` (0 = no rate), `u8 tier` |
+| 2 | ranges | `u16 counts_per_div` (32), `u8 n` (10 ranges), `u8 channels` (2), then per channel (CH1 first), per range: `u32 uv_per_div_bnc` (0 = no volts meaning), `u8 tier` |
+| 3 | trigger | `i16 level_min`, `i16 level_max`, `u8 center_code`, `u16 num`, `u16 den`, `u8 code_min`, `u8 code_max`, `i8 record_offset` |
+| 4 | probe | per channel (CH1 first): `u8 factor` (1 or 10) |
+
+Tiers: 0 none, 1 provisional, 2 measured. The encoder zeroes a value whose tier is none and
+sends tier none for a zero value, as in the waveform header. The rates and gains are the
+bench tables of `scope_timebase.c` and `scope_cal.c` (bench unit #1), not rounded.
+Time per division = `samples_per_div / sample_rate_hz`. Volts per division at the BNC =
+`uv_per_div_bnc / 1e6`; at the probe tip, multiply by the probe factor.
+
+Trigger level (`fpga_trigger_code_from_level()`): the UI level is clamped to
+`[level_min, level_max]` (−100..100), then
+
+```
+code = clamp(center_code + trunc(level * num / den), code_min, code_max)
+     = clamp(128 + trunc(level * 256 / 206), 1, 254)      trunc = toward zero (C division)
+```
+
+`code` goes to SPI reg `0x08`. The FPGA compares the ADC with it, and the record carries the
+ADC value minus 28, so the capture fires where the record crosses `code + record_offset`
+(`record_offset` = −28, EXP-55/56). One level step is `num/den` = 1.243 ADC counts, so
+`volts per step = volts_per_div / counts_per_div * num / den`. This is a gain only: the zero
+point is not calibrated, so a level has no absolute volts value.
+
+**`SET_PROBE` (`0x2B`): `u8 channel` (1|2), `u8 factor` (1|10).** Writes the same
+`scope_state` field as the unit's probe menu and the PRM-key cycle; `scope_cal` applies it to
+every volts readout. `BAD_LENGTH` / `BAD_ARG` for a bad request (nothing changes). Like the
+other host sets, it writes no flash itself: the settings store (an append log with a 2 s
+settle window) saves it on the next button press, MENU, or power-off countdown.
+
+**`SCOPE_STATE` append.** Bytes 36..37 are `u8 probe[2]` (CH1, CH2), and the length byte is
+38. The version stays 1: a host reads the length byte and ignores what it does not know, so a
+host from before this append parses the reply unchanged (`test_end_to_end.py` runs the
+stage-085 parser against the new encoder). `uv_per_div` keeps its meaning (the probe is
+included), and from this stage it is exactly `uv_per_div_bnc × probe` of the description; the
+waveform header uses the same number.
+
+**Remote badge.** The status bar shows "PC" while the last valid frame came in less than 3 s
+ago (`esp_comm_host_active()`, `ESP_HOST_ACTIVE_MS`). Shell text and corrupt frames do not
+count. The display loop repaints the badge when that state changes; the 1 s status-bar tick
+also draws it.

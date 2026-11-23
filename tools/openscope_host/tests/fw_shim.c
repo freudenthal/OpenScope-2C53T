@@ -68,7 +68,23 @@ static esp_ctrl_result_t c_tb(uint8_t code) { rec(2, code, 0, 0, 0); if (!ctrl_r
 static esp_ctrl_result_t c_vdiv(uint8_t ch, uint8_t r) { rec(3, ch, r, 0, 0); if (!ctrl_result) cs.ch[ch - 1].vdiv_idx = r; return (esp_ctrl_result_t)ctrl_result; }
 static esp_ctrl_result_t c_trig(uint8_t m, uint8_t e, uint8_t s, int16_t l) { rec(4, m, e, s, l); if (!ctrl_result) { cs.trig_mode = m; cs.trig_edge = e; cs.trig_source = s; cs.trig_level = l; } return (esp_ctrl_result_t)ctrl_result; }
 static esp_ctrl_result_t c_run(bool r) { rec(5, r, 0, 0, 0); if (!ctrl_result) cs.running = r; return (esp_ctrl_result_t)ctrl_result; }
-static const esp_control_ops_t ctrl_ops = { c_get, c_mode, c_tb, c_vdiv, c_trig, c_run };
+/* stage-086: description (fixed tables + the live probe of cs) and SET_PROBE
+ * (which = 6). The probe lives in cs so SCOPE_STATE and DESCRIPTION agree. */
+static esp_description_t ds;
+static void c_desc(esp_description_t *o) { *o = ds; o->probe[0] = cs.ch[0].probe; o->probe[1] = cs.ch[1].probe; }
+static esp_ctrl_result_t c_probe(uint8_t ch, uint8_t f) { rec(6, ch, f, 0, 0); if (!ctrl_result) cs.ch[ch - 1].probe = f; return (esp_ctrl_result_t)ctrl_result; }
+static const esp_control_ops_t ctrl_ops = { c_get, c_mode, c_tb, c_vdiv, c_trig, c_run, c_desc, c_probe };
+void shim_set_desc_rate(int code, uint32_t rate, int tier) { ds.tb_rate_hz[code] = rate; ds.tb_tier[code] = (uint8_t)tier; }
+void shim_set_desc_range(int ch, int r, uint32_t uv, int tier) { ds.uv_per_div_bnc[ch ? 1 : 0][r] = uv; ds.vdiv_tier[ch ? 1 : 0][r] = (uint8_t)tier; }
+void shim_set_scope_probe(int ch, int f) { cs.ch[ch ? 1 : 0].probe = (uint8_t)f; }
+static void desc_init(void)
+{
+    memset(&ds, 0, sizeof ds);
+    ds.samples_per_div = 32; ds.counts_per_div = 32;
+    ds.trig_level_min = -100; ds.trig_level_max = 100; ds.trig_center_code = 128;
+    ds.trig_num = 256; ds.trig_den = 206; ds.trig_code_min = 1; ds.trig_code_max = 254;
+    ds.trig_record_offset = -28;
+}
 void shim_set_ctrl_result(int r) { ctrl_result = r; }
 void shim_set_ctrl_bound(int b) { esp_comm_set_control_provider(b ? &ctrl_ops : 0); }
 int  shim_ctrl_calls(void) { return ctrl_calls; }
@@ -97,6 +113,7 @@ void shim_init(void)
     esp_comm_set_waveform_provider(wave);
     esp_comm_set_control_provider(&ctrl_ops);
     memset(&cs, 0, sizeof cs); memset(last_ctrl, 0, sizeof last_ctrl);
+    cs.ch[0].probe = cs.ch[1].probe = 1; desc_init();
     ctrl_result = 0; ctrl_calls = 0;
     memset(&wv, 0, sizeof wv); wave_state = 1; wave_step = 0;
     meter_ok = 0; meter_wrong = 0; memset(&mt, 0, sizeof mt);

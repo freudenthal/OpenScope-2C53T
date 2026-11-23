@@ -243,6 +243,53 @@ MUTATIONS: tuple[Mutation, ...] = (
         old="        if (!esp_comm_rx_in_frame() && b != ESP_SYNC_BYTE)\n            continue;",
         new="        if (b != ESP_SYNC_BYTE && !esp_comm_rx_in_frame())\n            continue;\n        if (passthrough) passthrough(&b, 1, ctx);",
     ),
+    # ── stage-086: DESCRIPTION, SET_PROBE, SCOPE_STATE probe append, host badge ──
+    Mutation(
+        name="description: tier NONE value sent bare",
+        old="    const bool usable = tier_flag(tier, value, 1, 1) != 0;\n    put_u32(p, usable ? value : 0);",
+        new="    const bool usable = tier_flag(tier, value, 1, 1) != 0;\n    put_u32(p, value);",
+    ),
+    Mutation(
+        name="description: zero value keeps a tier that vouches for it",
+        old="    p[4] = usable ? tier : ESP_TIER_NONE;",
+        new="    p[4] = tier;",
+    ),
+    Mutation(
+        name="description: probe section dropped",
+        old="    p = put_section(p, ESP_DESC_SEC_PROBE, ESP_DESC_PROBE_LEN);\n"
+            "    *p++ = wire_probe(d.probe[0]);\n    *p++ = wire_probe(d.probe[1]);\n",
+        new="",
+    ),
+    Mutation(
+        name="SET_PROBE: factor other than 1/10 accepted",
+        old="        (pkt->payload[1] != 1 && pkt->payload[1] != 10)) {",
+        new="        (pkt->payload[1] == 0)) {",
+    ),
+    Mutation(
+        name="SET_PROBE: channel 0 accepted",
+        old="    if ((pkt->payload[0] != 1 && pkt->payload[0] != 2) ||\n        (pkt->payload[1] != 1",
+        new="    if ((pkt->payload[0] > 2) ||\n        (pkt->payload[1] != 1",
+    ),
+    Mutation(
+        name="SCOPE_STATE: provider probe sent raw",
+        old="    return (factor == 10u) ? 10u : 1u;",
+        new="    return factor;",
+    ),
+    Mutation(
+        name="SCOPE_STATE: probe bytes not appended",
+        old="    out[36] = wire_probe(s.ch[0].probe);        /* stage-086 append */\n",
+        new="",
+    ),
+    Mutation(
+        name="host badge: a valid frame does not start the clock",
+        old="            host_seen = true;               /* the remote badge clock (stage-086) */\n",
+        new="",
+    ),
+    Mutation(
+        name="host badge: never times out",
+        old="    return host_seen && (uint32_t)(now_ms - host_last_ms) < ESP_HOST_ACTIVE_MS;",
+        new="    return host_seen;",
+    ),
 )
 
 

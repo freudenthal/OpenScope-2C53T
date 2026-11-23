@@ -35,6 +35,8 @@ void draw_status_bar(void)
     font_draw_string(120, 2, mode_names[current_mode],
                      th->success, th->status_bar_bg, &font_small);
 
+    status_bar_draw_remote_badge(remote_host_active());
+
     /* Battery status */
     {
         char buf[12];
@@ -74,6 +76,21 @@ void draw_status_bar(void)
             while (1);
         }
     }
+}
+
+/* Remote badge (stage-086): "PC" between the title and the mode name while a
+ * host frame came in less than ESP_HOST_ACTIVE_MS ago. Its own function so the
+ * display loop can repaint it on a change without re-running
+ * draw_status_bar(), whose battery shutdown timer counts calls as seconds. */
+#define REMOTE_BADGE_X  92
+#define REMOTE_BADGE_W  24
+void status_bar_draw_remote_badge(bool on)
+{
+    const theme_t *th = theme_get();
+    lcd_fill_rect(REMOTE_BADGE_X, 0, REMOTE_BADGE_W, 16, th->status_bar_bg);
+    if (on)
+        font_draw_string(REMOTE_BADGE_X + 4, 2, "PC", th->warning, th->status_bar_bg,
+                         &font_small);
 }
 
 /* Force full redraw on next status bar update (call on theme/mode change) */

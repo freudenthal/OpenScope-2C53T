@@ -47,6 +47,7 @@ extern void system_clock_config(void);
 #include "fault.h"
 #include "redraw_gate.h"
 #include "scope_mask.h"
+#include "esp_comm.h"
 
 /* ═══════════════════════════════════════════════════════════════════
  * Global State (extern'd via ui.h for UI modules)
@@ -294,10 +295,13 @@ static uint32_t info_bar_epoch(void)
         const scope_state_t *s = scope_state_get();
         h = redraw_epoch_mix(h, (uint32_t)scope_view);
         h = redraw_epoch_mix(h, (uint32_t)s->trigger.mode | ((uint32_t)s->timebase_idx << 8));
+        /* probe: the volts/div labels include it (a host SET_PROBE, stage-086) */
         h = redraw_epoch_mix(h, (uint32_t)s->ch1.enabled | ((uint32_t)s->ch1.vdiv_idx << 1)
-                                | ((uint32_t)s->ch1.coupling << 8));
+                                | ((uint32_t)s->ch1.coupling << 8)
+                                | ((uint32_t)s->ch1.probe << 12));
         h = redraw_epoch_mix(h, (uint32_t)s->ch2.enabled | ((uint32_t)s->ch2.vdiv_idx << 1)
-                                | ((uint32_t)s->ch2.coupling << 8));
+                                | ((uint32_t)s->ch2.coupling << 8)
+                                | ((uint32_t)s->ch2.probe << 12));
 #ifdef FEATURE_FFT
         const fft_config_t *cfg = fft_get_config();
         if (cfg)
@@ -635,6 +639,18 @@ static void vDisplayTask(void *pvParameters)
                 g_info_bar_epoch = ib;
             }
         }
+        /* Remote badge (stage-086). The status bar has no epoch gate (it
+         * repaints on the 1 s tick), so the badge state is its own one-bit
+         * epoch here: it shows on the first host frame and clears within one
+         * loop tick of the 3 s timeout, not on the next second. */
+        {
+            static bool g_remote_badge;
+            const bool rb = remote_host_active();
+            if (rb != g_remote_badge) {
+                status_bar_draw_remote_badge(rb);
+                g_remote_badge = rb;
+            }
+        }
         if (current_mode == MODE_OSCILLOSCOPE) {
             const scope_state_t *ss_anim = scope_state_get();
             /* Mask pass/fail readout (badge row 2, below the live band): its
@@ -840,6 +856,12 @@ static float probe_factor_from_state(uint8_t ch)
     const scope_state_t *ss = scope_state_get();
     const channel_state_t *c = (ch == 2u) ? &ss->ch2 : &ss->ch1;
     return (c->probe == PROBE_10X) ? 10.0f : 1.0f;
+}
+
+bool remote_host_active(void)
+{
+    /* Same clock usb_debug.c gives esp_comm_route(). */
+    return esp_comm_host_active((uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
 bool input_inject_button(button_id_t b)

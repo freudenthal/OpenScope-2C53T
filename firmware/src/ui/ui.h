@@ -182,6 +182,9 @@ extern fft_result_t     fft_result;
 /* status_bar.c */
 void draw_status_bar(void);
 void status_bar_invalidate(void);
+/* "PC" while a host drives the unit over the link (stage-086). */
+void status_bar_draw_remote_badge(bool on);
+bool remote_host_active(void);          /* main.c: a valid frame < 3 s ago */
 void draw_info_bar(void);
 void draw_splash(void);
 

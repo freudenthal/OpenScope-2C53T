@@ -62,6 +62,9 @@ def lib():
         L.shim_last_ctrl.argtypes = [ctypes.c_int]
         L.shim_set_scope_state.argtypes = [ctypes.c_int] * 5 + [ctypes.c_uint32] + [ctypes.c_int] * 5
         L.shim_set_scope_channel.argtypes = [ctypes.c_int] * 4 + [ctypes.c_uint32]
+        L.shim_set_desc_rate.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_int]
+        L.shim_set_desc_range.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_int]
+        L.shim_set_scope_probe.argtypes = [ctypes.c_int, ctypes.c_int]
         _LIB = L
     return _LIB
 
@@ -835,6 +838,126 @@ class TestControlSurface(unittest.TestCase):
         dev.set_timebase(0x11)
         self.assertEqual(dev.link.L.shim_ctrl_calls(), 2)          # applied twice, same state
         self.assertEqual(dev.scope_state().timebase_code, 0x11)
+
+
+def desc_device():
+    dev = ctl_device()
+    L = dev.link.L
+    L.shim_set_desc_rate(0x10, 12490, 2)
+    L.shim_set_desc_rate(0x0D, 119678, 1)
+    L.shim_set_desc_rate(0x08, 7777, 0)                 # tier NONE: must arrive as no rate
+    L.shim_set_desc_range(0, 6, 1342188, 2)
+    L.shim_set_desc_range(1, 8, 27905, 1)
+    L.shim_set_desc_range(0, 2, 5555, 0)                # tier NONE: no volts meaning
+    L.shim_set_scope_probe(0, 10)
+    return dev
+
+
+def stage085_proto():
+    """The stage-085 library's proto.py, from git: what an old host runs."""
+    src = subprocess.run(["git", "-C", ROOT, "show", "adca54a:tools/openscope_host/openscope/proto.py"],
+                         capture_output=True, text=True, check=True).stdout
+    mod = type(sys)("proto_stage085")
+    sys.modules[mod.__name__] = mod             # dataclasses look the module up
+    try:
+        exec(compile(src, "proto_stage085.py", "exec"), mod.__dict__)
+    finally:
+        del sys.modules[mod.__name__]
+    return mod
+
+
+class TestDescription(unittest.TestCase):
+    """stage-086 against the real esp_comm.c: DESCRIPTION, SET_PROBE, SCOPE_STATE probe."""
+
+    def test_description_round_trips_through_the_firmware_encoder(self):
+        d = desc_device().description()
+        self.assertEqual((d.samples_per_div, d.counts_per_div, len(d.rates)), (32, 32, 21))
+        self.assertEqual(d.sample_rate(0x10), 12490)
+        self.assertEqual(d.tier("timebase", 0x0D), "provisional")
+        self.assertIsNone(d.sample_rate(0x08))
+        self.assertEqual(d.tier("timebase", 0x08), "none")
+        self.assertEqual(d.uv_per_div_bnc(1, 6), 1342188)
+        self.assertEqual(d.tier("range", 2, 8), "provisional")
+        self.assertIsNone(d.volts_per_div(1, 2))
+        self.assertEqual(d.probe, (10, 1))
+        self.assertAlmostEqual(d.volts_per_div(1, 6), 13.42188)
+        self.assertEqual((d.trigger.code(0), d.trigger.code(-100), d.trigger.record_offset), (128, 4, -28))
+        self.assertEqual(d.skipped, ())
+
+    def test_description_is_cached_per_connection(self):
+        dev = desc_device()
+        calls = []
+        real = dev.request
+        dev.request = lambda cmd, *a, **k: (calls.append(cmd), real(cmd, *a, **k))[1]
+        dev.description()
+        dev.description()
+        self.assertEqual(calls.count(proto.CMD_GET_DESCRIPTION), 1)
+        dev.description(refresh=True)
+        self.assertEqual(calls.count(proto.CMD_GET_DESCRIPTION), 2)
+        dev.set_probe(1, 1)                              # probe section now stale
+        self.assertEqual(dev.description().probe, (1, 1))
+        self.assertEqual(calls.count(proto.CMD_GET_DESCRIPTION), 3)
+
+    def test_set_probe_reaches_the_provider_and_shows_in_state(self):
+        dev = desc_device()
+        L = dev.link.L
+        dev.set_probe(2, 10)
+        self.assertEqual([L.shim_last_ctrl(i) for i in range(3)], [6, 2, 10])
+        self.assertEqual(dev.scope_state().probe, (10, 10))
+        dev.set_probe(1, 1)
+        self.assertEqual(dev.scope_state().probe, (1, 10))
+
+    def test_bad_probe_is_bad_arg_and_the_provider_is_not_called(self):
+        dev = desc_device()
+        for payload in (b"\x00\x01", b"\x03\x0a", b"\x01\x02", b"\x02\x00", b"\x01\x64"):
+            with self.assertRaises(Nak) as cm:
+                dev.request(proto.CMD_SET_PROBE, payload)
+            self.assertEqual(proto.ERRORS[cm.exception.code], "BAD_ARG")
+        for cmd, payload in ((proto.CMD_SET_PROBE, b"\x01"), (proto.CMD_GET_DESCRIPTION, b"\x00")):
+            with self.assertRaises(Nak) as cm:
+                dev.request(cmd, payload)
+            self.assertEqual(proto.ERRORS[cm.exception.code], "BAD_LENGTH")
+        self.assertEqual(dev.link.L.shim_ctrl_calls(), 0)
+
+    def test_old_host_still_parses_the_new_scope_state(self):
+        old = stage085_proto()
+        dev = desc_device()
+        raw = dev.request(proto.CMD_GET_SCOPE_STATE, expect=(proto.RSP_SCOPE_STATE,)).payload
+        self.assertEqual(len(raw), 38)
+        s = old.parse_scope_state(raw)
+        self.assertEqual((s.timebase_code, s.ch[0].uv_per_div, s.trig_code), (0x10, 42950, 0x5A))
+        self.assertFalse(hasattr(s, "probe"))
+
+    def test_cli_describe_table(self):
+        rc, out, _ = run_cli(desc_device(), ["describe"])
+        self.assertEqual(rc, 0)
+        lines = out.splitlines()
+        row10 = next(x for x in lines if x.rstrip().endswith("0x10"))
+        self.assertIn("2.56 ms", row10)
+        self.assertIn("12490 S/s", row10)
+        self.assertIn("measured", row10)
+        row08 = next(x for x in lines if x.rstrip().endswith("0x08"))
+        self.assertIn("not calibrated", row08)
+        self.assertEqual(sum(1 for x in lines if x.rstrip()[-4:-2] == "0x"), 21)    # every code
+        ch1r6 = next(x for x in lines if x.startswith("  CH1") and x.rstrip().endswith(" 6"))
+        self.assertIn("1.34 V", ch1r6)                   # at the BNC
+        self.assertIn("13.4 V (x10)", ch1r6)             # at the probe
+        self.assertEqual(sum(1 for x in lines if x.startswith("  CH")), 20)          # every range
+        self.assertIn("trunc(level*256/206)", out)
+        self.assertIn("probe     CH1 x10, CH2 x1", out)
+
+    def test_cli_set_probe_and_state_prints_it(self):
+        dev = desc_device()
+        rc, out, _ = run_cli(dev, ["set", "probe", "1", "1"])
+        self.assertEqual(rc, 0)
+        self.assertIn("probe x1", out.splitlines()[2])
+        rc, out, _ = run_cli(dev, ["state"])
+        self.assertIn("CH1       on , range 6, 42.95 mV/div (measured, bench unit #1), probe x1", out)
+        for argv in (["set", "probe", "1", "2"], ["set", "probe", "3", "10"], ["set", "probe", "1"]):
+            rc, _, _ = run_cli(dev, argv)
+            self.assertEqual(rc, cli.EXIT_USAGE, argv)
+        self.assertEqual(dev.link.L.shim_last_ctrl(0), 6)
+        self.assertEqual(dev.link.L.shim_ctrl_calls(), 1)
 
 
 if __name__ == "__main__":

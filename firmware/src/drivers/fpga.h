@@ -1112,6 +1112,17 @@ bool    fpga_apply_timebase(uint8_t code);
  * the UI's -100..100 and record the code in force. Same park contract. */
 bool    fpga_apply_trigger_level(int level);
 uint8_t fpga_trigger_code_from_level(int level);
+/* The level->code relation, as constants so the remote DESCRIPTION (stage-086)
+ * reports the same numbers the function uses:
+ *   code = clamp(CENTER + trunc(level * NUM / DEN), CODE_MIN, CODE_MAX),
+ *   level clamped to +/-LEVEL_LIMIT first. NUM/DEN: 256 codes over the 206 px
+ *   plot height the UI level was first defined in. */
+#define FPGA_TRIG_LEVEL_LIMIT   100
+#define FPGA_TRIG_CENTER_CODE   128
+#define FPGA_TRIG_LEVEL_NUM     256
+#define FPGA_TRIG_LEVEL_DEN     206
+#define FPGA_TRIG_CODE_MIN      1
+#define FPGA_TRIG_CODE_MAX      254
 uint8_t fpga_acq_trig_code_get(void);
 bool    fpga_acq_auto_wait_is_override(void);
 void     fpga_acq_pair_gap_set(uint16_t ms);

@@ -33,6 +33,8 @@ static uint8_t rx_checksum_acc = 0;
  * inter-byte gap timeout, so a lying length cannot deafen the shell. */
 static uint32_t rx_discard = 0;
 static uint32_t rx_last_ms = 0;
+static bool host_seen = false;         /* a valid frame arrived since init */
+static uint32_t host_last_ms = 0;      /* ... at this esp_comm_route() time */
 static esp_rx_stats_t rx_stats;
 
 typedef enum {
@@ -91,6 +93,7 @@ void esp_comm_init(void)
 {
     rx_state = RX_WAIT_SYNC;
     rx_discard = 0;
+    host_seen = false;
     memset(&rx_stats, 0, sizeof(rx_stats));
     memset(&rx_packet, 0, sizeof(rx_packet));
 #if ESP_COMM_TRANSFER_STUBS
@@ -260,7 +263,11 @@ void esp_comm_route(const uint8_t *data, uint16_t len, uint32_t now_ms,
 
         rx_last_ms = now_ms;
         switch (rx_step(b)) {
-        case RX_PACKET:       esp_comm_process(&rx_packet); break;
+        case RX_PACKET:
+            host_seen = true;               /* the remote badge clock (stage-086) */
+            host_last_ms = now_ms;
+            esp_comm_process(&rx_packet);
+            break;
         case RX_BAD_CHECKSUM: esp_comm_send_nak(ESP_ERR_BAD_CHECKSUM); break;
         case RX_BAD_LENGTH:   esp_comm_send_nak(ESP_ERR_BAD_LENGTH); break;
         case RX_NONE:         break;
@@ -268,6 +275,11 @@ void esp_comm_route(const uint8_t *data, uint16_t len, uint32_t now_ms,
     }
     if (len > run_start && passthrough)
         passthrough(data + run_start, (uint16_t)(len - run_start), ctx);
+}
+
+bool esp_comm_host_active(uint32_t now_ms)
+{
+    return host_seen && (uint32_t)(now_ms - host_last_ms) < ESP_HOST_ACTIVE_MS;
 }
 
 const esp_packet_t *esp_comm_get_packet(void)
@@ -613,6 +625,13 @@ static void put_scope_channel(uint8_t *p, const esp_scope_channel_t *c)
     put_u32(&p[4], usable ? c->uv_per_div : 0);
 }
 
+/* 1 or 10 on the wire; anything else from a provider is not a probe setting
+ * this link knows, and 1 is the factor that leaves uv_per_div unscaled. */
+static uint8_t wire_probe(uint8_t factor)
+{
+    return (factor == 10u) ? 10u : 1u;
+}
+
 static void handle_get_scope_state(const esp_packet_t *pkt)
 {
     esp_scope_state_t s;
@@ -641,7 +660,85 @@ static void handle_get_scope_state(const esp_packet_t *pkt)
     put_u16(&out[18], s.counts_per_div);
     put_scope_channel(&out[20], &s.ch[0]);
     put_scope_channel(&out[28], &s.ch[1]);
+    out[36] = wire_probe(s.ch[0].probe);        /* stage-086 append */
+    out[37] = wire_probe(s.ch[1].probe);
     esp_comm_send_response(ESP_RSP_SCOPE_STATE, out, ESP_SCOPE_STATE_LEN);
+}
+
+/* ─── Device description (stage-086) — layout in esp_comm.h ─── */
+
+/* One (value, tier) pair with the link's guard: a value its tier disowns is
+ * zeroed, and a zero value is never sent with a tier that vouches for it. */
+static uint8_t *put_tiered(uint8_t *p, uint32_t value, uint8_t tier)
+{
+    const bool usable = tier_flag(tier, value, 1, 1) != 0;
+    put_u32(p, usable ? value : 0);
+    p[4] = usable ? tier : ESP_TIER_NONE;
+    return p + 5;
+}
+
+static uint8_t *put_section(uint8_t *p, uint8_t id, uint16_t len)
+{
+    p[0] = id;
+    put_u16(&p[1], len);
+    return p + 3;
+}
+
+static void handle_get_description(const esp_packet_t *pkt)
+{
+    esp_description_t d;
+    uint8_t out[ESP_DESCRIPTION_LEN];
+    uint8_t *p = out;
+    unsigned i, c;
+
+    if (!ctrl_len_ok(pkt, 0, control_ops && control_ops->get_description))
+        return;
+    memset(&d, 0, sizeof(d));
+    control_ops->get_description(&d);
+
+    *p++ = ESP_DESCRIPTION_VERSION;
+
+    p = put_section(p, ESP_DESC_SEC_TIMEBASE, ESP_DESC_TB_LEN);
+    put_u16(p, d.samples_per_div); p += 2;
+    *p++ = ESP_TIMEBASE_CODES;
+    for (i = 0; i < ESP_TIMEBASE_CODES; i++)
+        p = put_tiered(p, d.tb_rate_hz[i], d.tb_tier[i]);
+
+    p = put_section(p, ESP_DESC_SEC_RANGES, ESP_DESC_RANGES_LEN);
+    put_u16(p, d.counts_per_div); p += 2;
+    *p++ = ESP_VDIV_RANGES;
+    *p++ = 2;
+    for (c = 0; c < 2; c++)
+        for (i = 0; i < ESP_VDIV_RANGES; i++)
+            p = put_tiered(p, d.uv_per_div_bnc[c][i], d.vdiv_tier[c][i]);
+
+    p = put_section(p, ESP_DESC_SEC_TRIGGER, ESP_DESC_TRIGGER_LEN);
+    put_i16(p, d.trig_level_min); p += 2;
+    put_i16(p, d.trig_level_max); p += 2;
+    *p++ = d.trig_center_code;
+    put_u16(p, d.trig_num); p += 2;
+    put_u16(p, d.trig_den); p += 2;
+    *p++ = d.trig_code_min;
+    *p++ = d.trig_code_max;
+    *p++ = (uint8_t)d.trig_record_offset;
+
+    p = put_section(p, ESP_DESC_SEC_PROBE, ESP_DESC_PROBE_LEN);
+    *p++ = wire_probe(d.probe[0]);
+    *p++ = wire_probe(d.probe[1]);
+
+    esp_comm_send_response(ESP_RSP_DESCRIPTION, out, (uint16_t)(p - out));
+}
+
+static void handle_set_probe(const esp_packet_t *pkt)
+{
+    if (!ctrl_len_ok(pkt, 2, control_ops && control_ops->set_probe))
+        return;
+    if ((pkt->payload[0] != 1 && pkt->payload[0] != 2) ||
+        (pkt->payload[1] != 1 && pkt->payload[1] != 10)) {
+        esp_comm_send_nak(ESP_ERR_BAD_ARG);
+        return;
+    }
+    ctrl_reply(control_ops->set_probe(pkt->payload[0], pkt->payload[1]));
 }
 
 static void handle_set_mode(const esp_packet_t *pkt)
@@ -904,6 +1001,8 @@ void esp_comm_process(const esp_packet_t *pkt)
     case ESP_CMD_SET_VDIV:          handle_set_vdiv(pkt); break;
     case ESP_CMD_SET_TRIGGER:       handle_set_trigger(pkt); break;
     case ESP_CMD_RUN_STOP:          handle_run_stop(pkt); break;
+    case ESP_CMD_GET_DESCRIPTION:   handle_get_description(pkt); break;
+    case ESP_CMD_SET_PROBE:         handle_set_probe(pkt); break;
 #if ESP_COMM_TRANSFER_STUBS
     /* ESP32 co-processor staging. The flash writes are still TODO, so these
      * are compiled only where that is understood (the legacy flow tests). */

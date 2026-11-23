@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 SYNC = 0xAA
 HEADER_LEN = 4
@@ -37,6 +37,8 @@ CMD_SET_TIMEBASE = 0x25
 CMD_SET_VDIV = 0x26
 CMD_SET_TRIGGER = 0x27
 CMD_RUN_STOP = 0x29
+CMD_GET_DESCRIPTION = 0x2A     # stage-086
+CMD_SET_PROBE = 0x2B
 
 # Device -> host
 RSP_ACK = 0x81
@@ -46,6 +48,7 @@ RSP_STATUS = 0x85
 RSP_METER_FRAME = 0x90
 RSP_WAVEFORM_FRAME = 0x91
 RSP_SCOPE_STATE = 0x92
+RSP_DESCRIPTION = 0x94
 
 ERRORS = {
     0x01: "UNKNOWN_CMD",
@@ -496,6 +499,8 @@ SCOPE_STATE_VERSION = 1
 SCOPE_STATE_FIXED = struct.Struct("<BBBBBBBBBBhIBBH")   # 20 bytes up to counts_per_div
 SCOPE_CHANNEL = struct.Struct("<BBBBI")                 # 8 bytes per channel
 SCOPE_STATE_LEN = SCOPE_STATE_FIXED.size + 2 * SCOPE_CHANNEL.size     # 36
+SCOPE_STATE_PROBE_OFS = SCOPE_STATE_LEN    # stage-086 append: u8 probe[2] at 36..37
+PROBE_FACTORS = (1, 10)
 
 
 def _lookup(table: dict, value, what: str) -> int:
@@ -544,6 +549,14 @@ def payload_run_stop(running: bool) -> bytes:
     return bytes([1 if running else 0])
 
 
+def payload_set_probe(channel: int, factor: int) -> bytes:
+    if channel not in (1, 2):
+        raise ValueError(f"channel {channel!r}: 1 or 2")
+    if factor not in PROBE_FACTORS:
+        raise ValueError(f"probe factor {factor!r}: 1 or 10")
+    return bytes([channel, factor])
+
+
 @dataclass(frozen=True)
 class ScopeChannel:
     enabled: bool
@@ -573,6 +586,7 @@ class ScopeState:
     trig_code: int                  # reg 0x08 in force
     counts_per_div: int
     ch: tuple                       # (ScopeChannel CH1, ScopeChannel CH2)
+    probe: Optional[tuple] = None   # (CH1, CH2) factor 1|10; None = firmware before stage-086
 
     @property
     def mode_name(self) -> str:
@@ -614,8 +628,217 @@ def parse_scope_state(payload: bytes) -> ScopeState:
     for i in range(2):
         en, vd, tier, _r, uv = SCOPE_CHANNEL.unpack_from(payload, SCOPE_STATE_FIXED.size + i * SCOPE_CHANNEL.size)
         chans.append(ScopeChannel(bool(en), vd, tier, uv))
+    probe = None
+    if length >= SCOPE_STATE_PROBE_OFS + 2:     # appended fields: read only what is there
+        probe = (payload[SCOPE_STATE_PROBE_OFS], payload[SCOPE_STATE_PROBE_OFS + 1])
     return ScopeState(ver, mode, bool(running), tb_idx, tb_code, tb_tier, tmode, tedge, tsrc,
-                      tlevel, rate, tcode, cpd, tuple(chans))
+                      tlevel, rate, tcode, cpd, tuple(chans), probe)
+
+
+# ── Device description (stage-086): GET_DESCRIPTION -> 0x94 ───────────────
+# Layout: firmware/src/drivers/esp_comm.h ("Device description"). Version byte,
+# then sections (u8 id, u16 len, data). An unknown section id is skipped, so
+# later firmware can append sections without a version change.
+DESCRIPTION_VERSION = 1
+DESC_SEC_TIMEBASE, DESC_SEC_RANGES, DESC_SEC_TRIGGER, DESC_SEC_PROBE = 1, 2, 3, 4
+_DESC_ENTRY = struct.Struct("<IB")          # u32 value, u8 tier
+_DESC_TRIGGER = struct.Struct("<hhBHHBBb")  # 12 bytes
+
+
+@dataclass(frozen=True)
+class TriggerScale:
+    """How the UI level (-100..100) becomes the reg 0x08 code, as the
+    firmware computes it (fpga_trigger_code_from_level())."""
+    level_min: int
+    level_max: int
+    center_code: int
+    num: int
+    den: int
+    code_min: int
+    code_max: int
+    record_offset: int              # the capture fires where the record crosses code + this
+
+    def code(self, level: int) -> int:
+        level = max(self.level_min, min(self.level_max, int(level)))
+        q = abs(level * self.num) // self.den          # C division truncates toward zero
+        c = self.center_code + (q if level >= 0 else -q)
+        return max(self.code_min, min(self.code_max, c))
+
+    def record_counts(self, level: int) -> int:
+        """ADC count, in record units, where a capture at this level fires."""
+        return self.code(level) + self.record_offset
+
+    @property
+    def counts_per_level(self) -> float:
+        return self.num / self.den
+
+
+@dataclass(frozen=True)
+class Description:
+    """The unit's fixed tables, in one request. Volts are at the BNC: the
+    probe factor is a separate field and is applied by volts_per_div()."""
+    version: int
+    samples_per_div: Optional[int] = None
+    rates: Tuple[Tuple[int, int], ...] = ()          # per reg 0x01 code: (rate Hz or 0, tier)
+    counts_per_div: Optional[int] = None
+    ranges: Tuple[Tuple[Tuple[int, int], ...], ...] = ()   # [channel][range]: (uV/div BNC or 0, tier)
+    trigger: Optional[TriggerScale] = None
+    probe: Optional[Tuple[int, ...]] = None          # per channel, factor 1|10
+    skipped: Tuple[int, ...] = ()                    # section ids this tool does not know
+
+    def sample_rate(self, code: int) -> Optional[int]:
+        if 0 <= code < len(self.rates) and self.rates[code][0]:
+            return self.rates[code][0]
+        return None
+
+    def time_per_div(self, code: int) -> Optional[float]:
+        """Seconds per screen division at this timebase code; None = no rate."""
+        rate = self.sample_rate(code)
+        if rate is None or not self.samples_per_div:
+            return None
+        return self.samples_per_div / rate
+
+    def uv_per_div_bnc(self, channel: int, range_idx: int) -> Optional[int]:
+        if 1 <= channel <= len(self.ranges) and 0 <= range_idx < len(self.ranges[channel - 1]):
+            uv = self.ranges[channel - 1][range_idx][0]
+            return uv or None
+        return None
+
+    def probe_factor(self, channel: int) -> int:
+        if self.probe and 1 <= channel <= len(self.probe):
+            return self.probe[channel - 1]
+        return 1
+
+    def volts_per_div(self, channel: int, range_idx: int, probe: Optional[int] = None) -> Optional[float]:
+        """Volts per division at the probe tip. probe=None uses the factor the
+        unit reported with this description (it can change later: pass the
+        SCOPE_STATE probe for a live value). None = no volts meaning."""
+        uv = self.uv_per_div_bnc(channel, range_idx)
+        if uv is None:
+            return None
+        return uv * (self.probe_factor(channel) if probe is None else probe) / 1e6
+
+    def volts_per_level(self, channel: int, range_idx: int, probe: Optional[int] = None) -> Optional[float]:
+        """Volts per trigger-level step (a gain only: the zero point is
+        uncalibrated, so a level has no absolute volts)."""
+        v = self.volts_per_div(channel, range_idx, probe)
+        if v is None or self.trigger is None or not self.counts_per_div:
+            return None
+        return v / self.counts_per_div * self.trigger.counts_per_level
+
+    def tier(self, what: str, *idx: int) -> str:
+        """tier("timebase", code) or tier("range", channel, range) -> name."""
+        try:
+            if what == "timebase":
+                t = self.rates[idx[0]][1]
+            elif what == "range":
+                t = self.ranges[idx[0] - 1][idx[1]][1]
+            else:
+                raise ValueError(f"tier of {what!r}: 'timebase' or 'range'")
+        except IndexError:
+            return "none"
+        return TIERS.get(t, f"?{t}")
+
+
+def _entries(data: bytes, ofs: int, n: int, what: str):
+    if ofs + n * _DESC_ENTRY.size > len(data):
+        raise ProtocolError(f"DESCRIPTION {what} section: {n} entries do not fit in {len(data)} B")
+    out = []
+    for i in range(n):
+        v, t = _DESC_ENTRY.unpack_from(data, ofs + i * _DESC_ENTRY.size)
+        if t == 0:
+            v = 0                   # a value its tier disowns is no value (the firmware zeroes it too)
+        out.append((v, t))
+    return tuple(out)
+
+
+def parse_description(payload: bytes) -> Description:
+    if not payload:
+        raise ProtocolError("DESCRIPTION is empty")
+    ver = payload[0]
+    if ver != DESCRIPTION_VERSION:
+        raise ProtocolError(f"DESCRIPTION v{ver}, this tool reads v{DESCRIPTION_VERSION}")
+    f = {"version": ver}
+    skipped = []
+    pos = 1
+    while pos < len(payload):
+        if pos + 3 > len(payload):
+            raise ProtocolError(f"DESCRIPTION: truncated section header at byte {pos}")
+        sid = payload[pos]
+        slen = struct.unpack_from("<H", payload, pos + 1)[0]
+        data = payload[pos + 3:pos + 3 + slen]
+        if len(data) != slen:
+            raise ProtocolError(f"DESCRIPTION section {sid}: {slen} B announced, {len(data)} B left")
+        pos += 3 + slen
+        # Inside a known section, fields past the ones read here are ignored
+        # (append rule, as for the waveform header and SCOPE_STATE).
+        if sid == DESC_SEC_TIMEBASE:
+            if slen < 3:
+                raise ProtocolError("DESCRIPTION timebase section too short")
+            spd, n = struct.unpack_from("<HB", data)
+            f["samples_per_div"] = spd
+            f["rates"] = _entries(data, 3, n, "timebase")
+        elif sid == DESC_SEC_RANGES:
+            if slen < 4:
+                raise ProtocolError("DESCRIPTION ranges section too short")
+            cpd, n, nch = struct.unpack_from("<HBB", data)
+            f["counts_per_div"] = cpd
+            flat = _entries(data, 4, n * nch, "ranges")
+            f["ranges"] = tuple(flat[c * n:(c + 1) * n] for c in range(nch))
+        elif sid == DESC_SEC_TRIGGER:
+            if slen < _DESC_TRIGGER.size:
+                raise ProtocolError("DESCRIPTION trigger section too short")
+            t = TriggerScale(*_DESC_TRIGGER.unpack_from(data))
+            if t.den == 0:
+                raise ProtocolError("DESCRIPTION trigger scale has den 0")
+            f["trigger"] = t
+        elif sid == DESC_SEC_PROBE:
+            f["probe"] = tuple(data)
+        else:
+            skipped.append(sid)
+    f["skipped"] = tuple(skipped)
+    return Description(**f)
+
+
+def encode_description(d: Description) -> bytes:
+    """The inverse of parse_description() (tests, and a reference for the
+    layout). Sections that are None/empty are left out."""
+    out = bytearray([d.version])
+
+    def section(sid: int, data: bytes) -> None:
+        out.extend(struct.pack("<BH", sid, len(data)))
+        out.extend(data)
+
+    if d.samples_per_div is not None:
+        section(DESC_SEC_TIMEBASE, struct.pack("<HB", d.samples_per_div, len(d.rates))
+                + b"".join(_DESC_ENTRY.pack(v, t) for v, t in d.rates))
+    if d.counts_per_div is not None:
+        n = len(d.ranges[0]) if d.ranges else 0
+        section(DESC_SEC_RANGES, struct.pack("<HBB", d.counts_per_div, n, len(d.ranges))
+                + b"".join(_DESC_ENTRY.pack(v, t) for ch in d.ranges for v, t in ch))
+    if d.trigger is not None:
+        t = d.trigger
+        section(DESC_SEC_TRIGGER, _DESC_TRIGGER.pack(t.level_min, t.level_max, t.center_code,
+                                                     t.num, t.den, t.code_min, t.code_max,
+                                                     t.record_offset))
+    if d.probe is not None:
+        section(DESC_SEC_PROBE, bytes(d.probe))
+    return bytes(out)
+
+
+def format_seconds(s: Optional[float]) -> str:
+    if s is None:
+        return "not calibrated"
+    for unit, k in (("s", 1.0), ("ms", 1e-3), ("us", 1e-6), ("ns", 1e-9)):
+        if s >= k:
+            return f"{s / k:.3g} {unit}"
+    return f"{s / 1e-9:.3g} ns"
+
+
+def format_volts(v: Optional[float]) -> str:
+    if v is None:
+        return "no volts meaning"
+    return f"{v:.3g} V" if v >= 1.0 else f"{v * 1e3:.3g} mV"
 
 
 NAK_HINTS = {

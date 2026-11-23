@@ -243,7 +243,8 @@ def _state_lines(s: proto.ScopeState) -> List[str]:
     for i, c in enumerate(s.ch):
         gain = (f"{c.uv_per_div / 1000:g} mV/div ({c.tier_name}, bench unit #1)" if c.uv_per_div
                 else "no volts meaning on this range")
-        lines.append(f"CH{i + 1}       {'on ' if c.enabled else 'off'}, range {c.vdiv_idx}, {gain}")
+        probe = f"probe x{s.probe[i]}" if s.probe else "probe not reported (old firmware)"
+        lines.append(f"CH{i + 1}       {'on ' if c.enabled else 'off'}, range {c.vdiv_idx}, {gain}, {probe}")
     lines.append(f"trigger   {s.trig_mode_name}, {s.trig_edge_name}, {s.trig_source_name}, "
                  f"level {s.trig_level:+d} (reg 0x08 = 0x{s.trig_code:02X})")
     lines.append(f"grid      {s.counts_per_div} ADC counts/div")
@@ -256,9 +257,46 @@ def _state(dev: Device, _a) -> int:
     return EXIT_OK
 
 
+def describe_lines(d: proto.Description) -> List[str]:
+    """`openscope describe`: practical units first, the codes in the last column."""
+    lines = [f"timebase  ({d.samples_per_div} samples/div)",
+             f"  {'time/div':<16}{'sample rate':<14}{'tier':<13}code"]
+    for code in range(len(d.rates)):
+        rate = d.sample_rate(code)
+        lines.append(f"  {proto.format_seconds(d.time_per_div(code)):<16}"
+                     f"{(f'{rate} S/s' if rate else '-'):<14}{d.tier('timebase', code):<13}0x{code:02X}")
+    lines.append(f"volts/div  ({d.counts_per_div} ADC counts/div; BNC = no probe factor)")
+    lines.append(f"  {'ch':<4}{'at BNC':<18}{'at probe':<18}{'tier':<13}range")
+    for ch in range(1, len(d.ranges) + 1):
+        factor = d.probe_factor(ch)
+        for r in range(len(d.ranges[ch - 1])):
+            bnc = d.volts_per_div(ch, r, probe=1)
+            tip = d.volts_per_div(ch, r)
+            lines.append(f"  CH{ch:<2}{proto.format_volts(bnc):<18}"
+                         f"{(proto.format_volts(tip) + f' (x{factor})') if tip else '-':<18}"
+                         f"{d.tier('range', ch, r):<13}{r}")
+    if d.trigger:
+        t = d.trigger
+        lines.append(f"trigger   level {t.level_min}..{t.level_max} -> reg 0x08 = "
+                     f"clamp({t.center_code} + trunc(level*{t.num}/{t.den}), {t.code_min}, {t.code_max}); "
+                     f"fires at record count code{t.record_offset:+d}; "
+                     f"{t.counts_per_level:.3f} ADC counts per level step")
+    if d.probe:
+        lines.append("probe     " + ", ".join(f"CH{i + 1} x{f}" for i, f in enumerate(d.probe)))
+    if d.skipped:
+        lines.append("sections this tool does not read: " + ", ".join(str(s) for s in d.skipped))
+    return lines
+
+
+def _describe(dev: Device, _a) -> int:
+    for line in describe_lines(dev.description()):
+        print(line)
+    return EXIT_OK
+
+
 SET_USAGE = ("set timebase <code 0x00-0x14> | set vdiv <1|2> <0-9> | "
              "set trigger <auto|normal|single> [rising|falling] [ch1|ch2] [level -100..100] | "
-             "set run | set stop | set mode <scope|meter|siggen|settings>")
+             "set run | set stop | set mode <scope|meter|siggen|settings> | set probe <1|2> <1|10>")
 
 
 def _int(text: str) -> int:
@@ -277,6 +315,10 @@ def _set(dev: Device, a) -> int:
             ch, rng = _int(v[0]), _int(v[1])
             proto.payload_set_vdiv(ch, rng)
             action = lambda: dev.set_vdiv(ch, rng)  # noqa: E731
+        elif what == "probe" and len(v) == 2:
+            ch, factor = _int(v[0]), _int(v[1])
+            proto.payload_set_probe(ch, factor)
+            action = lambda: dev.set_probe(ch, factor)  # noqa: E731
         elif what in ("run", "stop") and not v:
             action = lambda: dev.run_stop(what == "run")  # noqa: E731
         elif what == "mode" and len(v) == 1:
@@ -344,10 +386,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--channels", default="1", help="1, 2 or 1,2 (default 1)")
     p.add_argument("--interval", type=float, default=0.05, help="poll period, s")
     p.add_argument("--out", metavar="FILE", help="save to .csv (always) or .npz (needs numpy)")
-    sub.add_parser("state", help="scope settings: mode, timebase, volts/div, trigger, run/stop")
+    sub.add_parser("state", help="scope settings: mode, timebase, volts/div, probe, trigger, run/stop")
+    sub.add_parser("describe", help="time/div of every timebase code, volts/div of every range, "
+                                    "trigger scale, probe (practical units; codes last)")
     p = sub.add_parser("set", help="change a scope setting; prints the state in force after it",
                        description=SET_USAGE)
-    p.add_argument("what", choices=["timebase", "vdiv", "trigger", "run", "stop", "mode"])
+    p.add_argument("what", choices=["timebase", "vdiv", "trigger", "run", "stop", "mode", "probe"])
     p.add_argument("values", nargs="*", metavar="VALUE")
     p = sub.add_parser("shell", help="run one ASCII debug-shell command")
     p.add_argument("line", nargs="+")
@@ -370,7 +414,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_OK
 
     handlers = {"info": _info, "press": _press, "meter": _meter, "shell": _shell,
-                "screenshot": _screenshot, "scope": _scope, "state": _state, "set": _set}
+                "screenshot": _screenshot, "scope": _scope, "state": _state, "set": _set,
+                "describe": _describe}
     dev = None
     try:
         dev = Device.open(a.port)           # also checks the protocol major (§3.7)

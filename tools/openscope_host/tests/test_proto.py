@@ -284,5 +284,101 @@ class TestControlSurface(unittest.TestCase):
                 fn(*args)
 
 
+def sample_description(**kw) -> "proto.Description":
+    rates = [(0, 0)] * 21
+    rates[0x0D] = (119678, 1)
+    rates[0x0E], rates[0x0F], rates[0x10] = (49930, 2), (24979, 2), (12490, 2)
+    ranges = tuple(tuple((0, 0) if r < 4 else (1000 * (ch + 1) * 100 + r, 2 if r in (5, 6, 7) else 1)
+                         for r in range(10)) for ch in range(2))
+    f = dict(version=1, samples_per_div=32, rates=tuple(rates), counts_per_div=32, ranges=ranges,
+             trigger=proto.TriggerScale(-100, 100, 128, 256, 206, 1, 254, -28), probe=(10, 1))
+    f.update(kw)
+    return proto.Description(**f)
+
+
+class TestDescription(unittest.TestCase):
+    """stage-086: GET_DESCRIPTION sections, skip rule, helpers, probe append."""
+
+    def test_round_trip_of_each_section(self):
+        d = sample_description()
+        p = proto.encode_description(d)
+        self.assertEqual(len(p), 239)              # the firmware's ESP_DESCRIPTION_LEN
+        self.assertEqual(proto.parse_description(p), d)
+        for drop in ("samples_per_div", "counts_per_div", "trigger", "probe"):  # each section alone missing
+            part = sample_description(**{drop: None})
+            back = proto.parse_description(proto.encode_description(part))
+            self.assertEqual(back, sample_description(**{drop: None, **(
+                {"rates": ()} if drop == "samples_per_div" else {"ranges": ()} if drop == "counts_per_div" else {})}))
+
+    def test_unknown_section_is_skipped(self):
+        p = bytearray(proto.encode_description(sample_description()))
+        extra = struct.pack("<BH", 9, 4) + b"\xde\xad\xbe\xef"
+        q = bytes(p[:1]) + extra + bytes(p[1:]) + struct.pack("<BH", 200, 0)
+        d = proto.parse_description(q)
+        self.assertEqual(d.skipped, (9, 200))
+        self.assertEqual(d.sample_rate(0x10), 12490)
+        self.assertEqual(d.probe, (10, 1))
+
+    def test_appended_fields_inside_a_section_are_ignored(self):
+        t = proto.encode_description(sample_description(samples_per_div=None, counts_per_div=None, probe=None))
+        sec = bytearray(t[1:])
+        sec[1:3] = struct.pack("<H", 12 + 2)           # trigger section grows by 2 bytes
+        d = proto.parse_description(bytes(t[:1]) + bytes(sec) + b"\x00\x00")
+        self.assertEqual(d.trigger.code(0), 128)
+
+    def test_malformed_refused(self):
+        good = proto.encode_description(sample_description())
+        for bad in (b"", b"\x02" + good[1:], good[:-1], good + b"\x04",
+                    good[:1] + struct.pack("<BHHB", 1, 3, 32, 21)):   # 21 entries announced, none sent
+            with self.assertRaises(proto.ProtocolError, msg=bad[:8].hex()):
+                proto.parse_description(bad)
+
+    def test_tier_none_value_is_no_value(self):
+        rates = [(0, 0)] * 21
+        rates[3] = (5000, 0)                            # a value its tier disowns
+        d = proto.parse_description(proto.encode_description(sample_description(rates=tuple(rates))))
+        self.assertIsNone(d.sample_rate(3))
+        self.assertEqual(d.tier("timebase", 3), "none")
+
+    def test_helpers_in_practical_units(self):
+        d = sample_description()
+        self.assertAlmostEqual(d.time_per_div(0x10), 32 / 12490)
+        self.assertIsNone(d.time_per_div(0x08))
+        self.assertEqual(d.tier("timebase", 0x0D), "provisional")
+        self.assertEqual(d.tier("range", 2, 6), "measured")
+        self.assertAlmostEqual(d.volts_per_div(1, 6, probe=1), 0.100006)
+        self.assertAlmostEqual(d.volts_per_div(1, 6), 1.00006)          # described probe x10
+        self.assertAlmostEqual(d.volts_per_div(2, 6), 0.200006)         # CH2 x1
+        self.assertIsNone(d.volts_per_div(1, 2))                         # railing range
+        self.assertAlmostEqual(d.volts_per_level(2, 6), 0.200006 / 32 * 256 / 206)
+        self.assertEqual(proto.format_seconds(d.time_per_div(0x10)), "2.56 ms")
+        self.assertEqual(proto.format_seconds(None), "not calibrated")
+        self.assertEqual(proto.format_volts(1.00006), "1 V")
+        self.assertEqual(proto.format_volts(0.0429), "42.9 mV")
+
+    def test_trigger_scale_matches_the_firmware_formula(self):
+        t = sample_description().trigger
+        # fpga_trigger_code_from_level(): C division truncates toward zero
+        self.assertEqual([t.code(v) for v in (-100, -50, -1, 0, 1, 50, 100, 150, -150)],
+                         [4, 66, 127, 128, 129, 190, 252, 252, 4])
+        self.assertEqual(t.record_counts(0), 100)
+
+    def test_probe_payload(self):
+        self.assertEqual(proto.payload_set_probe(1, 10), b"\x01\x0a")
+        self.assertEqual(proto.payload_set_probe(2, 1), b"\x02\x01")
+        for args in ((0, 1), (3, 1), (1, 2), (1, 0), (1, 100)):
+            with self.assertRaises(ValueError):
+                proto.payload_set_probe(*args)
+
+    def test_scope_state_probe_append(self):
+        old = scope_state_payload()                     # stage-085 firmware: 36 bytes, no probe
+        self.assertIsNone(proto.parse_scope_state(old).probe)
+        new = bytearray(old) + b"\x0a\x01"
+        new[1] = len(new)
+        s = proto.parse_scope_state(bytes(new))
+        self.assertEqual(s.probe, (10, 1))
+        self.assertEqual(s.ch[0].uv_per_div, 42950)     # uv_per_div keeps its meaning
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

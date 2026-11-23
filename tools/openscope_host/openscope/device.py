@@ -46,7 +46,8 @@ class _WriteFailed(DeviceError):
 IDEMPOTENT = frozenset({proto.CMD_PING, proto.CMD_STATUS, proto.CMD_GET_METER,
                         proto.CMD_GET_WAVEFORM, proto.CMD_GET_SCOPE_STATE,
                         proto.CMD_SET_MODE, proto.CMD_SET_TIMEBASE, proto.CMD_SET_VDIV,
-                        proto.CMD_SET_TRIGGER, proto.CMD_RUN_STOP})
+                        proto.CMD_SET_TRIGGER, proto.CMD_RUN_STOP,
+                        proto.CMD_GET_DESCRIPTION, proto.CMD_SET_PROBE})
 
 # Shell commands that only read. The shell also has commands that reset the
 # device (fwapply, fwswap, reboot bootloader) or write flash, so a shell line
@@ -79,6 +80,7 @@ class Device:
         self.timeout = timeout
         self._sleep = sleep
         self.decoder = proto.Decoder()
+        self._description: Optional[proto.Description] = None
 
     # ── lifecycle ─────────────────────────────────────────────────
     @classmethod
@@ -190,6 +192,7 @@ class Device:
         refusal), and the next request re-checks before it sends anything."""
         checked = getattr(self, "proto_version", None) is not None
         self._verified = not checked
+        self._description = None    # the port that comes back may be other firmware
         self.link.reopen()
         self._settle()
         if checked:
@@ -306,6 +309,25 @@ class Device:
 
     def run_stop(self, running: bool) -> None:
         self.request(proto.CMD_RUN_STOP, proto.payload_run_stop(running))
+
+    # ── device description (stage-086) ────────────────────────────
+    def description(self, refresh: bool = False) -> proto.Description:
+        """Rates and tiers of every timebase code, BNC volts/div and tiers of
+        every range, the trigger scale and the probe factors, in one request.
+        Cached per connection (the tables are fixed in the firmware image; a
+        reconnect drops the cache). The probe factor in it is a snapshot: the
+        unit's own menu can change it, so read scope_state().probe for a live
+        value, or pass refresh=True."""
+        if self._description is None or refresh:
+            self._description = proto.parse_description(
+                self.request(proto.CMD_GET_DESCRIPTION, expect=(proto.RSP_DESCRIPTION,)).payload)
+        return self._description
+
+    def set_probe(self, channel: int, factor: int) -> None:
+        """x1 or x10, the same field the unit's probe menu writes."""
+        payload = proto.payload_set_probe(channel, factor)
+        self._description = None    # its probe section is now stale
+        self.request(proto.CMD_SET_PROBE, payload)
 
     # ── ASCII shell (same port; §3.2 keeps it alive next to the protocol) ──
     def shell(self, line: str, timeout: float = 3.0) -> str:

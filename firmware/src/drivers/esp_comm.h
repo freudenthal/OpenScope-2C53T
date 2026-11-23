@@ -48,6 +48,8 @@
 #define ESP_CMD_SET_VDIV        0x26    /* u8 channel 1|2, u8 range 0..ESP_VDIV_RANGES-1 */
 #define ESP_CMD_SET_TRIGGER     0x27    /* u8 mode, u8 edge, u8 source, i16 level */
 #define ESP_CMD_RUN_STOP        0x29    /* u8 running 0|1 */
+#define ESP_CMD_GET_DESCRIPTION 0x2A    /* stage-086: -> DESCRIPTION (layout below) */
+#define ESP_CMD_SET_PROBE       0x2B    /* stage-086: u8 channel 1|2, u8 factor 1|10 */
 
 /* Responses: GD32 → ESP32 */
 #define ESP_RSP_ACK             0x81    /* Command accepted */
@@ -59,6 +61,7 @@
 #define ESP_RSP_METER_FRAME     0x90    /* §3.5 METER_FRAME */
 #define ESP_RSP_WAVEFORM_FRAME  0x91    /* §3.5 WAVEFORM_FRAME */
 #define ESP_RSP_SCOPE_STATE     0x92    /* §3.4 SCOPE_STATE (layout below) */
+#define ESP_RSP_DESCRIPTION     0x94    /* stage-086 DESCRIPTION (0x93 is §3.4's planned EVENT) */
 
 /* NAK error codes */
 #define ESP_ERR_UNKNOWN_CMD     0x01
@@ -282,6 +285,7 @@ typedef esp_wave_result_t (*esp_wave_fn)(uint8_t channel_mask, esp_wave_snapshot
  *   SET_TRIGGER   u8 mode (0 auto, 1 normal, 2 single), u8 edge (0 rising,
  *                 1 falling), u8 source (0 CH1, 1 CH2), i16 level -100..100
  *   RUN_STOP      u8 running (0 stop, 1 run)
+ *   SET_PROBE     u8 channel (1|2), u8 factor (1|10)              (stage-086)
  * Replies: ACK once the setting is in force. NAK BAD_LENGTH / BAD_ARG for a
  * malformed request (provider not called), NOT_READY when the provider could
  * not apply it (nothing changed), UNSUPPORTED_IN_MODE when the provider needs
@@ -310,9 +314,13 @@ typedef esp_wave_result_t (*esp_wave_fn)(uint8_t channel_mask, esp_wave_snapshot
  *                                 the probe setting, as the waveform header does)
  *   [28..31] CH2: as [20..23]
  *   [32..35] CH2: u32 uv_per_div
+ *   [36]     u8   CH1 probe factor, 1 or 10 (stage-086 append; still v1: a
+ *   [37]     u8   CH2 probe factor   host reads [1] and ignores bytes it does
+ *                                    not know; a 36-byte reply has no probe)
+ *   uv_per_div keeps its meaning (probe included), so an old host sees no change.
  */
 #define ESP_SCOPE_STATE_VERSION 1
-#define ESP_SCOPE_STATE_LEN     36
+#define ESP_SCOPE_STATE_LEN     38
 #define ESP_TIMEBASE_CODES      21      /* SCOPE_TIMEBASE_CODE_COUNT (usb_debug.c asserts) */
 #define ESP_VDIV_RANGES         10      /* VDIV_COUNT (usb_debug.c asserts) */
 #define ESP_TRIG_LEVEL_MAX      100
@@ -322,6 +330,7 @@ typedef struct {
     uint8_t     vdiv_idx;
     uint8_t     vdiv_tier;      /* ESP_TIER_* of uv_per_div */
     uint32_t    uv_per_div;
+    uint8_t     probe;          /* factor 1 or 10 (anything else is sent as 1) */
 } esp_scope_channel_t;
 
 typedef struct {
@@ -337,6 +346,57 @@ typedef struct {
     uint16_t    counts_per_div;
     esp_scope_channel_t ch[2];
 } esp_scope_state_t;
+
+/* ─── Device description (stage-086, GET_DESCRIPTION 0x2A -> 0x94) ───
+ *
+ * Everything a host needs to print practical values instead of codes, in one
+ * request. Payload, little-endian:
+ *   [0]  u8 version (ESP_DESCRIPTION_VERSION), then sections to the end:
+ *        u8 id, u16 len, u8 data[len]
+ * A host SKIPS a section id it does not know (len tells it how far), so a
+ * later stage appends a section without a version change. Sections:
+ *   1 timebase  u16 samples_per_div, u8 n, then per reg 0x01 code 0..n-1:
+ *               u32 sample_rate_hz (0 = no rate), u8 tier
+ *   2 ranges    u16 counts_per_div, u8 n (ranges per channel), u8 channels,
+ *               then per channel (CH1 first), per range 0..n-1:
+ *               u32 uv_per_div_bnc (0 = no volts meaning), u8 tier
+ *               -- at the BNC, NO probe factor (scope_cal_range_label_bnc())
+ *   3 trigger   i16 level_min, i16 level_max, u8 center_code, u16 num,
+ *               u16 den, u8 code_min, u8 code_max, i8 record_offset
+ *               reg 0x08 code = clamp(center_code + trunc(level*num/den),
+ *               code_min, code_max), level clamped to [min, max] first
+ *               (fpga_trigger_code_from_level()); the capture fires where the
+ *               record crosses code + record_offset (EXP-56: -28)
+ *   4 probe     per channel (CH1 first): u8 factor (1 or 10)
+ * The encoder zeroes a value whose tier is NONE and sends tier NONE for a
+ * zero value, as everywhere else on this link. */
+#define ESP_DESCRIPTION_VERSION 1
+#define ESP_DESC_SEC_TIMEBASE   1
+#define ESP_DESC_SEC_RANGES     2
+#define ESP_DESC_SEC_TRIGGER    3
+#define ESP_DESC_SEC_PROBE      4
+#define ESP_DESC_TB_LEN         (3u + ESP_TIMEBASE_CODES * 5u)          /* 108 */
+#define ESP_DESC_RANGES_LEN     (4u + 2u * ESP_VDIV_RANGES * 5u)        /* 104 */
+#define ESP_DESC_TRIGGER_LEN    12u
+#define ESP_DESC_PROBE_LEN      2u
+/* version + 4 section headers + the sections = 239 */
+#define ESP_DESCRIPTION_LEN     (1u + 4u * 3u + ESP_DESC_TB_LEN + ESP_DESC_RANGES_LEN + \
+                                 ESP_DESC_TRIGGER_LEN + ESP_DESC_PROBE_LEN)
+
+typedef struct {
+    uint16_t samples_per_div;
+    uint32_t tb_rate_hz[ESP_TIMEBASE_CODES];
+    uint8_t  tb_tier[ESP_TIMEBASE_CODES];
+    uint16_t counts_per_div;
+    uint32_t uv_per_div_bnc[2][ESP_VDIV_RANGES];
+    uint8_t  vdiv_tier[2][ESP_VDIV_RANGES];
+    int16_t  trig_level_min, trig_level_max;
+    uint8_t  trig_center_code;
+    uint16_t trig_num, trig_den;
+    uint8_t  trig_code_min, trig_code_max;
+    int8_t   trig_record_offset;
+    uint8_t  probe[2];          /* 1 or 10 */
+} esp_description_t;
 
 typedef enum {
     ESP_CTRL_OK = 0,
@@ -354,6 +414,9 @@ typedef struct {
     esp_ctrl_result_t (*set_vdiv)(uint8_t channel, uint8_t range);
     esp_ctrl_result_t (*set_trigger)(uint8_t mode, uint8_t edge, uint8_t source, int16_t level);
     esp_ctrl_result_t (*run_stop)(bool running);
+    /* stage-086. Appended: an older table that stops at run_stop stays valid. */
+    void              (*get_description)(esp_description_t *out);
+    esp_ctrl_result_t (*set_probe)(uint8_t channel, uint8_t factor);
 } esp_control_ops_t;
 /* Inject a button press (id 1..15 = button_id_t). Return false if it could
  * not be queued, so the host gets NAK instead of a false ACK. */
@@ -461,6 +524,12 @@ void esp_comm_set_meter_provider(esp_meter_fn fn);
 void esp_comm_set_waveform_provider(esp_wave_fn fn);
 /* The ops table is used by reference: it must outlive the binding (static). */
 void esp_comm_set_control_provider(const esp_control_ops_t *ops);
+
+/* Remote badge (stage-086): true while the last VALID frame arrived less
+ * than ESP_HOST_ACTIVE_MS ago, on esp_comm_route()'s clock. Shell text does
+ * not count: the badge means "a program drives the unit". */
+#define ESP_HOST_ACTIVE_MS      3000u
+bool esp_comm_host_active(uint32_t now_ms);
 
 /* True while a frame is being received (sync seen, checksum not yet). */
 bool esp_comm_rx_in_frame(void);

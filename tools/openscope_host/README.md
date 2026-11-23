@@ -10,9 +10,10 @@ python3 -m openscope info               # firmware, protocol, mode, battery, USB
 python3 -m openscope press MENU OK      # inject button presses
 python3 -m openscope meter --count 0 --log m.csv   # log the multimeter (~4 Hz) until Ctrl-C
 python3 -m openscope scope --frames 10 --channels 1,2 --out cap.csv   # captures (raw counts); .npz needs numpy
-python3 -m openscope state              # mode, timebase (display + in force), volts/div, trigger, run/stop
+python3 -m openscope state              # mode, timebase (display + in force), volts/div, probe, trigger, run/stop
+python3 -m openscope describe           # time/div of every timebase code, volts/div of every range, trigger scale
 python3 -m openscope set timebase 0x10  # also: set vdiv 1 6 | set trigger normal falling ch1 -20
-                                        #       set run | set stop | set mode meter
+                                        #       set run | set stop | set mode meter | set probe 1 10
 python3 -m openscope shell usbstat      # run one ASCII debug-shell command
 python3 -m openscope screenshot s.png   # device framebuffer, CRC-checked
 ```
@@ -27,6 +28,14 @@ not written to the settings store by itself: it is saved by the next button pres
 power-off countdown. STOP stops acquisition: `frame_id` holds and the LCD shows STOP. A frame
 read while stopped reports the timebase code and range the held record was taken with, even
 if they were changed after the STOP. RUN drops the record held across the STOP and starts again.
+
+`describe` asks the unit once for its tables (`Device.description()`, cached per connection):
+the sample rate and trust tier of each timebase code (time/div = 32 samples / rate; codes
+with no measured rate print "not calibrated"), the volts/div of each range at the BNC and at
+the probe, the trigger level formula, and the probe setting. `set probe` writes the same
+setting as the unit's probe menu (x1 or x10) and is saved the same way as the other sets.
+While a host sends frames, the unit shows "PC" in the status bar; it goes away 3 s after the
+last frame.
 
 Waveforms are raw unsigned ADC counts. A frame carries the bench-measured sample rate and
 volts/div of its timebase code and range (bench unit #1, 0 where none was measured) and flags

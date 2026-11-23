@@ -8480,6 +8480,25 @@ static uint32_t round_u32(float v)
     return (v > 0.0f) ? (uint32_t)(v + 0.5f) : 0u;
 }
 
+/* uV per division AT THE BNC (no probe): the DESCRIPTION's number. The
+ * waveform header and SCOPE_STATE send this TIMES the probe factor, computed
+ * here once, so a host gets bnc x probe == uv_per_div exactly (stage-086). */
+static uint32_t remote_uv_per_div_bnc(uint8_t ch, uint8_t r)
+{
+    return round_u32(scope_cal_mv_per_count(ch, r) * SCOPE_CAL_COUNTS_PER_DIV * 1000.0f);
+}
+
+static uint8_t remote_probe_factor(uint8_t ch)
+{
+    const scope_state_t *ss = scope_state_get();
+    return ((ch == 2u ? ss->ch2.probe : ss->ch1.probe) == PROBE_10X) ? 10u : 1u;
+}
+
+static uint32_t remote_uv_per_div(uint8_t ch, uint8_t r)
+{
+    return remote_uv_per_div_bnc(ch, r) * remote_probe_factor(ch);
+}
+
 static esp_wave_result_t remote_waveform(uint8_t mask, esp_wave_snapshot_t *w)
 {
     const volatile uint8_t *c1, *c2;
@@ -8545,7 +8564,7 @@ static esp_wave_result_t remote_waveform(uint8_t mask, esp_wave_snapshot_t *w)
         w->ch[c].count      = FPGA_ADC_BUF_SIZE;
         w->ch[c].vdiv_idx   = r;
         w->ch[c].vdiv_tier  = (uint8_t)scope_cal_get_tier(ch, r);
-        w->ch[c].uv_per_div = round_u32(scope_cal_volts_per_div(ch, r) * 1e6f);
+        w->ch[c].uv_per_div = remote_uv_per_div(ch, r);
     }
     return ESP_WAVE_OK;
 }
@@ -8575,7 +8594,8 @@ static void remote_scope_channel(uint8_t ch, const channel_state_t *c, esp_scope
     o->enabled    = c->enabled;
     o->vdiv_idx   = c->vdiv_idx;
     o->vdiv_tier  = (uint8_t)scope_cal_get_tier(ch, c->vdiv_idx);
-    o->uv_per_div = round_u32(scope_cal_volts_per_div(ch, c->vdiv_idx) * 1e6f);
+    o->uv_per_div = remote_uv_per_div(ch, c->vdiv_idx);
+    o->probe      = remote_probe_factor(ch);
 }
 
 static void remote_scope_state(esp_scope_state_t *o)
@@ -8667,13 +8687,65 @@ static esp_ctrl_result_t remote_run_stop(bool running)
     return ESP_CTRL_OK;
 }
 
+/* stage-086: the fixed tables the host needs for practical values, from the
+ * same functions the LCD labels use. Volts are at the BNC: the probe travels
+ * in its own section, so a host never has to undo a factor. */
+_Static_assert((int)SCOPE_TIMEBASE_SAMPLES_PER_DIV == 32 && (int)SCOPE_CAL_COUNTS_PER_DIV == 32,
+               "the u16 grid fields are whole numbers");
+static void remote_description(esp_description_t *o)
+{
+    o->samples_per_div = (uint16_t)SCOPE_TIMEBASE_SAMPLES_PER_DIV;
+    for (uint8_t code = 0; code < ESP_TIMEBASE_CODES; code++) {
+        o->tb_rate_hz[code] = round_u32(scope_timebase_sample_rate(code));
+        o->tb_tier[code]    = (uint8_t)scope_timebase_get_tier(code);
+    }
+    o->counts_per_div = (uint16_t)SCOPE_CAL_COUNTS_PER_DIV;
+    for (uint8_t c = 0; c < 2; c++) {
+        for (uint8_t r = 0; r < ESP_VDIV_RANGES; r++) {
+            o->uv_per_div_bnc[c][r] = remote_uv_per_div_bnc((uint8_t)(c + 1u), r);
+            o->vdiv_tier[c][r]      = (uint8_t)scope_cal_get_tier((uint8_t)(c + 1u), r);
+        }
+    }
+    o->trig_level_min     = -FPGA_TRIG_LEVEL_LIMIT;
+    o->trig_level_max     =  FPGA_TRIG_LEVEL_LIMIT;
+    o->trig_center_code   = FPGA_TRIG_CENTER_CODE;
+    o->trig_num           = FPGA_TRIG_LEVEL_NUM;
+    o->trig_den           = FPGA_TRIG_LEVEL_DEN;
+    o->trig_code_min      = FPGA_TRIG_CODE_MIN;
+    o->trig_code_max      = FPGA_TRIG_CODE_MAX;
+    o->trig_record_offset = (int8_t)FPGA_ADC_OFFSET;
+    o->probe[0] = remote_probe_factor(1);
+    o->probe[1] = remote_probe_factor(2);
+}
+
+/* The same write the probe menu rows and the PRM-key cycle make: the field in
+ * scope_state, which scope_cal reads for every volts readout. No flash write
+ * here: like every host set (stage-080), the settings store captures it on
+ * the next button press, MENU, or the power-off countdown (settings_store.h:
+ * append log, 2 s settle window), so a scripted probe toggle writes nothing. */
+static esp_ctrl_result_t remote_set_probe(uint8_t ch, uint8_t factor)
+{
+    scope_state_t *ss = scope_state_get();
+    channel_state_t *c = (ch == 2u) ? &ss->ch2 : &ss->ch1;
+    const probe_t want = (factor == 10u) ? PROBE_10X : PROBE_1X;
+    if (c->probe != want) {
+        char t[20];
+        c->probe = want;
+        snprintf(t, sizeof(t), "CH%u probe %s", (unsigned)ch, probe_labels[want]);
+        scope_show_popup(t);
+    }
+    return ESP_CTRL_OK;
+}
+
 static const esp_control_ops_t remote_control = {
-    .get_state    = remote_scope_state,
-    .set_mode     = remote_set_mode,
-    .set_timebase = remote_set_timebase,
-    .set_vdiv     = remote_set_vdiv,
-    .set_trigger  = remote_set_trigger,
-    .run_stop     = remote_run_stop,
+    .get_state       = remote_scope_state,
+    .set_mode        = remote_set_mode,
+    .set_timebase    = remote_set_timebase,
+    .set_vdiv        = remote_set_vdiv,
+    .set_trigger     = remote_set_trigger,
+    .run_stop        = remote_run_stop,
+    .get_description = remote_description,
+    .set_probe       = remote_set_probe,
 };
 
 static void remote_to_shell(const uint8_t *data, uint16_t len, void *ctx)

@@ -3754,11 +3754,11 @@ uint8_t fpga_acq_trig_code_get(void)      { return acq_trig_code; }
  * in scope_ui.c) -> reg 0x08 code. Keep the 206 in step with scope_ui.c. */
 uint8_t fpga_trigger_code_from_level(int level)
 {
-    if (level < -100) level = -100;
-    if (level >  100) level =  100;
-    int code = 128 + (level * 256) / 206;
-    if (code < 1)   code = 1;
-    if (code > 254) code = 254;
+    if (level < -FPGA_TRIG_LEVEL_LIMIT) level = -FPGA_TRIG_LEVEL_LIMIT;
+    if (level >  FPGA_TRIG_LEVEL_LIMIT) level =  FPGA_TRIG_LEVEL_LIMIT;
+    int code = FPGA_TRIG_CENTER_CODE + (level * FPGA_TRIG_LEVEL_NUM) / FPGA_TRIG_LEVEL_DEN;
+    if (code < FPGA_TRIG_CODE_MIN) code = FPGA_TRIG_CODE_MIN;
+    if (code > FPGA_TRIG_CODE_MAX) code = FPGA_TRIG_CODE_MAX;
     return (uint8_t)code;
 }
 uint16_t fpga_acq_rearm_wait_get(void)  { return acq_rearm_wait_ms; }

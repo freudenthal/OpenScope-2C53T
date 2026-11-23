@@ -127,9 +127,59 @@ static void wave_defaults(void)
     wave_calls = 0;
 }
 
+/* Control provider (stage-086 additions only; the M6 sets are covered end to
+ * end in tools/openscope_host/tests/test_end_to_end.py). */
+static esp_description_t fake_desc;
+static esp_scope_state_t fake_state;
+static int probe_calls;
+static uint8_t probe_ch_seen, probe_factor_seen;
+static void ctl_get_state(esp_scope_state_t *o) { *o = fake_state; }
+static void ctl_get_description(esp_description_t *o) { *o = fake_desc; }
+static esp_ctrl_result_t ctl_set_probe(uint8_t ch, uint8_t f)
+{
+    probe_calls++; probe_ch_seen = ch; probe_factor_seen = f;
+    return ESP_CTRL_OK;
+}
+static const esp_control_ops_t ctl_ops = {
+    .get_state = ctl_get_state,
+    .get_description = ctl_get_description,
+    .set_probe = ctl_set_probe,
+};
+
+static void desc_defaults(void)
+{
+    memset(&fake_desc, 0, sizeof(fake_desc));
+    fake_desc.samples_per_div = 32;
+    for (int i = 0; i < ESP_TIMEBASE_CODES; i++) {
+        fake_desc.tb_rate_hz[i] = 1000u + (uint32_t)i;      /* every code distinct */
+        fake_desc.tb_tier[i] = ESP_TIER_NONE;
+    }
+    fake_desc.tb_rate_hz[0x10] = 12490; fake_desc.tb_tier[0x10] = ESP_TIER_MEASURED;
+    fake_desc.tb_rate_hz[0x0D] = 119678; fake_desc.tb_tier[0x0D] = ESP_TIER_PROVISIONAL;
+    fake_desc.tb_rate_hz[0x0F] = 0; fake_desc.tb_tier[0x0F] = ESP_TIER_MEASURED;  /* 0 vouched for */
+    fake_desc.counts_per_div = 32;
+    for (int c = 0; c < 2; c++)
+        for (int r = 0; r < ESP_VDIV_RANGES; r++) {
+            fake_desc.uv_per_div_bnc[c][r] = 100000u * (uint32_t)(c + 1) + (uint32_t)r;
+            fake_desc.vdiv_tier[c][r] = ESP_TIER_MEASURED;
+        }
+    fake_desc.vdiv_tier[1][3] = ESP_TIER_NONE;              /* a value its tier disowns */
+    fake_desc.trig_level_min = -100; fake_desc.trig_level_max = 100;
+    fake_desc.trig_center_code = 128; fake_desc.trig_num = 256; fake_desc.trig_den = 206;
+    fake_desc.trig_code_min = 1; fake_desc.trig_code_max = 254;
+    fake_desc.trig_record_offset = -28;
+    fake_desc.probe[0] = 10; fake_desc.probe[1] = 7;        /* 7: not a probe setting */
+    memset(&fake_state, 0, sizeof(fake_state));
+    fake_state.ch[0].probe = 10;
+    fake_state.ch[1].probe = 1;
+    probe_calls = 0; probe_ch_seen = probe_factor_seen = 0;
+}
+
 static void reset(void)
 {
     esp_comm_init();
+    esp_comm_set_control_provider(0);
+    desc_defaults();
     esp_comm_set_writer(0);
     esp_comm_set_block_writer(block_writer);
     esp_comm_set_status_provider(0);
@@ -692,6 +742,129 @@ static void test_waveform_byte_writer_agrees(void)
     CHECK(tx_bytes_len == a && memcmp(tx_bytes, copy, a) == 0, "byte writer emits the identical two-part frames");
 }
 
+/* --- stage-086: DESCRIPTION, SET_PROBE, SCOPE_STATE append, host badge --- */
+
+static uint32_t rd_u32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint16_t rd_u16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+
+static int request(uint8_t cmd, const uint8_t *p, uint16_t n, uint8_t *out, uint16_t *outn)
+{
+    uint8_t f[64];
+    size_t off = 0;
+    tx_len = 0;
+    route(f, frame(f, cmd, p, n), 1000);
+    return take(&off, out, outn);
+}
+
+static void test_description_layout(void)
+{
+    uint8_t pl[512]; uint16_t n = 0;
+    reset();
+    esp_comm_set_control_provider(&ctl_ops);
+    CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n) == ESP_RSP_DESCRIPTION, "DESCRIPTION reply");
+    CHECK(n == ESP_DESCRIPTION_LEN && n == 239, "239 bytes");
+    CHECK(pl[0] == ESP_DESCRIPTION_VERSION, "version byte");
+
+    /* walk the sections the way a host does */
+    const uint8_t *p = pl + 1, *end = pl + n;
+    int seen = 0;
+    while (p + 3 <= end) {
+        uint8_t id = p[0]; uint16_t len = rd_u16(p + 1);
+        const uint8_t *d = p + 3;
+        CHECK(d + len <= end, "section inside the payload");
+        if (id == ESP_DESC_SEC_TIMEBASE) {
+            seen |= 1;
+            CHECK(len == ESP_DESC_TB_LEN, "timebase len");
+            CHECK(rd_u16(d) == 32 && d[2] == ESP_TIMEBASE_CODES, "samples/div, n");
+            const uint8_t *e = d + 3;
+            CHECK(rd_u32(e + 5 * 0x10) == 12490 && e[5 * 0x10 + 4] == ESP_TIER_MEASURED, "0x10 measured");
+            CHECK(rd_u32(e + 5 * 0x0D) == 119678 && e[5 * 0x0D + 4] == ESP_TIER_PROVISIONAL, "0x0D provisional");
+            CHECK(rd_u32(e + 5 * 0x08) == 0 && e[5 * 0x08 + 4] == ESP_TIER_NONE, "tier NONE rate zeroed");
+            CHECK(rd_u32(e + 5 * 0x0F) == 0 && e[5 * 0x0F + 4] == ESP_TIER_NONE, "zero rate never vouched for");
+            CHECK(rd_u32(e + 5 * 20) == 0, "last code present");
+        } else if (id == ESP_DESC_SEC_RANGES) {
+            seen |= 2;
+            CHECK(len == ESP_DESC_RANGES_LEN, "ranges len");
+            CHECK(rd_u16(d) == 32 && d[2] == ESP_VDIV_RANGES && d[3] == 2, "counts/div, n, channels");
+            const uint8_t *e = d + 4;
+            CHECK(rd_u32(e + 5 * 6) == 100006 && e[5 * 6 + 4] == ESP_TIER_MEASURED, "CH1 range 6");
+            CHECK(rd_u32(e + 5 * (10 + 9)) == 200009, "CH2 range 9 (CH1 block first)");
+            CHECK(rd_u32(e + 5 * (10 + 3)) == 0 && e[5 * 13 + 4] == ESP_TIER_NONE, "tier NONE volts zeroed");
+        } else if (id == ESP_DESC_SEC_TRIGGER) {
+            seen |= 4;
+            CHECK(len == ESP_DESC_TRIGGER_LEN, "trigger len");
+            CHECK((int16_t)rd_u16(d) == -100 && (int16_t)rd_u16(d + 2) == 100, "level limits");
+            CHECK(d[4] == 128 && rd_u16(d + 5) == 256 && rd_u16(d + 7) == 206, "center, num, den");
+            CHECK(d[9] == 1 && d[10] == 254 && (int8_t)d[11] == -28, "code limits, record offset");
+        } else if (id == ESP_DESC_SEC_PROBE) {
+            seen |= 8;
+            CHECK(len == 2 && d[0] == 10 && d[1] == 1, "probe 10 / unknown 7 sent as 1");
+        }
+        p = d + len;
+    }
+    CHECK(p == end, "sections end exactly at the payload end");
+    CHECK(seen == 15, "all four sections");
+}
+
+static void test_description_refusals(void)
+{
+    uint8_t pl[16]; uint16_t n = 0; uint8_t junk = 0;
+    reset();
+    CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_UNSUPPORTED,
+          "no provider: UNSUPPORTED");
+    esp_comm_set_control_provider(&ctl_ops);
+    CHECK(request(ESP_CMD_GET_DESCRIPTION, &junk, 1, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_BAD_LENGTH,
+          "payload: BAD_LENGTH");
+}
+
+static void test_set_probe(void)
+{
+    uint8_t pl[16]; uint16_t n = 0;
+    static const uint8_t good[][2] = { {1, 1}, {1, 10}, {2, 1}, {2, 10} };
+    static const uint8_t bad[][2] = { {0, 1}, {3, 1}, {1, 0}, {1, 2}, {2, 100}, {1, 11} };
+    reset();
+    esp_comm_set_control_provider(&ctl_ops);
+    for (unsigned i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+        CHECK(request(ESP_CMD_SET_PROBE, good[i], 2, pl, &n) == ESP_RSP_ACK, "SET_PROBE ACK");
+        CHECK(probe_ch_seen == good[i][0] && probe_factor_seen == good[i][1], "provider got the args");
+    }
+    CHECK(probe_calls == 4, "4 calls");
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        CHECK(request(ESP_CMD_SET_PROBE, bad[i], 2, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_BAD_ARG,
+              "SET_PROBE BAD_ARG");
+    CHECK(request(ESP_CMD_SET_PROBE, good[0], 1, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_BAD_LENGTH,
+          "SET_PROBE BAD_LENGTH");
+    CHECK(probe_calls == 4, "a refused request never reaches the provider");
+}
+
+static void test_scope_state_probe_append(void)
+{
+    uint8_t pl[64]; uint16_t n = 0;
+    reset();
+    esp_comm_set_control_provider(&ctl_ops);
+    CHECK(request(ESP_CMD_GET_SCOPE_STATE, 0, 0, pl, &n) == ESP_RSP_SCOPE_STATE, "SCOPE_STATE reply");
+    CHECK(n == 38 && pl[0] == 1 && pl[1] == 38, "still v1, length byte 38");
+    CHECK(pl[36] == 10 && pl[37] == 1, "probe CH1 10, CH2 1");
+    fake_state.ch[1].probe = 0;
+    request(ESP_CMD_GET_SCOPE_STATE, 0, 0, pl, &n);
+    CHECK(pl[37] == 1, "a provider 0 is sent as 1");
+}
+
+static void test_host_active_clock(void)
+{
+    uint8_t f[16];
+    reset();
+    CHECK(!esp_comm_host_active(0) && !esp_comm_host_active(5000), "no frame yet: not active");
+    route("help\r\n", 6, 100);
+    CHECK(!esp_comm_host_active(200), "shell text does not count");
+    route(f, frame(f, ESP_CMD_PING, 0, 0), 10000);
+    CHECK(esp_comm_host_active(10000) && esp_comm_host_active(12999), "active < 3 s after a frame");
+    CHECK(!esp_comm_host_active(13000), "inactive at 3 s");
+    f[frame(f, ESP_CMD_PING, 0, 0) - 1] ^= 0xFF;            /* bad checksum */
+    route(f, 5, 20000);
+    CHECK(!esp_comm_host_active(20001), "a corrupt frame does not count");
+}
+
 int main(void)
 {
     printf("test_remote_proto\n");
@@ -721,6 +894,11 @@ int main(void)
     test_waveform_all_or_nothing();
     test_waveform_flags_are_derived();
     test_waveform_byte_writer_agrees();
+    test_description_layout();
+    test_description_refusals();
+    test_set_probe();
+    test_scope_state_probe_append();
+    test_host_active_clock();
     printf("%d/%d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;
 }

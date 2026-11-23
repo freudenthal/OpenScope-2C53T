@@ -837,12 +837,15 @@ static void cmd_status(void)
         "PC0 edges: %lu\r\n"
         "acq latency: %lu ms (strobe -> commit, last cycle); poll reads before it: %lu (total %lu)\r\n"
         "acq edge filter: %s  kept %lu  dropped %lu  unclassified %lu\r\n"
+        "acq stop: %s, held records dropped on RUN %lu\r\n"
         "acq rotation: %ld samples (seam of the last strobed record; -1 = none)\r\n"
         "acq hdr CH1: %02X %02X %02X  CH2: %02X %02X %02X\r\n",
         (unsigned long)fpga.pc0_edges,
         (unsigned long)fpga.acq_last_latency_ms, (unsigned long)fpga.acq_polls_last, (unsigned long)fpga.acq_poll_reads,
         fpga_acq_edge_filter_get() ? "ON" : "OFF", (unsigned long)fpga.acq_edge_kept,
         (unsigned long)fpga.acq_edge_dropped, (unsigned long)fpga.acq_edge_unknown,
+        scope_state_get()->running ? "running" : "STOPPED (no reads)",
+        (unsigned long)fpga.acq_stop_stale_dropped,
         (long)fpga.acq_last_rot,
         fpga.acq_hdr_ch1[0], fpga.acq_hdr_ch1[1], fpga.acq_hdr_ch1[2],
         fpga.acq_hdr_ch2[0], fpga.acq_hdr_ch2[1], fpga.acq_hdr_ch2[2]
@@ -8484,6 +8487,7 @@ static esp_wave_result_t remote_waveform(uint8_t mask, esp_wave_snapshot_t *w)
     uint8_t *s2 = shell_bus_scratch + FPGA_ADC_BUF_SIZE;
     uint32_t g0 = 0, g1 = 1;
     bool ordered = false;
+    uint8_t code = 0, rec_vdiv[2] = { 0, 0 };
 
     if (current_mode != MODE_OSCILLOSCOPE)
         return ESP_WAVE_WRONG_MODE;
@@ -8507,6 +8511,9 @@ static esp_wave_result_t remote_waveform(uint8_t mask, esp_wave_snapshot_t *w)
         if (mask & ESP_WAVE_MASK_CH2)
             for (uint32_t i = 0; i < FPGA_ADC_BUF_SIZE; i++) s2[i] = c2[i];
         ordered = fpga_acq_record_time_ordered();   /* published inside the same seqlock */
+        code = fpga_acq_record_rate_idx();          /* what THIS record was sampled at */
+        rec_vdiv[0] = fpga_acq_record_vdiv(1);
+        rec_vdiv[1] = fpga_acq_record_vdiv(2);
         g1 = fpga_acq_frame_generation();
         if (g1 == g0)
             break;
@@ -8516,13 +8523,13 @@ static esp_wave_result_t remote_waveform(uint8_t mask, esp_wave_snapshot_t *w)
         return ESP_WAVE_BUSY;
 
     const scope_state_t *ss = scope_state_get();
-    const uint8_t code = fpga_acq_rate_idx_get();   /* what the FPGA samples at */
-
+    /* Rate and ranges are the RECORD's (stage-082): STOP holds a record while
+     * the settings can change. The disagree flag keeps its meaning: the
+     * hardware code in force vs the display (the 2026-08-19 divergence, same
+     * rule as fft_live_rate_in_force()). */
     w->frame_id           = g0;
     w->timebase_idx       = code;
-    /* Same rule as fft_live_rate_in_force(): a rate is claimed only when the
-     * display and the hardware agree on the code (the 2026-08-19 divergence). */
-    w->timebase_disagrees = (code != ss->timebase_idx);
+    w->timebase_disagrees = (fpga_acq_rate_idx_get() != ss->timebase_idx);
     w->timebase_tier      = (uint8_t)scope_timebase_get_tier(code);
     w->sample_rate_hz     = round_u32(scope_timebase_sample_rate(code));
     w->time_ordered       = ordered;
@@ -8531,7 +8538,7 @@ static esp_wave_result_t remote_waveform(uint8_t mask, esp_wave_snapshot_t *w)
     w->head_skip          = SCOPE_RECORD_HEAD_SKIP;
     for (uint8_t c = 0; c < 2; c++) {
         const uint8_t ch = (uint8_t)(c + 1u);
-        const uint8_t r = c ? ss->ch2.vdiv_idx : ss->ch1.vdiv_idx;
+        const uint8_t r = rec_vdiv[c];
         if (!(mask & (1u << c)))
             continue;
         w->ch[c].samples    = c ? s2 : s1;
@@ -8647,11 +8654,16 @@ static esp_ctrl_result_t remote_set_trigger(uint8_t mode, uint8_t edge, uint8_t 
     return ESP_CTRL_OK;
 }
 
-/* The RUN/STOP key (OK in scope mode) is scope_toggle_running(): the field
- * and nothing else. Same here, as an absolute value. */
+/* The RUN/STOP key (OK in scope mode) is scope_toggle_running() plus a
+ * popup. Same here, as an absolute value. Since stage-082 the acquisition
+ * task reads the field: STOP reads no new record. */
 static esp_ctrl_result_t remote_run_stop(bool running)
 {
-    scope_state_get()->running = running;
+    scope_state_t *ss = scope_state_get();
+    bool changed = (ss->running != running);
+    ss->running = running;
+    if (changed)
+        scope_show_popup(running ? "RUN" : "STOP");
     return ESP_CTRL_OK;
 }
 

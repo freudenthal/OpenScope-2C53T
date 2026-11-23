@@ -3054,14 +3054,29 @@ static volatile uint8_t *acq_write_ch2(void)
 static volatile bool acq_stage_ordered = false;
 static volatile bool acq_pub_ordered = false;
 
+/* What the PUBLISHED record was taken with: the reg 0x01 code and both
+ * channels' ranges at commit time, inside the same seqlock window. Since
+ * STOP holds the record (G-270, stage-082), the settings can change after
+ * the last commit; a reader that labelled the held record with the settings
+ * in force NOW would give it the wrong rate and gain. */
+static volatile uint8_t acq_rate_idx;              /* defined with its value below */
+static volatile uint8_t acq_pub_rate_idx = 0x08;
+static volatile uint8_t acq_pub_vdiv[2] = { 0, 0 };
+
 static void fpga_acq_frames_commit(void)
 {
     if (acq_stage_ch1 == NULL || acq_stage_ch2 == NULL)
         return;   /* in-place fallback: nothing to copy */
+    const scope_state_t *ss = scope_state_get();
     acq_frame_gen++;                                   /* odd: committing */
     memcpy((void *)fpga.ch1_buf, acq_stage_ch1, FPGA_ADC_BUF_SIZE);
     memcpy((void *)fpga.ch2_buf, acq_stage_ch2, FPGA_ADC_BUF_SIZE);
     acq_pub_ordered = acq_stage_ordered;
+    acq_pub_rate_idx = acq_rate_idx;
+    if (ss != NULL) {
+        acq_pub_vdiv[0] = ss->ch1.vdiv_idx;
+        acq_pub_vdiv[1] = ss->ch2.vdiv_idx;
+    }
     acq_frame_gen++;                                   /* even: stable */
 }
 
@@ -3672,6 +3687,8 @@ uint16_t fpga_acq_poll_gap_get(void)         { return acq_poll_gap_ms; }
 void fpga_acq_unrotate_set(bool on)           { acq_unrotate = on; }
 bool fpga_acq_unrotate_get(void)              { return acq_unrotate; }
 bool fpga_acq_record_time_ordered(void)       { return acq_pub_ordered; }
+uint8_t fpga_acq_record_rate_idx(void)        { return acq_pub_rate_idx; }
+uint8_t fpga_acq_record_vdiv(uint8_t ch)      { return acq_pub_vdiv[ch == 2 ? 1 : 0]; }
 bool fpga_meter_wave_available(void)
 {
     /* Mirrors the task-creation chain in fpga_init(): only the stock-path
@@ -3935,6 +3952,8 @@ static void fpga_warmtest_acq_task(void *pv)
     uint32_t last_commit_tick = 0;
     uint32_t polls_since_handover = 0;
     trigger_mode_t last_mode = TRIG_AUTO;
+    bool stopped = false;              /* stage-082: STOP holds the record */
+    bool after_stop = false;           /* first read after RUN: drop a held record */
     for (;;) {
         if (!fpga.initialized || fpga.bus_released) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -3957,6 +3976,28 @@ static void fpga_warmtest_acq_task(void *pv)
         if (scope_mask_hold_active()) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
+        }
+
+        /* STOP (stage-082, G-270). Until 2026-11-22 this loop never read
+         * scope_state.running: the RUN/STOP key and host RUN_STOP froze the
+         * LCD only, while records kept committing (bench: 16 new frame_ids in
+         * 5 s under STOP). Now STOP reads nothing -- the same hold SINGLE and
+         * the mask use -- so the published record, the LCD and the host agree.
+         * The FPGA keeps the record it completed after our last read until the
+         * next read, so the first strobed record after RUN is from around the
+         * STOP and is dropped; the poll restarts as at boot. */
+        {
+            const scope_state_t *ss_run = scope_state_get();
+            if (ss_run != NULL && !ss_run->running) {
+                stopped = true;
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            if (stopped) {
+                stopped = false;
+                after_stop = true;
+                capture_in_flight = false;
+            }
         }
 
         /* EDGE-PACED ready wait — rewritten 2026-08-14 after the June-capture
@@ -4076,6 +4117,13 @@ static void fpga_warmtest_acq_task(void *pv)
         } else {
             polls_since_handover++;
             fpga.acq_poll_reads++;
+        }
+        if (after_stop) {                      /* stage-082: first read after RUN */
+            after_stop = false;
+            if (triggered) {
+                fpga.acq_stop_stale_dropped++; /* the record held across STOP */
+                continue;
+            }
         }
         if (!triggered) {
             if (auto_mode && acq_gate_enable) {

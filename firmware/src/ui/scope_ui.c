@@ -2554,6 +2554,15 @@ void draw_scope_live_frame(void)
      * Cost of leaving it out: stale badges — a display bug. The version that
      * was here was a data-loss bug. Prefer the display bug. */
 
+    /* STOP badges (stage-082). The band above starts at SCOPE_TOP, so it
+     * painted over the STOP badges the full path draws: after a host STOP
+     * the LCD showed a frozen trace and no STOP sign (G-270). Two small
+     * fills and two strings, no sample reads -- not the hazard above. */
+    if (!ss->running) {
+        draw_trigger_status(ss, th);
+        draw_run_stop(ss, th);
+    }
+
 #ifdef SCOPE_DEBUG_OVERLAY
     /* Keep the counters moving; opaque fixed-width lines, no strip refill. */
     draw_scope_debug(th);

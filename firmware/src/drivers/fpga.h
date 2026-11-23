@@ -384,6 +384,7 @@ typedef struct {
     volatile uint32_t acq_edge_kept;       /* edge filter: strobed records of the chosen edge */
     volatile uint32_t acq_edge_dropped;    /* edge filter: strobed records of the other edge */
     volatile uint32_t acq_edge_unknown;    /* edge filter: not classifiable -> committed unfiltered */
+    volatile uint32_t acq_stop_stale_dropped; /* stage-082: records held across STOP, dropped on RUN */
     volatile uint32_t pc0_edges;           /* PC0 (data-ready) falling edges via EXINT0.
                                             * One per fresh ready event — the instrument
                                             * for engine cycle rate per trigger regime,
@@ -1139,6 +1140,11 @@ bool     fpga_acq_edge_filter_get(void);
 /* true when the latest committed record was un-rotated at its seam, so the
  * hardware trigger sits at index 512 (dev plan 2.3). */
 bool     fpga_acq_record_time_ordered(void);
+/* The reg 0x01 code and the range (ch 1|2) the published record was taken
+ * with, published inside the commit seqlock (stage-082). While the scope is
+ * stopped they can differ from the settings in force. */
+uint8_t  fpga_acq_record_rate_idx(void);
+uint8_t  fpga_acq_record_vdiv(uint8_t ch);
 /* true when this build creates the meter-waveform sampler task ("mtr_wave").
  * The coldtrace family does not, so its meter screen must not wait for
  * samples that never come (2026-09-30). */

@@ -24,7 +24,9 @@ Exit codes: 0 ok, 1 no device (one-line message, no traceback), 2 device refused
 buttons use) and prints the state in force after it. `set mode` presses MENU on the device
 until the mode matches. Omitted `set trigger` fields keep their current values. A host set is
 not written to the settings store by itself: it is saved by the next button press, MENU, or
-power-off countdown. STOP freezes the LCD only; acquisition and `frame_id` keep running.
+power-off countdown. STOP stops acquisition: `frame_id` holds and the LCD shows STOP. A frame
+read while stopped reports the timebase code and range the held record was taken with, even
+if they were changed after the STOP. RUN drops the record held across the STOP and starts again.
 
 Waveforms are raw unsigned ADC counts. A frame carries the bench-measured sample rate and
 volts/div of its timebase code and range (bench unit #1, 0 where none was measured) and flags

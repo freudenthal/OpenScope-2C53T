@@ -4093,6 +4093,14 @@ static void fpga_warmtest_acq_task(void *pv)
         if (acq_pair_gap_ms) vTaskDelay(pdMS_TO_TICKS(acq_pair_gap_ms));
         uint8_t s2 = fpga_warmtest_read_channel(0x05, w2);
         last_read_tick = xTaskGetTickCount();
+        /* STOP that arrived during this pass (the sleep above can be most of
+         * a second): commit nothing after the host's ACK (bench 2026-11-22:
+         * one record landed after it). The next pass parks at the hold. */
+        {
+            const scope_state_t *ss_chk = scope_state_get();
+            if (ss_chk != NULL && !ss_chk->running)
+                continue;
+        }
         bool triggered = (fpga.pc0_edges != edges_before);
         if (!triggered) {                       /* the strobe is µs after the read; give the ISR a tick */
             vTaskDelay(pdMS_TO_TICKS(1));

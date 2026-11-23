@@ -23,6 +23,15 @@ counts give amplitudes (Vpp), not absolute volts. `NO_CAPTURE_DATA` means the sc
 capture — it never sends its demo trace. `scope --frames N` counts only new captures (new
 `frame_id`) and gives up, keeping what it got, when acquisition is stopped or held.
 
+## GUI (`openscope-gui`)
+`pip install -e .[gui]` (PySide6-Essentials, pyqtgraph, numpy), then `openscope-gui`
+(or `python -m openscope.gui.app`). Live CH1/CH2 traces in raw ADC counts, two cursors (Δt,
+Δcounts), an FFT tab, a meter strip chart with CSV log, device screenshot, and the unit's buttons.
+It follows the unit's mode, shows the frame's trust flags (rate measured or not, uncalibrated),
+and recovers by itself after an unplug. v1 is read-only except button presses. Bench options:
+`--stats CSV` (rates once a second), `--events TXT`, `--meter-log CSV`, `--grab PNG`,
+`--quit-after S`. One reader thread (`gui/worker.py`) owns the port; a 30 Hz timer draws.
+
 ## Layers
 | module | job |
 |---|---|
@@ -30,11 +39,14 @@ capture — it never sends its demo trace. `scope --frames N` counts only new ca
 | `link.py` | port discovery by VID:PID, reopen after the port vanishes |
 | `device.py` | one method per request; stateless; one retry after a replug (e.g. the firmware's CDC self-heal, #39) |
 | `cli.py` | the `openscope` command |
+| `gui/` | the `openscope-gui` window: `worker.py` (reader `QThread`), `views.py` (plots), `app.py` |
 
 ## Tests (no hardware)
 ```bash
 python3 tests/test_proto.py        # framing + rejection paths + a mutation
 python3 tests/test_end_to_end.py   # host tool vs the REAL firmware esp_comm.c (compiled into a shim, via ctypes)
+python3 tests/test_gui_worker.py   # GUI reader thread vs a fake Device (needs the gui extra; skipped without)
+python3 tests/test_gui_views.py    # FFT/period helpers, cursor readout, meter CSV (offscreen Qt)
 ```
 The end-to-end suite checks the §6 acceptance criteria against the firmware's own parser and encoder: `info` shows the live mode and battery and follows a mode change, "no device" is a clean exit 1, button presses reach the injector, a full input queue is a NAK and not a false success, the ASCII shell keeps working next to the protocol, and an abandoned frame does not poison the next request.
 

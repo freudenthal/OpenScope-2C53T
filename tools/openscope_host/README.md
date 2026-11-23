@@ -45,41 +45,10 @@ capture — it never sends its demo trace. `scope --frames N` counts only new ca
 `frame_id`) and gives up, keeping what it got, when acquisition is stopped or held.
 
 ## GUI (`openscope-gui`)
-`pip install -e .[gui]` (PySide6-Essentials, pyqtgraph, numpy), then `openscope-gui`
-(or `python -m openscope.gui.app`).
-
-![openscope-gui on the unit: Oscilloscope tab, control panel, status bar](docs/openscope-gui.png)
-
-* **Tabs are the unit's modes:** Oscilloscope, Multimeter, Signal generator. Click a tab and the
-  unit goes to that mode. Press MENU on the unit and the window goes to the matching tab (it
-  sends nothing for that). While the unit shows its Settings menu, a line over the tabs says so.
-* **Control panel** (right; one panel per tab). Oscilloscope: Run/Stop, Single (trigger Single,
-  then run), the channels to show, time/div, volts/div and probe ×1/×10 per channel, trigger
-  mode, edge, source and level. The lists show practical values from the unit's own description
-  (`openscope describe`): "2.56 ms/div", "26 V/div" (probe included), "≈" for provisional values.
-  Settings with no calibrated value are hidden; View ▸ Show uncalibrated settings lists them.
-  The level is in volts on the source channel, relative to the middle of the screen (in percent
-  of the screen on a range with no volts meaning). Codes (timebase code, range, register value)
-  are in the tooltips only. The panel shows the state the unit reports back after each set, never
-  the value it asked for. The Multimeter and Signal generator panels come in later stages.
-* **Menus:** File (Save LCD screenshot, Save waveform as CSV or NPZ, Record meter to CSV, Exit),
-  View (Control panel, Unit keys, Show uncalibrated settings, Advanced tools), Device (Connect,
-  Disconnect, Port, Device information), Tools (with Advanced tools: Debug console, which never
-  sends `cal restore` or `mem write`), Help (About). Window size, dock layout and View choices
-  are kept between runs.
-* **Toolbar and keys:** Run/Stop (Space), Single, Screenshot (Ctrl+P), Save waveform (Ctrl+S),
-  Pause display; F1 About. Shortcuts never send unit key presses. The unit keys dock (View ▸
-  Unit keys, hidden by default) sends key presses for functions that have no control yet.
-* **Status bar:** connection, unit mode and battery, the scope state in words ("Running ·
-  2.56 ms/div · 12.49 kS/s (measured)", "held record", "record taken at …" when the shown
-  record was taken with other settings), link and draw rates.
-
-The plot shows raw ADC counts, two cursors (Δt, Δcounts), an FFT tab and the measurements; the
-meter tab has a strip chart and the CSV log. The screenshot stops the scope for the dump and runs
-it again, so the screen passes the CRC. The window recovers by itself after an unplug. Bench
-options: `--stats CSV` (rates once a second), `--events TXT`, `--meter-log CSV`, `--grab PNG`,
-`--quit-after S`, `--channels 1,2`. One reader thread (`gui/worker.py`) owns the port; a 30 Hz
-timer draws.
+The desktop window moved to its own repository,
+[OpenScope-2C53T-GUI](https://github.com/freudenthal/OpenScope-2C53T-GUI) (package `openscope_gui`).
+It uses this library: `pip install -e tools/openscope_host`, then install the GUI from its checkout.
+Keep the library and the firmware at the same protocol version as the GUI expects.
 
 ## Layers
 | module | job |
@@ -88,16 +57,11 @@ timer draws.
 | `link.py` | port discovery by VID:PID, reopen after the port vanishes |
 | `device.py` | one method per request; stateless; one retry after a replug (e.g. the firmware's CDC self-heal, #39) |
 | `cli.py` | the `openscope` command |
-| `gui/` | the `openscope-gui` window: `worker.py` (reader `QThread`), `window.py` (tabs, menus, toolbar, docks), `scope_panel.py`, `dialogs.py`, `labels.py` (practical-unit text), `views.py` (plots), `app.py` (entry point) |
 
 ## Tests (no hardware)
 ```bash
 python3 tests/test_proto.py        # framing + rejection paths + a mutation
 python3 tests/test_end_to_end.py   # host tool vs the REAL firmware esp_comm.c (compiled into a shim, via ctypes)
-python3 tests/test_gui_worker.py   # GUI reader thread vs a fake Device (needs the gui extra; skipped without)
-python3 tests/test_gui_views.py    # FFT/period helpers, cursor readout, meter CSV (offscreen Qt)
-python3 tests/test_gui_labels.py   # practical-unit text from a real device description (no Qt)
-python3 tests/test_gui_app.py      # the window offscreen: tabs = modes, panel, no codes visible, settings kept
 ```
 The end-to-end suite checks the §6 acceptance criteria against the firmware's own parser and encoder: `info` shows the live mode and battery and follows a mode change, "no device" is a clean exit 1, button presses reach the injector, a full input queue is a NAK and not a false success, the ASCII shell keeps working next to the protocol, and an abandoned frame does not poison the next request.
 

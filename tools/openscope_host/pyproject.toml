@@ -11,12 +11,10 @@ dependencies = ["pyserial>=3.5"]
 
 [project.optional-dependencies]
 mcp = ["mcp>=1.2"]
-gui = ["PySide6-Essentials", "pyqtgraph>=0.14", "numpy"]
 
 [project.scripts]
 openscope = "openscope.cli:main"
 openscope-mcp = "openscope.mcp_server:main"
-openscope-gui = "openscope.gui.app:main"
 
 [tool.setuptools]
-packages = ["openscope", "openscope.gui"]
+packages = ["openscope"]

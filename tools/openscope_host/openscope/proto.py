@@ -31,6 +31,12 @@ CMD_STATUS = 0x08
 CMD_BUTTON = 0x0A
 CMD_GET_METER = 0x21
 CMD_GET_WAVEFORM = 0x22
+CMD_GET_SCOPE_STATE = 0x23
+CMD_SET_MODE = 0x24
+CMD_SET_TIMEBASE = 0x25
+CMD_SET_VDIV = 0x26
+CMD_SET_TRIGGER = 0x27
+CMD_RUN_STOP = 0x29
 
 # Device -> host
 RSP_ACK = 0x81
@@ -39,6 +45,7 @@ RSP_DATA = 0x83
 RSP_STATUS = 0x85
 RSP_METER_FRAME = 0x90
 RSP_WAVEFORM_FRAME = 0x91
+RSP_SCOPE_STATE = 0x92
 
 ERRORS = {
     0x01: "UNKNOWN_CMD",
@@ -474,11 +481,149 @@ def parse_waveform(payload: bytes) -> Waveform:
                     bytes(payload[hlen:hlen + count]))
 
 
+# ── Control surface (M6): GET_SCOPE_STATE and the scope sets ──────────────
+# Layouts: firmware/src/drivers/esp_comm.h ("Control surface"). Every field is
+# range-checked here too, so a bad argument fails before anything is sent.
+TIMEBASE_CODES = 21                 # reg 0x01 codes 0x00..0x14
+VDIV_RANGES = 10                    # frontend ranges 0..9
+TRIG_LEVEL_MAX = 100                # the UI's -100..100
+TIERS = {0: "none", 1: "provisional", 2: "measured"}
+TRIG_MODES = {0: "auto", 1: "normal", 2: "single"}
+TRIG_EDGES = {0: "rising", 1: "falling"}
+TRIG_SOURCES = {0: "CH1", 1: "CH2"}
+SCOPE_STATE_VERSION = 1
+SCOPE_STATE_FIXED = struct.Struct("<BBBBBBBBBBhIBBH")   # 20 bytes up to counts_per_div
+SCOPE_CHANNEL = struct.Struct("<BBBBI")                 # 8 bytes per channel
+SCOPE_STATE_LEN = SCOPE_STATE_FIXED.size + 2 * SCOPE_CHANNEL.size     # 36
+
+
+def _lookup(table: dict, value, what: str) -> int:
+    """'normal' / 'NORMAL' / 1 / '1' -> 1, else ValueError naming the choices."""
+    if isinstance(value, int) and value in table:
+        return value
+    s = str(value).strip().lower()
+    for k, v in table.items():
+        if s == v.lower() or s == str(k):
+            return k
+    raise ValueError(f"{what} {value!r}: one of {', '.join(table.values())}")
+
+
+def mode_id(name_or_id) -> int:
+    return _lookup(MODES, name_or_id, "mode")
+
+
+def payload_set_mode(mode) -> bytes:
+    return bytes([mode_id(mode)])
+
+
+def payload_set_timebase(code: int) -> bytes:
+    if not isinstance(code, int) or not 0 <= code < TIMEBASE_CODES:
+        raise ValueError(f"timebase code {code!r}: 0x00..0x{TIMEBASE_CODES - 1:02X}")
+    return bytes([code])
+
+
+def payload_set_vdiv(channel: int, range_idx: int) -> bytes:
+    if channel not in (1, 2):
+        raise ValueError(f"channel {channel!r}: 1 or 2")
+    if not isinstance(range_idx, int) or not 0 <= range_idx < VDIV_RANGES:
+        raise ValueError(f"range {range_idx!r}: 0..{VDIV_RANGES - 1}")
+    return bytes([channel, range_idx])
+
+
+def payload_set_trigger(mode, edge="rising", source="CH1", level: int = 0) -> bytes:
+    m = _lookup(TRIG_MODES, mode, "trigger mode")
+    e = _lookup(TRIG_EDGES, edge, "edge")
+    s = _lookup(TRIG_SOURCES, source, "source")
+    if not isinstance(level, int) or not -TRIG_LEVEL_MAX <= level <= TRIG_LEVEL_MAX:
+        raise ValueError(f"trigger level {level!r}: -{TRIG_LEVEL_MAX}..{TRIG_LEVEL_MAX}")
+    return struct.pack("<BBBh", m, e, s, level)
+
+
+def payload_run_stop(running: bool) -> bytes:
+    return bytes([1 if running else 0])
+
+
+@dataclass(frozen=True)
+class ScopeChannel:
+    enabled: bool
+    vdiv_idx: int
+    vdiv_tier: int                  # 0 none, 1 provisional, 2 measured
+    uv_per_div: int                 # 0 = no volts meaning on this range
+
+    @property
+    def tier_name(self) -> str:
+        return TIERS.get(self.vdiv_tier, f"?{self.vdiv_tier}")
+
+
+@dataclass(frozen=True)
+class ScopeState:
+    """The scope's working state, as the firmware holds it (GET_SCOPE_STATE)."""
+    version: int
+    mode: int
+    running: bool
+    timebase_idx: int               # the display's code
+    timebase_code: int              # reg 0x01 code in force in the FPGA
+    timebase_tier: int
+    trig_mode: int
+    trig_edge: int
+    trig_source: int
+    trig_level: int
+    sample_rate_hz: int             # of the code in force; 0 = no trustworthy rate
+    trig_code: int                  # reg 0x08 in force
+    counts_per_div: int
+    ch: tuple                       # (ScopeChannel CH1, ScopeChannel CH2)
+
+    @property
+    def mode_name(self) -> str:
+        return MODES.get(self.mode, f"unknown({self.mode})")
+
+    @property
+    def timebase_disagrees(self) -> bool:
+        return self.timebase_idx != self.timebase_code
+
+    @property
+    def timebase_tier_name(self) -> str:
+        return TIERS.get(self.timebase_tier, f"?{self.timebase_tier}")
+
+    @property
+    def trig_mode_name(self) -> str:
+        return TRIG_MODES.get(self.trig_mode, f"?{self.trig_mode}")
+
+    @property
+    def trig_edge_name(self) -> str:
+        return TRIG_EDGES.get(self.trig_edge, f"?{self.trig_edge}")
+
+    @property
+    def trig_source_name(self) -> str:
+        return TRIG_SOURCES.get(self.trig_source, f"?{self.trig_source}")
+
+
+def parse_scope_state(payload: bytes) -> ScopeState:
+    if len(payload) < 2:
+        raise ProtocolError(f"SCOPE_STATE too short: {len(payload)} B")
+    ver, length = payload[0], payload[1]
+    if ver != SCOPE_STATE_VERSION:
+        raise ProtocolError(f"SCOPE_STATE v{ver}, this tool reads v{SCOPE_STATE_VERSION}")
+    if length != len(payload) or length < SCOPE_STATE_LEN:
+        raise ProtocolError(f"SCOPE_STATE length byte {length}, payload {len(payload)} B, "
+                            f"need >= {SCOPE_STATE_LEN}")
+    (_, _, mode, running, tb_idx, tb_code, tb_tier, tmode, tedge, tsrc, tlevel,
+     rate, tcode, _res, cpd) = SCOPE_STATE_FIXED.unpack_from(payload)
+    chans = []
+    for i in range(2):
+        en, vd, tier, _r, uv = SCOPE_CHANNEL.unpack_from(payload, SCOPE_STATE_FIXED.size + i * SCOPE_CHANNEL.size)
+        chans.append(ScopeChannel(bool(en), vd, tier, uv))
+    return ScopeState(ver, mode, bool(running), tb_idx, tb_code, tb_tier, tmode, tedge, tsrc,
+                      tlevel, rate, tcode, cpd, tuple(chans))
+
+
 NAK_HINTS = {
     "NO_CAPTURE_DATA": "the scope has no real capture yet (nothing acquired since boot, or the FPGA "
                        "is not capturing); the device never substitutes its demo trace",
     "UNSUPPORTED_IN_MODE": "the scope is not in oscilloscope mode, so its capture buffers are not live",
-    "NOT_READY": "no tear-free copy of the capture could be taken; try again",
+    "NOT_READY": "the device could not do it now (no tear-free capture copy, or a setting the "
+                 "acquisition task would not pause for); nothing changed, try again",
+    "BAD_ARG": "a value is out of range; nothing changed",
     "UNSUPPORTED": "this firmware does not implement the request",
 }
 

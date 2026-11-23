@@ -41,8 +41,12 @@ class _WriteFailed(DeviceError):
 
 
 # Queries: re-sending after a lost reply cannot change the instrument.
+# The M6 sets carry ABSOLUTE values (a code, a range, a mode), never steps:
+# applying one twice leaves the same state as once, so they may be re-sent too.
 IDEMPOTENT = frozenset({proto.CMD_PING, proto.CMD_STATUS, proto.CMD_GET_METER,
-                        proto.CMD_GET_WAVEFORM})
+                        proto.CMD_GET_WAVEFORM, proto.CMD_GET_SCOPE_STATE,
+                        proto.CMD_SET_MODE, proto.CMD_SET_TIMEBASE, proto.CMD_SET_VDIV,
+                        proto.CMD_SET_TRIGGER, proto.CMD_RUN_STOP})
 
 # Shell commands that only read. The shell also has commands that reset the
 # device (fwapply, fwswap, reboot bootloader) or write flash, so a shell line
@@ -270,6 +274,38 @@ class Device:
 
     def press(self, button) -> None:
         self.request(proto.CMD_BUTTON, bytes([proto.button_id(button)]))
+
+    # ── control surface (M6) ──────────────────────────────────────
+    def scope_state(self) -> proto.ScopeState:
+        """Mode, timebase (display code AND the code in force), volts/div per
+        channel, trigger, run/stop — as the firmware holds them."""
+        return proto.parse_scope_state(
+            self.request(proto.CMD_GET_SCOPE_STATE, expect=(proto.RSP_SCOPE_STATE,)).payload)
+
+    # SET_MODE waits on the device for each injected MENU press to land
+    # (up to 0.8 s each, at most 5): allow for it.
+    MODE_TIMEOUT_S = 5.0
+
+    def set_mode(self, mode) -> None:
+        payload = proto.payload_set_mode(mode)
+        old, self.timeout = self.timeout, max(self.timeout, self.MODE_TIMEOUT_S)
+        try:
+            self.request(proto.CMD_SET_MODE, payload)
+        finally:
+            self.timeout = old
+
+    def set_timebase(self, code: int) -> None:
+        """reg 0x01 code 0x00..0x14; ACK means the FPGA runs at it."""
+        self.request(proto.CMD_SET_TIMEBASE, proto.payload_set_timebase(code))
+
+    def set_vdiv(self, channel: int, range_idx: int) -> None:
+        self.request(proto.CMD_SET_VDIV, proto.payload_set_vdiv(channel, range_idx))
+
+    def set_trigger(self, mode, edge="rising", source="CH1", level: int = 0) -> None:
+        self.request(proto.CMD_SET_TRIGGER, proto.payload_set_trigger(mode, edge, source, level))
+
+    def run_stop(self, running: bool) -> None:
+        self.request(proto.CMD_RUN_STOP, proto.payload_run_stop(running))
 
     # ── ASCII shell (same port; §3.2 keeps it alive next to the protocol) ──
     def shell(self, line: str, timeout: float = 3.0) -> str:

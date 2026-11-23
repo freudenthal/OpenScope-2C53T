@@ -57,6 +57,11 @@ def lib():
                                         ctypes.c_uint32, ctypes.c_int, ctypes.c_int, ctypes.c_int]
         L.shim_set_wave_channel.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_int,
                                             ctypes.c_int, ctypes.c_uint32]
+        L.shim_set_ctrl_result.argtypes = [ctypes.c_int]
+        L.shim_set_ctrl_bound.argtypes = [ctypes.c_int]
+        L.shim_last_ctrl.argtypes = [ctypes.c_int]
+        L.shim_set_scope_state.argtypes = [ctypes.c_int] * 5 + [ctypes.c_uint32] + [ctypes.c_int] * 5
+        L.shim_set_scope_channel.argtypes = [ctypes.c_int] * 4 + [ctypes.c_uint32]
         _LIB = L
     return _LIB
 
@@ -689,6 +694,147 @@ class TestTransportLoss(unittest.TestCase):
         dev.link.write = lambda data: None       # swallowed: nothing ever answers
         with self.assertRaises(Timeout):
             dev.ping()
+
+
+def ctl_device():
+    dev = device()
+    L = dev.link.L
+    L.shim_set_scope_state(0, 1, 0x10, 0x10, 2, 12490, 0, 0, 0, 0, 0x5A)
+    L.shim_set_scope_channel(0, 1, 6, 2, 42950)
+    L.shim_set_scope_channel(1, 1, 8, 1, 279050)
+    return dev
+
+
+def run_cli(dev, argv):
+    out, err = io.StringIO(), io.StringIO()
+    with mock.patch.object(cli.Device, "open", return_value=dev), redirect_stdout(out), redirect_stderr(err):
+        rc = cli.main(argv)
+    return rc, out.getvalue(), err.getvalue()
+
+
+class TestControlSurface(unittest.TestCase):
+    """M6 sets against the real esp_comm.c: validation, provider calls, replies."""
+
+    def test_scope_state_round_trips_through_the_firmware_encoder(self):
+        s = ctl_device().scope_state()
+        self.assertEqual((s.mode_name, s.running, s.timebase_code, s.sample_rate_hz, s.timebase_tier_name),
+                         ("scope", True, 0x10, 12490, "measured"))
+        self.assertEqual((s.ch[0].vdiv_idx, s.ch[0].uv_per_div, s.ch[1].tier_name), (6, 42950, "provisional"))
+        self.assertEqual(s.trig_code, 0x5A)
+
+    def test_firmware_zeroes_a_rate_its_tier_disowns(self):
+        dev = ctl_device()
+        dev.link.L.shim_set_scope_state(0, 1, 0x08, 0x08, 0, 99999, 0, 0, 0, 0, 0x80)    # tier NONE
+        dev.link.L.shim_set_scope_channel(0, 1, 2, 0, 1234)                            # range NONE
+        s = dev.scope_state()
+        self.assertEqual((s.sample_rate_hz, s.ch[0].uv_per_div), (0, 0))
+
+    def test_each_set_reaches_the_provider_with_its_arguments(self):
+        dev = ctl_device()
+        L = dev.link.L
+        dev.set_timebase(0x14)
+        self.assertEqual([L.shim_last_ctrl(i) for i in range(2)], [2, 0x14])
+        dev.set_vdiv(2, 7)
+        self.assertEqual([L.shim_last_ctrl(i) for i in range(3)], [3, 2, 7])
+        dev.set_trigger("single", "falling", "CH2", -55)
+        self.assertEqual([L.shim_last_ctrl(i) for i in range(5)], [4, 2, 1, 1, -55])
+        dev.run_stop(False)
+        self.assertEqual([L.shim_last_ctrl(i) for i in range(2)], [5, 0])
+        dev.set_mode("meter")
+        self.assertEqual([L.shim_last_ctrl(i) for i in range(2)], [1, 1])
+        s = dev.scope_state()
+        self.assertEqual((s.timebase_code, s.ch[1].vdiv_idx, s.trig_mode_name, s.trig_level, s.running, s.mode_name),
+                         (0x14, 7, "single", -55, False, "meter"))
+
+    def test_bad_field_is_bad_arg_and_the_provider_is_not_called(self):
+        dev = ctl_device()
+        L = dev.link.L
+        bad = [(proto.CMD_SET_TIMEBASE, b"\x15"), (proto.CMD_SET_VDIV, b"\x00\x01"),
+               (proto.CMD_SET_VDIV, b"\x01\x0a"), (proto.CMD_SET_TRIGGER, b"\x03\x00\x00\x00\x00"),
+               (proto.CMD_SET_TRIGGER, b"\x00\x02\x00\x00\x00"), (proto.CMD_SET_TRIGGER, b"\x00\x00\x02\x00\x00"),
+               (proto.CMD_SET_TRIGGER, b"\x00\x00\x00\x65\x00"),      # level +101
+               (proto.CMD_SET_TRIGGER, b"\x00\x00\x00\x9b\xff"),      # level -101
+               (proto.CMD_RUN_STOP, b"\x02"), (proto.CMD_SET_MODE, b"\x04")]
+        for cmd, payload in bad:
+            with self.assertRaises(Nak, msg=f"0x{cmd:02X} {payload.hex()}") as cm:
+                dev.request(cmd, payload)
+            self.assertEqual(proto.ERRORS[cm.exception.code], "BAD_ARG")
+        self.assertEqual(L.shim_ctrl_calls(), 0)
+
+    def test_wrong_length_is_bad_length(self):
+        dev = ctl_device()
+        for cmd, payload in ((proto.CMD_GET_SCOPE_STATE, b"\x00"), (proto.CMD_SET_TIMEBASE, b""),
+                             (proto.CMD_SET_VDIV, b"\x01"), (proto.CMD_SET_TRIGGER, b"\x00\x00\x00\x00"),
+                             (proto.CMD_RUN_STOP, b"\x01\x01")):
+            with self.assertRaises(Nak) as cm:
+                dev.request(cmd, payload)
+            self.assertEqual(proto.ERRORS[cm.exception.code], "BAD_LENGTH")
+        self.assertEqual(dev.link.L.shim_ctrl_calls(), 0)
+
+    def test_provider_failure_is_not_ready_and_changes_nothing(self):
+        dev = ctl_device()
+        dev.link.L.shim_set_ctrl_result(1)
+        with self.assertRaises(Nak) as cm:
+            dev.set_timebase(0x12)
+        self.assertEqual(proto.ERRORS[cm.exception.code], "NOT_READY")
+        self.assertEqual(dev.scope_state().timebase_code, 0x10)
+        dev.link.L.shim_set_ctrl_result(2)
+        with self.assertRaises(Nak) as cm:
+            dev.run_stop(True)
+        self.assertEqual(proto.ERRORS[cm.exception.code], "UNSUPPORTED_IN_MODE")
+
+    def test_unbound_provider_is_unsupported(self):
+        dev = ctl_device()
+        dev.link.L.shim_set_ctrl_bound(0)
+        for call in (dev.scope_state, lambda: dev.set_timebase(0x10)):
+            with self.assertRaises(Nak) as cm:
+                call()
+            self.assertEqual(proto.ERRORS[cm.exception.code], "UNSUPPORTED")
+
+    def test_cli_state_prints_every_field(self):
+        rc, out, _ = run_cli(ctl_device(), ["state"])
+        self.assertEqual(rc, 0)
+        for text in ("mode      scope, running", "0x10 in force, 12490 S/s (measured); display agrees",
+                     "CH1       on , range 6, 42.95 mV/div (measured", "CH2       on , range 8",
+                     "trigger   auto, rising, CH1, level +0 (reg 0x08 = 0x5A)"):
+            self.assertIn(text, out)
+
+    def test_cli_set_prints_the_state_in_force(self):
+        dev = ctl_device()
+        rc, out, _ = run_cli(dev, ["set", "timebase", "0x14"])
+        self.assertEqual(rc, 0)
+        self.assertIn("timebase  0x14 in force", out)
+        rc, out, _ = run_cli(dev, ["set", "trigger", "normal", "-30"])     # edge/source kept
+        self.assertEqual(rc, 0)
+        self.assertIn("trigger   normal, rising, CH1, level -30", out)
+        rc, out, _ = run_cli(dev, ["set", "vdiv", "1", "5"])
+        self.assertIn("CH1       on , range 5", out)
+        rc, out, _ = run_cli(dev, ["set", "stop"])
+        self.assertIn("STOPPED", out)
+
+    def test_cli_refusal_exits_2_with_a_readable_line(self):
+        dev = ctl_device()
+        dev.link.L.shim_set_ctrl_result(1)
+        rc, out, err = run_cli(dev, ["set", "timebase", "0x12"])
+        self.assertEqual(rc, 2)
+        self.assertIn("refused", err)
+        self.assertIn("NOT_READY", err)
+        self.assertEqual(out, "")
+
+    def test_cli_bad_value_is_usage_and_sends_nothing(self):
+        dev = ctl_device()
+        for argv in (["set", "timebase", "0x15"], ["set", "vdiv", "3", "1"], ["set", "trigger", "sometimes"],
+                     ["set", "trigger", "auto", "200"], ["set", "mode", "dmm"], ["set", "vdiv", "1"]):
+            rc, _, err = run_cli(dev, argv)
+            self.assertEqual(rc, cli.EXIT_USAGE, argv)
+        self.assertEqual(dev.link.L.shim_ctrl_calls(), 0)
+
+    def test_absolute_set_is_resent_after_a_lost_reply(self):
+        dev = ctl_device()
+        dev.link.fail_next_read_after_write = True
+        dev.set_timebase(0x11)
+        self.assertEqual(dev.link.L.shim_ctrl_calls(), 2)          # applied twice, same state
+        self.assertEqual(dev.scope_state().timebase_code, 0x11)
 
 
 if __name__ == "__main__":

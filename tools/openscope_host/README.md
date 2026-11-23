@@ -10,11 +10,21 @@ python3 -m openscope info               # firmware, protocol, mode, battery, USB
 python3 -m openscope press MENU OK      # inject button presses
 python3 -m openscope meter --count 0 --log m.csv   # log the multimeter (~4 Hz) until Ctrl-C
 python3 -m openscope scope --frames 10 --channels 1,2 --out cap.csv   # captures (raw counts); .npz needs numpy
+python3 -m openscope state              # mode, timebase (display + in force), volts/div, trigger, run/stop
+python3 -m openscope set timebase 0x10  # also: set vdiv 1 6 | set trigger normal falling ch1 -20
+                                        #       set run | set stop | set mode meter
 python3 -m openscope shell usbstat      # run one ASCII debug-shell command
 python3 -m openscope screenshot s.png   # device framebuffer, CRC-checked
 ```
 
-Exit codes: 0 ok, 1 no device (one-line message, no traceback), 2 device refused or error.
+Exit codes: 0 ok, 1 no device (one-line message, no traceback), 2 device refused or error,
+64 bad arguments (nothing sent).
+
+`set` goes through the firmware's single entry point for each setting (the same one the
+buttons use) and prints the state in force after it. `set mode` presses MENU on the device
+until the mode matches. Omitted `set trigger` fields keep their current values. A host set is
+not written to the settings store by itself: it is saved by the next button press, MENU, or
+power-off countdown. STOP freezes the LCD only; acquisition and `frame_id` keep running.
 
 Waveforms are raw unsigned ADC counts. A frame carries the bench-measured sample rate and
 volts/div of its timebase code and range (bench unit #1, 0 where none was measured) and flags

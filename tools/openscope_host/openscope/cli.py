@@ -232,6 +232,86 @@ def _scope(dev: Device, a) -> int:
     return status
 
 
+def _state_lines(s: proto.ScopeState) -> List[str]:
+    rate = (f"{s.sample_rate_hz} S/s ({s.timebase_tier_name})" if s.sample_rate_hz
+            else "no trustworthy rate")
+    tb = f"0x{s.timebase_code:02X} in force, {rate}"
+    tb += (f"; display shows 0x{s.timebase_idx:02X}: DISAGREES" if s.timebase_disagrees
+           else "; display agrees")
+    lines = [f"mode      {s.mode_name}, {'running' if s.running else 'STOPPED'}",
+             f"timebase  {tb}"]
+    for i, c in enumerate(s.ch):
+        gain = (f"{c.uv_per_div / 1000:g} mV/div ({c.tier_name}, bench unit #1)" if c.uv_per_div
+                else "no volts meaning on this range")
+        lines.append(f"CH{i + 1}       {'on ' if c.enabled else 'off'}, range {c.vdiv_idx}, {gain}")
+    lines.append(f"trigger   {s.trig_mode_name}, {s.trig_edge_name}, {s.trig_source_name}, "
+                 f"level {s.trig_level:+d} (reg 0x08 = 0x{s.trig_code:02X})")
+    lines.append(f"grid      {s.counts_per_div} ADC counts/div")
+    return lines
+
+
+def _state(dev: Device, _a) -> int:
+    for line in _state_lines(dev.scope_state()):
+        print(line)
+    return EXIT_OK
+
+
+SET_USAGE = ("set timebase <code 0x00-0x14> | set vdiv <1|2> <0-9> | "
+             "set trigger <auto|normal|single> [rising|falling] [ch1|ch2] [level -100..100] | "
+             "set run | set stop | set mode <scope|meter|siggen|settings>")
+
+
+def _int(text: str) -> int:
+    return int(text, 0)          # 0x10, 16, -20
+
+
+def _set(dev: Device, a) -> int:
+    what, v = a.what, a.values
+    try:
+        # Every value is checked HERE, before anything is sent (exit 64).
+        if what == "timebase" and len(v) == 1:
+            code = _int(v[0])
+            proto.payload_set_timebase(code)
+            action = lambda: dev.set_timebase(code)  # noqa: E731
+        elif what == "vdiv" and len(v) == 2:
+            ch, rng = _int(v[0]), _int(v[1])
+            proto.payload_set_vdiv(ch, rng)
+            action = lambda: dev.set_vdiv(ch, rng)  # noqa: E731
+        elif what in ("run", "stop") and not v:
+            action = lambda: dev.run_stop(what == "run")  # noqa: E731
+        elif what == "mode" and len(v) == 1:
+            proto.mode_id(v[0])
+            action = lambda: dev.set_mode(v[0])  # noqa: E731
+        elif what == "trigger" and 1 <= len(v) <= 4:
+            # Omitted fields keep the device's current values.
+            cur = dev.scope_state()
+            mode, edge, src, level = v[0], cur.trig_edge, cur.trig_source, cur.trig_level
+            for tok in v[1:]:
+                t = tok.lower()
+                if t in proto.TRIG_EDGES.values():
+                    edge = t
+                elif t.upper() in proto.TRIG_SOURCES.values():
+                    src = t.upper()
+                else:
+                    level = _int(tok)
+            proto.payload_set_trigger(mode, edge, src, level)       # validate before sending
+            action = lambda: dev.set_trigger(mode, edge, src, level)  # noqa: E731
+        else:
+            print(f"usage: openscope {SET_USAGE}", file=sys.stderr)
+            return EXIT_USAGE
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        action()
+    except Nak as e:
+        print(f"refused: {nak_explained(e)}", file=sys.stderr)
+        return EXIT_DEVICE_ERROR
+    for line in _state_lines(dev.scope_state()):          # what is in force now
+        print(line)
+    return EXIT_OK
+
+
 def _shell(dev: Device, a) -> int:
     print(dev.shell(" ".join(a.line), timeout=a.timeout))
     return EXIT_OK
@@ -264,6 +344,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--channels", default="1", help="1, 2 or 1,2 (default 1)")
     p.add_argument("--interval", type=float, default=0.05, help="poll period, s")
     p.add_argument("--out", metavar="FILE", help="save to .csv (always) or .npz (needs numpy)")
+    sub.add_parser("state", help="scope settings: mode, timebase, volts/div, trigger, run/stop")
+    p = sub.add_parser("set", help="change a scope setting; prints the state in force after it",
+                       description=SET_USAGE)
+    p.add_argument("what", choices=["timebase", "vdiv", "trigger", "run", "stop", "mode"])
+    p.add_argument("values", nargs="*", metavar="VALUE")
     p = sub.add_parser("shell", help="run one ASCII debug-shell command")
     p.add_argument("line", nargs="+")
     p.add_argument("--timeout", type=float, default=3.0)
@@ -285,7 +370,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return EXIT_OK
 
     handlers = {"info": _info, "press": _press, "meter": _meter, "shell": _shell,
-                "screenshot": _screenshot, "scope": _scope}
+                "screenshot": _screenshot, "scope": _scope, "state": _state, "set": _set}
     dev = None
     try:
         dev = Device.open(a.port)           # also checks the protocol major (§3.7)

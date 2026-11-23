@@ -229,5 +229,60 @@ class TestGuardsAreLoadBearing(unittest.TestCase):
                          "mutant should accept the corrupted frame the real decoder rejects")
 
 
+def scope_state_payload(**kw):
+    f = dict(ver=1, length=36, mode=0, running=1, tb_idx=0x10, tb_code=0x10, tb_tier=2, tmode=0,
+             tedge=1, tsrc=0, level=-20, rate=12490, tcode=0x5A, cpd=32)
+    f.update(kw)
+    head = struct.pack("<BBBBBBBBBBhIBBH", f["ver"], f["length"], f["mode"], f["running"], f["tb_idx"],
+                       f["tb_code"], f["tb_tier"], f["tmode"], f["tedge"], f["tsrc"], f["level"],
+                       f["rate"], f["tcode"], 0, f["cpd"])
+    return head + struct.pack("<BBBBI", 1, 6, 2, 0, 42950) + struct.pack("<BBBBI", 0, 8, 1, 0, 279050)
+
+
+class TestControlSurface(unittest.TestCase):
+    def test_scope_state_roundtrip(self):
+        s = proto.parse_scope_state(scope_state_payload())
+        self.assertEqual((s.mode_name, s.running, s.timebase_code, s.sample_rate_hz), ("scope", True, 0x10, 12490))
+        self.assertEqual((s.trig_mode_name, s.trig_edge_name, s.trig_source_name, s.trig_level, s.trig_code),
+                         ("auto", "falling", "CH1", -20, 0x5A))
+        self.assertFalse(s.timebase_disagrees)
+        self.assertEqual((s.ch[0].enabled, s.ch[0].vdiv_idx, s.ch[0].tier_name, s.ch[0].uv_per_div),
+                         (True, 6, "measured", 42950))
+        self.assertEqual((s.ch[1].enabled, s.ch[1].vdiv_idx, s.ch[1].tier_name), (False, 8, "provisional"))
+
+    def test_divergence_is_visible(self):
+        self.assertTrue(proto.parse_scope_state(scope_state_payload(tb_idx=0x0A, tb_code=0x08)).timebase_disagrees)
+
+    def test_appended_fields_are_skipped_not_refused(self):
+        p = bytearray(scope_state_payload()) + b"\x01\x02"
+        p[1] = len(p)
+        self.assertEqual(proto.parse_scope_state(bytes(p)).timebase_code, 0x10)
+
+    def test_bad_scope_state_refused(self):
+        good = scope_state_payload()
+        for bad in (good[:35], good[:1], scope_state_payload(ver=2), scope_state_payload(length=40),
+                    good + b"\x00"):                       # length byte no longer matches
+            with self.assertRaises(proto.ProtocolError):
+                proto.parse_scope_state(bad)
+
+    def test_set_payloads(self):
+        self.assertEqual(proto.payload_set_timebase(0x14), b"\x14")
+        self.assertEqual(proto.payload_set_vdiv(2, 9), b"\x02\x09")
+        self.assertEqual(proto.payload_set_trigger("normal", "falling", "ch2", -100), b"\x01\x01\x01\x9c\xff")
+        self.assertEqual(proto.payload_set_trigger(2, 0, 0, 100), b"\x02\x00\x00\x64\x00")
+        self.assertEqual(proto.payload_run_stop(False), b"\x00")
+        self.assertEqual(proto.payload_set_mode("SETTINGS"), b"\x03")
+
+    def test_out_of_range_never_encoded(self):
+        for fn, args in ((proto.payload_set_timebase, (21,)), (proto.payload_set_timebase, (-1,)),
+                         (proto.payload_set_vdiv, (3, 1)), (proto.payload_set_vdiv, (1, 10)),
+                         (proto.payload_set_trigger, ("rolling",)), (proto.payload_set_trigger, ("auto", "up")),
+                         (proto.payload_set_trigger, ("auto", "rising", "ch3")),
+                         (proto.payload_set_trigger, ("auto", "rising", "ch1", 101)),
+                         (proto.payload_set_mode, ("dmm",)), (proto.payload_set_mode, (4,))):
+            with self.assertRaises(ValueError, msg=f"{fn.__name__}{args}"):
+                fn(*args)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

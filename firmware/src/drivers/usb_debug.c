@@ -8543,6 +8543,127 @@ static esp_wave_result_t remote_waveform(uint8_t mask, esp_wave_snapshot_t *w)
     return ESP_WAVE_OK;
 }
 
+/* ─── Control surface (M6, stage-080): GET_SCOPE_STATE and the scope sets ───
+ * Each set goes through the same single entry point the buttons and the
+ * shell use, and changes scope_state only AFTER the hardware took it — the
+ * reverse order (label first) is how the display and reg 0x01 diverged on
+ * 2026-08-19. Runs on this (shell) task, like `fpga scope timebase`.
+ *
+ * NOT persisted here: the settings store is driven from the input task only
+ * (settings_store.h) and samples live state on the next button press, MENU,
+ * or power-off countdown. So a scripted sweep writes no flash; a host set
+ * survives a power cycle only if one of those happens after it. */
+_Static_assert(ESP_TIMEBASE_CODES == SCOPE_TIMEBASE_CODE_COUNT, "wire timebase codes");
+_Static_assert(ESP_VDIV_RANGES == VDIV_COUNT, "wire vdiv ranges");
+_Static_assert(ESP_TRIG_LEVEL_MAX == 100, "trigger level is the UI's -100..100");
+_Static_assert(TRIG_AUTO == 0 && TRIG_NORMAL == 1 && TRIG_SINGLE == 2 &&
+               TRIG_RISING == 0 && TRIG_FALLING == 1 &&
+               TRIG_SRC_CH1 == 0 && TRIG_SRC_CH2 == 1, "wire trigger enums");
+_Static_assert(MODE_OSCILLOSCOPE == 0 && MODE_MULTIMETER == 1 &&
+               MODE_SIGNAL_GEN == 2 && MODE_SETTINGS == 3 && MODE_COUNT == 4,
+               "wire device modes");
+
+static void remote_scope_channel(uint8_t ch, const channel_state_t *c, esp_scope_channel_t *o)
+{
+    o->enabled    = c->enabled;
+    o->vdiv_idx   = c->vdiv_idx;
+    o->vdiv_tier  = (uint8_t)scope_cal_get_tier(ch, c->vdiv_idx);
+    o->uv_per_div = round_u32(scope_cal_volts_per_div(ch, c->vdiv_idx) * 1e6f);
+}
+
+static void remote_scope_state(esp_scope_state_t *o)
+{
+    const scope_state_t *ss = scope_state_get();
+    const uint8_t code = fpga_acq_rate_idx_get();           /* reg 0x01 in force */
+    o->mode           = (uint8_t)current_mode;
+    o->running        = ss->running;
+    o->timebase_idx   = ss->timebase_idx;
+    o->timebase_code  = code;
+    o->timebase_tier  = (uint8_t)scope_timebase_get_tier(code);
+    o->sample_rate_hz = round_u32(scope_timebase_sample_rate(code));
+    o->trig_mode      = (uint8_t)ss->trigger.mode;
+    o->trig_edge      = (uint8_t)ss->trigger.edge;
+    o->trig_source    = (uint8_t)ss->trigger.source;
+    o->trig_level     = ss->trigger.level;
+    o->trig_code      = fpga_acq_trig_code_get();            /* reg 0x08 in force */
+    o->counts_per_div = (uint16_t)SCOPE_CAL_COUNTS_PER_DIV;
+    remote_scope_channel(1, &ss->ch1, &o->ch[0]);
+    remote_scope_channel(2, &ss->ch2, &o->ch[1]);
+}
+
+/* Device mode has no single entry point: the MENU key handler is the only
+ * code that changes current_mode with its side effects (meter-chip mode,
+ * siggen/scope entry, PC11, settings flush). So inject MENU through the
+ * button queue and wait for each press to land, rather than writing
+ * current_mode behind the UI's back. MENU inside a settings sub-menu first
+ * backs out without a mode change, hence one extra press is allowed. */
+#define REMOTE_MODE_PRESS_WAIT_MS  800u
+static esp_ctrl_result_t remote_set_mode(uint8_t target)
+{
+    for (uint8_t press = 0; press < MODE_COUNT + 1u; press++) {
+        const device_mode_t before = current_mode;
+        if ((uint8_t)before == target)
+            return ESP_CTRL_OK;
+        if (!button_scan_inject(ESP_BTN_MENU))
+            return ESP_CTRL_NOT_READY;
+        for (uint32_t t = 0; t < REMOTE_MODE_PRESS_WAIT_MS / 10u && current_mode == before; t++)
+            vTaskDelay(pdMS_TO_TICKS(10));
+        if (current_mode == before && before != MODE_SETTINGS)
+            return ESP_CTRL_NOT_READY;                      /* the press did not land */
+    }
+    return ((uint8_t)current_mode == target) ? ESP_CTRL_OK : ESP_CTRL_NOT_READY;
+}
+
+static esp_ctrl_result_t remote_set_timebase(uint8_t code)
+{
+    if (!fpga_apply_timebase(code))
+        return ESP_CTRL_NOT_READY;                          /* acq task would not park */
+    scope_state_get()->timebase_idx = code;
+    return ESP_CTRL_OK;
+}
+
+static esp_ctrl_result_t remote_set_vdiv(uint8_t ch, uint8_t range)
+{
+    scope_state_t *ss = scope_state_get();
+    if (!fpga_apply_vdiv(ch, range))
+        return ESP_CTRL_NOT_READY;
+    (ch == 1u ? &ss->ch1 : &ss->ch2)->vdiv_idx = range;
+    return ESP_CTRL_OK;
+}
+
+/* Level through fpga_apply_trigger_level() (the one writer of reg 0x08);
+ * mode/edge/source are state the acq task and the edge filter read every
+ * cycle, set the way `fpga scope trigmode` sets them. The register write
+ * goes first: if it fails nothing at all has changed. */
+static esp_ctrl_result_t remote_set_trigger(uint8_t mode, uint8_t edge, uint8_t source, int16_t level)
+{
+    scope_state_t *ss = scope_state_get();
+    if (!fpga_apply_trigger_level(level))
+        return ESP_CTRL_NOT_READY;
+    ss->trigger.level  = level;
+    ss->trigger.edge   = (trigger_edge_t)edge;
+    ss->trigger.source = (trigger_source_t)source;
+    ss->trigger.mode   = (trigger_mode_t)mode;
+    return ESP_CTRL_OK;
+}
+
+/* The RUN/STOP key (OK in scope mode) is scope_toggle_running(): the field
+ * and nothing else. Same here, as an absolute value. */
+static esp_ctrl_result_t remote_run_stop(bool running)
+{
+    scope_state_get()->running = running;
+    return ESP_CTRL_OK;
+}
+
+static const esp_control_ops_t remote_control = {
+    .get_state    = remote_scope_state,
+    .set_mode     = remote_set_mode,
+    .set_timebase = remote_set_timebase,
+    .set_vdiv     = remote_set_vdiv,
+    .set_trigger  = remote_set_trigger,
+    .run_stop     = remote_run_stop,
+};
+
 static void remote_to_shell(const uint8_t *data, uint16_t len, void *ctx)
 {
     (void)ctx;
@@ -8606,6 +8727,7 @@ static void vUsbDebugTask(void *pvParameters)
     esp_comm_set_button_injector(button_scan_inject);
     esp_comm_set_meter_provider(remote_meter);
     esp_comm_set_waveform_provider(remote_waveform);
+    esp_comm_set_control_provider(&remote_control);
 
     for (;;) {
         bool did_work = false;

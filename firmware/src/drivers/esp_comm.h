@@ -42,6 +42,12 @@
 #define ESP_CMD_MODULE_DELETE   0x0D    /* Delete a module by slot */
 #define ESP_CMD_GET_METER       0x21    /* remote_protocol.md §3.4: one meter reading */
 #define ESP_CMD_GET_WAVEFORM    0x22    /* §3.4: u8 channel_mask -> one WAVEFORM_FRAME per channel */
+#define ESP_CMD_GET_SCOPE_STATE 0x23    /* §3.4 (M6): -> SCOPE_STATE */
+#define ESP_CMD_SET_MODE        0x24    /* u8 device_mode 0..3 */
+#define ESP_CMD_SET_TIMEBASE    0x25    /* u8 reg 0x01 code 0..ESP_TIMEBASE_CODES-1 */
+#define ESP_CMD_SET_VDIV        0x26    /* u8 channel 1|2, u8 range 0..ESP_VDIV_RANGES-1 */
+#define ESP_CMD_SET_TRIGGER     0x27    /* u8 mode, u8 edge, u8 source, i16 level */
+#define ESP_CMD_RUN_STOP        0x29    /* u8 running 0|1 */
 
 /* Responses: GD32 → ESP32 */
 #define ESP_RSP_ACK             0x81    /* Command accepted */
@@ -52,6 +58,7 @@
 #define ESP_RSP_MODULE_LIST     0x86    /* Module list response */
 #define ESP_RSP_METER_FRAME     0x90    /* §3.5 METER_FRAME */
 #define ESP_RSP_WAVEFORM_FRAME  0x91    /* §3.5 WAVEFORM_FRAME */
+#define ESP_RSP_SCOPE_STATE     0x92    /* §3.4 SCOPE_STATE (layout below) */
 
 /* NAK error codes */
 #define ESP_ERR_UNKNOWN_CMD     0x01
@@ -259,6 +266,90 @@ typedef enum {
     ESP_WAVE_BUSY,              /* no tear-free copy within the retry budget */
 } esp_wave_result_t;
 typedef esp_wave_result_t (*esp_wave_fn)(uint8_t channel_mask, esp_wave_snapshot_t *out);
+/* ─── Control surface (M6, remote_protocol.md §3.4 codes 0x23-0x29) ───
+ *
+ * Set payloads, little-endian. esp_comm validates the length and EVERY field
+ * before the provider is called, so a refused request changes nothing:
+ *   SET_MODE      u8 mode     0 scope, 1 meter, 2 siggen, 3 settings
+ *   SET_TIMEBASE  u8 code     the SPI reg 0x01 code, 0..ESP_TIMEBASE_CODES-1
+ *                             (scope_state.timebase_idx IS this code; §3.4's
+ *                             "index into timebase_table[]" predates that)
+ *   SET_VDIV      u8 channel (1|2), u8 range 0..ESP_VDIV_RANGES-1
+ *   SET_TRIGGER   u8 mode (0 auto, 1 normal, 2 single), u8 edge (0 rising,
+ *                 1 falling), u8 source (0 CH1, 1 CH2), i16 level -100..100
+ *   RUN_STOP      u8 running (0 stop, 1 run)
+ * Replies: ACK once the setting is in force. NAK BAD_LENGTH / BAD_ARG for a
+ * malformed request (provider not called), NOT_READY when the provider could
+ * not apply it (nothing changed), UNSUPPORTED_IN_MODE when the provider needs
+ * another mode, UNSUPPORTED when no provider is bound.
+ *
+ * SCOPE_STATE payload v1, explicit little-endian layout (not a struct dump):
+ *   [0]      u8   version         ESP_SCOPE_STATE_VERSION
+ *   [1]      u8   length          bytes in this payload; fields may be appended
+ *   [2]      u8   mode            current device mode
+ *   [3]      u8   running         scope_state.running (RUN/STOP)
+ *   [4]      u8   timebase_idx    the display's code (labels the axis)
+ *   [5]      u8   timebase_code   reg 0x01 code IN FORCE in the FPGA; [4] != [5]
+ *                                 is the 2026-08-19 divergence, made visible
+ *   [6]      u8   timebase_tier   ESP_TIER_* of the code in force
+ *   [7]      u8   trig_mode
+ *   [8]      u8   trig_edge
+ *   [9]      u8   trig_source
+ *   [10..11] i16  trig_level      -100..100 (the UI's units)
+ *   [12..15] u32  sample_rate_hz  bench-measured rate of the code in force;
+ *                                 0 = no trustworthy rate (tier NONE)
+ *   [16]     u8   trig_code       reg 0x08 code IN FORCE
+ *   [17]     u8   reserved (0)
+ *   [18..19] u16  counts_per_div
+ *   [20..23] CH1: u8 enabled, u8 vdiv_idx, u8 vdiv_tier, u8 reserved
+ *   [24..27] CH1: u32 uv_per_div  (0 = the range has no volts meaning)
+ *   [28..31] CH2: as [20..23]
+ *   [32..35] CH2: u32 uv_per_div
+ */
+#define ESP_SCOPE_STATE_VERSION 1
+#define ESP_SCOPE_STATE_LEN     36
+#define ESP_TIMEBASE_CODES      21      /* SCOPE_TIMEBASE_CODE_COUNT (usb_debug.c asserts) */
+#define ESP_VDIV_RANGES         10      /* VDIV_COUNT (usb_debug.c asserts) */
+#define ESP_TRIG_LEVEL_MAX      100
+
+typedef struct {
+    bool        enabled;
+    uint8_t     vdiv_idx;
+    uint8_t     vdiv_tier;      /* ESP_TIER_* of uv_per_div */
+    uint32_t    uv_per_div;
+} esp_scope_channel_t;
+
+typedef struct {
+    uint8_t     mode;
+    bool        running;
+    uint8_t     timebase_idx;   /* display */
+    uint8_t     timebase_code;  /* in force */
+    uint8_t     timebase_tier;  /* of the code in force */
+    uint32_t    sample_rate_hz; /* of the code in force */
+    uint8_t     trig_mode, trig_edge, trig_source;
+    int16_t     trig_level;
+    uint8_t     trig_code;      /* reg 0x08 in force */
+    uint16_t    counts_per_div;
+    esp_scope_channel_t ch[2];
+} esp_scope_state_t;
+
+typedef enum {
+    ESP_CTRL_OK = 0,
+    ESP_CTRL_NOT_READY,         /* could not apply (e.g. acq task would not park): nothing changed */
+    ESP_CTRL_WRONG_MODE,        /* the setting needs another device mode */
+} esp_ctrl_result_t;
+
+/* All members may be NULL: the matching command then answers UNSUPPORTED.
+ * Arguments are already range-checked. A provider must change nothing when
+ * it returns anything but ESP_CTRL_OK. */
+typedef struct {
+    void              (*get_state)(esp_scope_state_t *out);
+    esp_ctrl_result_t (*set_mode)(uint8_t mode);
+    esp_ctrl_result_t (*set_timebase)(uint8_t code);
+    esp_ctrl_result_t (*set_vdiv)(uint8_t channel, uint8_t range);
+    esp_ctrl_result_t (*set_trigger)(uint8_t mode, uint8_t edge, uint8_t source, int16_t level);
+    esp_ctrl_result_t (*run_stop)(bool running);
+} esp_control_ops_t;
 /* Inject a button press (id 1..15 = button_id_t). Return false if it could
  * not be queued, so the host gets NAK instead of a false ACK. */
 typedef bool (*esp_button_fn)(uint8_t button_id);
@@ -363,6 +454,8 @@ void esp_comm_set_status_provider(esp_status_fn fn);
 void esp_comm_set_button_injector(esp_button_fn fn);
 void esp_comm_set_meter_provider(esp_meter_fn fn);
 void esp_comm_set_waveform_provider(esp_wave_fn fn);
+/* The ops table is used by reference: it must outlive the binding (static). */
+void esp_comm_set_control_provider(const esp_control_ops_t *ops);
 
 /* True while a frame is being received (sync seen, checksum not yet). */
 bool esp_comm_rx_in_frame(void);

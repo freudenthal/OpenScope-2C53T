@@ -55,6 +55,38 @@ void shim_set_wave_channel(int ch, const uint8_t *samples, int n, int vdiv_idx, 
     c->vdiv_idx = (uint8_t)vdiv_idx; c->vdiv_tier = (uint8_t)vdiv_tier; c->uv_per_div = uv_per_div;
 }
 
+/* Control surface (M6). Stubs record the last call; ctrl_result is what every
+ * set returns (0 OK, 1 NOT_READY, 2 WRONG_MODE). A set that returns OK is
+ * reflected in the state GET_SCOPE_STATE reports, like the firmware's. */
+static esp_scope_state_t cs;
+static int ctrl_result = 0, ctrl_calls = 0;
+static int last_ctrl[6];            /* [0] which (1 mode .. 5 run), then args */
+static void rec(int which, int a, int b, int c, int d) { ctrl_calls++; last_ctrl[0] = which; last_ctrl[1] = a; last_ctrl[2] = b; last_ctrl[3] = c; last_ctrl[4] = d; }
+static void c_get(esp_scope_state_t *o) { *o = cs; }
+static esp_ctrl_result_t c_mode(uint8_t m) { rec(1, m, 0, 0, 0); if (!ctrl_result) cs.mode = m; return (esp_ctrl_result_t)ctrl_result; }
+static esp_ctrl_result_t c_tb(uint8_t code) { rec(2, code, 0, 0, 0); if (!ctrl_result) cs.timebase_idx = cs.timebase_code = code; return (esp_ctrl_result_t)ctrl_result; }
+static esp_ctrl_result_t c_vdiv(uint8_t ch, uint8_t r) { rec(3, ch, r, 0, 0); if (!ctrl_result) cs.ch[ch - 1].vdiv_idx = r; return (esp_ctrl_result_t)ctrl_result; }
+static esp_ctrl_result_t c_trig(uint8_t m, uint8_t e, uint8_t s, int16_t l) { rec(4, m, e, s, l); if (!ctrl_result) { cs.trig_mode = m; cs.trig_edge = e; cs.trig_source = s; cs.trig_level = l; } return (esp_ctrl_result_t)ctrl_result; }
+static esp_ctrl_result_t c_run(bool r) { rec(5, r, 0, 0, 0); if (!ctrl_result) cs.running = r; return (esp_ctrl_result_t)ctrl_result; }
+static const esp_control_ops_t ctrl_ops = { c_get, c_mode, c_tb, c_vdiv, c_trig, c_run };
+void shim_set_ctrl_result(int r) { ctrl_result = r; }
+void shim_set_ctrl_bound(int b) { esp_comm_set_control_provider(b ? &ctrl_ops : 0); }
+int  shim_ctrl_calls(void) { return ctrl_calls; }
+int  shim_last_ctrl(int i) { return (i >= 0 && i < 6) ? last_ctrl[i] : -999; }
+void shim_set_scope_state(int mode, int running, int tb_idx, int tb_code, int tb_tier, uint32_t rate,
+                          int tmode, int tedge, int tsrc, int tlevel, int tcode)
+{
+    cs.mode = (uint8_t)mode; cs.running = running != 0; cs.timebase_idx = (uint8_t)tb_idx;
+    cs.timebase_code = (uint8_t)tb_code; cs.timebase_tier = (uint8_t)tb_tier; cs.sample_rate_hz = rate;
+    cs.trig_mode = (uint8_t)tmode; cs.trig_edge = (uint8_t)tedge; cs.trig_source = (uint8_t)tsrc;
+    cs.trig_level = (int16_t)tlevel; cs.trig_code = (uint8_t)tcode; cs.counts_per_div = 32;
+}
+void shim_set_scope_channel(int ch, int enabled, int vdiv, int tier, uint32_t uv)
+{
+    esp_scope_channel_t *c = &cs.ch[ch ? 1 : 0];
+    c->enabled = enabled != 0; c->vdiv_idx = (uint8_t)vdiv; c->vdiv_tier = (uint8_t)tier; c->uv_per_div = uv;
+}
+
 void shim_init(void)
 {
     esp_comm_init();
@@ -63,6 +95,9 @@ void shim_init(void)
     esp_comm_set_button_injector(inject);
     esp_comm_set_meter_provider(meter);
     esp_comm_set_waveform_provider(wave);
+    esp_comm_set_control_provider(&ctrl_ops);
+    memset(&cs, 0, sizeof cs); memset(last_ctrl, 0, sizeof last_ctrl);
+    ctrl_result = 0; ctrl_calls = 0;
     memset(&wv, 0, sizeof wv); wave_state = 1; wave_step = 0;
     meter_ok = 0; meter_wrong = 0; memset(&mt, 0, sizeof mt);
     tx_n = sh_n = 0; presses = 0; last_button = -1; inject_ok = 1;

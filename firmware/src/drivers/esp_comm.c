@@ -67,6 +67,7 @@ static esp_status_fn status_provider = 0;
 static esp_button_fn button_injector = 0;
 static esp_meter_fn meter_provider = 0;
 static esp_wave_fn wave_provider = 0;
+static const esp_control_ops_t *control_ops = 0;
 
 /* Reported only when no status provider is bound (host tests, bare ESP32
  * bring-up). The firmware binds the real build string. */
@@ -126,6 +127,11 @@ void esp_comm_set_meter_provider(esp_meter_fn fn)
 void esp_comm_set_waveform_provider(esp_wave_fn fn)
 {
     wave_provider = fn;
+}
+
+void esp_comm_set_control_provider(const esp_control_ops_t *ops)
+{
+    control_ops = ops;
 }
 
 void esp_comm_get_rx_stats(esp_rx_stats_t *out)
@@ -566,6 +572,136 @@ static void handle_get_waveform(const esp_packet_t *pkt)
     }
 }
 
+/* ─── Control surface (M6) — layouts and reply rules in esp_comm.h ─── */
+
+static void put_i16(uint8_t *p, int16_t v) { put_u16(p, (uint16_t)v); }
+static int16_t get_i16(const uint8_t *p) { return (int16_t)(uint16_t)(p[0] | (p[1] << 8)); }
+
+/* Shared tail of every set: map the provider's answer onto the wire. */
+static void ctrl_reply(esp_ctrl_result_t r)
+{
+    switch (r) {
+    case ESP_CTRL_OK:         esp_comm_send_ack(); break;
+    case ESP_CTRL_WRONG_MODE: esp_comm_send_nak(ESP_ERR_UNSUPPORTED_IN_MODE); break;
+    default:                  esp_comm_send_nak(ESP_ERR_NOT_READY); break;   /* nothing changed */
+    }
+}
+
+/* Length first, then the provider's presence, then every field: a refusal
+ * names the first thing wrong with the request itself. */
+static bool ctrl_len_ok(const esp_packet_t *pkt, uint16_t want, bool bound)
+{
+    if (pkt->payload_len != want) {
+        esp_comm_send_nak(ESP_ERR_BAD_LENGTH);
+        return false;
+    }
+    if (!bound) {
+        esp_comm_send_nak(ESP_ERR_UNSUPPORTED);
+        return false;
+    }
+    return true;
+}
+
+static void put_scope_channel(uint8_t *p, const esp_scope_channel_t *c)
+{
+    /* Same guard as the waveform header: a gain the tier disowns is zeroed. */
+    const bool usable = tier_flag(c->vdiv_tier, c->uv_per_div, 1, 1) != 0;
+    p[0] = c->enabled ? 1 : 0;
+    p[1] = c->vdiv_idx;
+    p[2] = usable ? c->vdiv_tier : ESP_TIER_NONE;
+    p[3] = 0;
+    put_u32(&p[4], usable ? c->uv_per_div : 0);
+}
+
+static void handle_get_scope_state(const esp_packet_t *pkt)
+{
+    esp_scope_state_t s;
+    uint8_t out[ESP_SCOPE_STATE_LEN];
+    bool rate_ok;
+
+    if (!ctrl_len_ok(pkt, 0, control_ops && control_ops->get_state))
+        return;
+    memset(&s, 0, sizeof(s));
+    control_ops->get_state(&s);
+    rate_ok = tier_flag(s.timebase_tier, s.sample_rate_hz, 1, 1) != 0;
+    memset(out, 0, sizeof(out));
+    out[0] = ESP_SCOPE_STATE_VERSION;
+    out[1] = ESP_SCOPE_STATE_LEN;
+    out[2] = s.mode;
+    out[3] = s.running ? 1 : 0;
+    out[4] = s.timebase_idx;
+    out[5] = s.timebase_code;
+    out[6] = rate_ok ? s.timebase_tier : ESP_TIER_NONE;
+    out[7] = s.trig_mode;
+    out[8] = s.trig_edge;
+    out[9] = s.trig_source;
+    put_i16(&out[10], s.trig_level);
+    put_u32(&out[12], rate_ok ? s.sample_rate_hz : 0);
+    out[16] = s.trig_code;
+    put_u16(&out[18], s.counts_per_div);
+    put_scope_channel(&out[20], &s.ch[0]);
+    put_scope_channel(&out[28], &s.ch[1]);
+    esp_comm_send_response(ESP_RSP_SCOPE_STATE, out, ESP_SCOPE_STATE_LEN);
+}
+
+static void handle_set_mode(const esp_packet_t *pkt)
+{
+    if (!ctrl_len_ok(pkt, 1, control_ops && control_ops->set_mode))
+        return;
+    if (pkt->payload[0] > 3) {
+        esp_comm_send_nak(ESP_ERR_BAD_ARG);
+        return;
+    }
+    ctrl_reply(control_ops->set_mode(pkt->payload[0]));
+}
+
+static void handle_set_timebase(const esp_packet_t *pkt)
+{
+    if (!ctrl_len_ok(pkt, 1, control_ops && control_ops->set_timebase))
+        return;
+    if (pkt->payload[0] >= ESP_TIMEBASE_CODES) {
+        esp_comm_send_nak(ESP_ERR_BAD_ARG);
+        return;
+    }
+    ctrl_reply(control_ops->set_timebase(pkt->payload[0]));
+}
+
+static void handle_set_vdiv(const esp_packet_t *pkt)
+{
+    if (!ctrl_len_ok(pkt, 2, control_ops && control_ops->set_vdiv))
+        return;
+    if ((pkt->payload[0] != 1 && pkt->payload[0] != 2) || pkt->payload[1] >= ESP_VDIV_RANGES) {
+        esp_comm_send_nak(ESP_ERR_BAD_ARG);
+        return;
+    }
+    ctrl_reply(control_ops->set_vdiv(pkt->payload[0], pkt->payload[1]));
+}
+
+static void handle_set_trigger(const esp_packet_t *pkt)
+{
+    int16_t level;
+    if (!ctrl_len_ok(pkt, 5, control_ops && control_ops->set_trigger))
+        return;
+    level = get_i16(&pkt->payload[3]);
+    if (pkt->payload[0] > 2 || pkt->payload[1] > 1 || pkt->payload[2] > 1 ||
+        level < -ESP_TRIG_LEVEL_MAX || level > ESP_TRIG_LEVEL_MAX) {
+        esp_comm_send_nak(ESP_ERR_BAD_ARG);       /* one bad field: nothing changes */
+        return;
+    }
+    ctrl_reply(control_ops->set_trigger(pkt->payload[0], pkt->payload[1], pkt->payload[2], level));
+}
+
+static void handle_run_stop(const esp_packet_t *pkt)
+{
+    if (!ctrl_len_ok(pkt, 1, control_ops && control_ops->run_stop))
+        return;
+    if (pkt->payload[0] > 1) {
+        esp_comm_send_nak(ESP_ERR_BAD_ARG);
+        return;
+    }
+    ctrl_reply(control_ops->run_stop(pkt->payload[0] != 0));
+}
+
 #if ESP_COMM_TRANSFER_STUBS
 static void handle_module_start(const esp_packet_t *pkt)
 {
@@ -762,6 +898,12 @@ void esp_comm_process(const esp_packet_t *pkt)
     case ESP_CMD_BUTTON:            handle_button(pkt); break;
     case ESP_CMD_GET_METER:         handle_get_meter(pkt); break;
     case ESP_CMD_GET_WAVEFORM:      handle_get_waveform(pkt); break;
+    case ESP_CMD_GET_SCOPE_STATE:   handle_get_scope_state(pkt); break;
+    case ESP_CMD_SET_MODE:          handle_set_mode(pkt); break;
+    case ESP_CMD_SET_TIMEBASE:      handle_set_timebase(pkt); break;
+    case ESP_CMD_SET_VDIV:          handle_set_vdiv(pkt); break;
+    case ESP_CMD_SET_TRIGGER:       handle_set_trigger(pkt); break;
+    case ESP_CMD_RUN_STOP:          handle_run_stop(pkt); break;
 #if ESP_COMM_TRANSFER_STUBS
     /* ESP32 co-processor staging. The flash writes are still TODO, so these
      * are compiled only where that is understood (the legacy flow tests). */

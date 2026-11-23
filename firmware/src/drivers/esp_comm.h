@@ -197,8 +197,12 @@ typedef esp_meter_result_t (*esp_meter_fn)(esp_meter_snapshot_t *out);
  *                                 0 = no trustworthy rate (never measured,
  *                                 incoherent, or display != hardware)
  *   [16..19] u32  uv_per_div      bench-measured volts/div of this channel and
- *                                 range (scope_cal.c, bench unit #1), in uV, at
- *                                 the BNC (no probe factor); 0 = the range has
+ *                                 range (scope_cal.c, bench unit #1), in uV,
+ *                                 TIMES the channel's probe setting (x1/x10:
+ *                                 scope_cal_volts_per_div() applies it; the
+ *                                 setting itself is not on the wire — stage-080
+ *                                 bench, CH1 at x10 read 34 Vpp for a 3.3 V
+ *                                 square); 0 = the range has
  *                                 no volts meaning. A GAIN only: the zero
  *                                 point is uncalibrated, so counts->volts
  *                                 gives Vpp, not absolute volts.
@@ -302,7 +306,8 @@ typedef esp_wave_result_t (*esp_wave_fn)(uint8_t channel_mask, esp_wave_snapshot
  *   [17]     u8   reserved (0)
  *   [18..19] u16  counts_per_div
  *   [20..23] CH1: u8 enabled, u8 vdiv_idx, u8 vdiv_tier, u8 reserved
- *   [24..27] CH1: u32 uv_per_div  (0 = the range has no volts meaning)
+ *   [24..27] CH1: u32 uv_per_div  (0 = the range has no volts meaning; includes
+ *                                 the probe setting, as the waveform header does)
  *   [28..31] CH2: as [20..23]
  *   [32..35] CH2: u32 uv_per_div
  */

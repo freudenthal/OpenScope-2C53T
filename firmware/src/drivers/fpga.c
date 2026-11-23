@@ -3676,6 +3676,19 @@ uint16_t fpga_acq_post_edge_get(void)
     return (uint16_t)ms;
 }
 bool fpga_acq_post_edge_is_override(void) { return acq_post_edge_ms != 0; }
+/* stage-091: how long after a reg 0x01/0x06/0x08 write a strobed record can
+ * still be one that triggered before the write: its 512 post-trigger samples
+ * at the rate in force, plus one poll and 10 ms. Unmeasured rates: 600 ms.
+ * (After a timebase write the old rate decides; the new rate is used here,
+ * so a write to a slower code drops a little more, never less.) */
+static uint16_t fpga_acq_reprime_window_ms(void)
+{
+    float fs = scope_timebase_sample_rate(acq_rate_idx);
+    if (fs <= 0.0f) return 600u;
+    float ms = 512.0f / fs * 1000.0f + (float)acq_poll_gap_ms + 10.0f;
+    if (ms > 5000.0f) ms = 5000.0f;
+    return (uint16_t)ms;
+}
 /* EXP-48/49 (2026-09-14): from the edge until the bracket ends the FPGA holds
  * the completed record and ignores reads as arms, so the record can be read
  * (and committed) at edge + fill + margin instead of at the bracket's end;
@@ -3977,7 +3990,8 @@ static void fpga_warmtest_acq_task(void *pv)
     trigger_mode_t last_mode = TRIG_AUTO;
     bool stopped = false;              /* stage-082: STOP holds the record */
     bool after_stop = false;           /* first read after RUN: drop a held record */
-    bool after_reprime = false;        /* stage-091: first read after a register write */
+    bool after_reprime = false;        /* stage-091: inside the window after a register write */
+    uint32_t reprime_tick = 0;
     for (;;) {
         if (!fpga.initialized || fpga.bus_released) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -4072,6 +4086,7 @@ static void fpga_warmtest_acq_task(void *pv)
             acq_reprime_req = false;
             capture_in_flight = false;
             after_reprime = true;
+            reprime_tick = xTaskGetTickCount();
         }
         if (mode_now == TRIG_SINGLE && single_done) {
             vTaskDelay(pdMS_TO_TICKS(10));     /* hold the one record */
@@ -4158,15 +4173,19 @@ static void fpga_warmtest_acq_task(void *pv)
                 continue;
             }
         }
-        /* stage-091: a reg 0x01/0x06/0x08 write does not discard a record the
-         * FPGA completed before it; the next read hands it over. Bench on
-         * 3713d78: after a source change CH2 -> CH1 with the level at the CH2
-         * middle, exactly one record came, with its crossing on CH2. So the
-         * first strobed record after a write is from the old settings: drop
-         * it, as the record held across STOP is dropped. */
+        /* stage-091: a reg 0x01/0x06/0x08 write does not discard a capture
+         * that triggered before it: the FPGA completes it (512 post-trigger
+         * samples) and hands it over on a later read. Bench, Normal, 4 s
+         * after a source change with the level kept: one record each time,
+         * crossing on the OLD source (3713d78 at 0x0F and 0x12; b28d078,
+         * which dropped only the first read after the write, still at 0x12,
+         * where 512 samples take 205 ms). A record strobed within 512
+         * samples + one poll of the write triggered before it: drop it, as
+         * the record held across STOP is dropped. */
         if (after_reprime) {
-            after_reprime = false;
-            if (triggered) {
+            if ((int32_t)(last_read_tick - reprime_tick) >= (int32_t)fpga_acq_reprime_window_ms()) {
+                after_reprime = false;
+            } else if (triggered) {
                 fpga.acq_reprime_stale_dropped++;
                 continue;
             }

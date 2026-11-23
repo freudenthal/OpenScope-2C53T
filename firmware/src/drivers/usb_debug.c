@@ -837,7 +837,7 @@ static void cmd_status(void)
         "PC0 edges: %lu\r\n"
         "acq latency: %lu ms (strobe -> commit, last cycle); poll reads before it: %lu (total %lu)\r\n"
         "acq edge filter: %s  kept %lu  dropped %lu  unclassified %lu\r\n"
-        "acq stop: %s, held records dropped on RUN %lu\r\n"
+        "acq stop: %s, held records dropped on RUN %lu, after a register write %lu\r\n"
         "acq rotation: %ld samples (seam of the last strobed record; -1 = none)\r\n"
         "acq hdr CH1: %02X %02X %02X  CH2: %02X %02X %02X\r\n",
         (unsigned long)fpga.pc0_edges,
@@ -846,6 +846,7 @@ static void cmd_status(void)
         (unsigned long)fpga.acq_edge_dropped, (unsigned long)fpga.acq_edge_unknown,
         scope_state_get()->running ? "running" : "STOPPED (no reads)",
         (unsigned long)fpga.acq_stop_stale_dropped,
+        (unsigned long)fpga.acq_reprime_stale_dropped,
         (long)fpga.acq_last_rot,
         fpga.acq_hdr_ch1[0], fpga.acq_hdr_ch1[1], fpga.acq_hdr_ch1[2],
         fpga.acq_hdr_ch2[0], fpga.acq_hdr_ch2[1], fpga.acq_hdr_ch2[2]

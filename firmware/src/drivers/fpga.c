@@ -3977,6 +3977,7 @@ static void fpga_warmtest_acq_task(void *pv)
     trigger_mode_t last_mode = TRIG_AUTO;
     bool stopped = false;              /* stage-082: STOP holds the record */
     bool after_stop = false;           /* first read after RUN: drop a held record */
+    bool after_reprime = false;        /* stage-091: first read after a register write */
     for (;;) {
         if (!fpga.initialized || fpga.bus_released) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -4070,6 +4071,7 @@ static void fpga_warmtest_acq_task(void *pv)
         if (acq_reprime_req) {                 /* a register write dropped the capture */
             acq_reprime_req = false;
             capture_in_flight = false;
+            after_reprime = true;
         }
         if (mode_now == TRIG_SINGLE && single_done) {
             vTaskDelay(pdMS_TO_TICKS(10));     /* hold the one record */
@@ -4153,6 +4155,19 @@ static void fpga_warmtest_acq_task(void *pv)
             after_stop = false;
             if (triggered) {
                 fpga.acq_stop_stale_dropped++; /* the record held across STOP */
+                continue;
+            }
+        }
+        /* stage-091: a reg 0x01/0x06/0x08 write does not discard a record the
+         * FPGA completed before it; the next read hands it over. Bench on
+         * 3713d78: after a source change CH2 -> CH1 with the level at the CH2
+         * middle, exactly one record came, with its crossing on CH2. So the
+         * first strobed record after a write is from the old settings: drop
+         * it, as the record held across STOP is dropped. */
+        if (after_reprime) {
+            after_reprime = false;
+            if (triggered) {
+                fpga.acq_reprime_stale_dropped++;
                 continue;
             }
         }

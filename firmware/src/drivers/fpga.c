@@ -3509,6 +3509,12 @@ static volatile uint16_t acq_auto_wait_ms = 0;
  * fpga_reconcile_trigger_after_arm() hands the register to the UI level
  * right after the arm; fpga_apply_trigger_level() is the ONLY runtime path. */
 static volatile uint8_t acq_trig_code = 0xAD;
+/* stage-091 (G-320): the trigger source in force, SPI3 reg 0x06 (stock's
+ * ms[0x16], desk sweep 2026-08-15: 0 = CH1, 1 = CH2). The arm burst writes
+ * 0; fpga_reconcile_trigger_after_arm() and fpga_apply_trigger() are the only
+ * writers after it. Before stage-091 nothing wrote it at runtime, so the FPGA
+ * compared the CH1 ADC with reg 0x08 whatever the UI source said. */
+static volatile uint8_t acq_trig_src = 0;
 /* EXP-47: a reg-0x08 or reg-0x01 write drops the capture in flight (NORMAL
  * stayed frozen after level +100 -> 0). The apply entry points raise this;
  * the acq task clears capture_in_flight on it and re-primes. */
@@ -3748,6 +3754,7 @@ void fpga_acq_read_br_set(uint8_t br)     { acq_read_br = br; }
 uint8_t fpga_acq_read_br_get(void)      { return acq_read_br; }
 uint16_t fpga_acq_pair_gap_get(void)    { return acq_pair_gap_ms; }
 uint8_t fpga_acq_trig_code_get(void)      { return acq_trig_code; }
+uint8_t fpga_acq_trig_src_get(void)       { return acq_trig_src; }
 
 /* UI trigger level (-100..100, screen pixels about mid-scale, the renderer's
  * own convention: SCOPE_H px == 256 counts, SCOPE_H = LCD_HEIGHT-16-18 = 206
@@ -3815,9 +3822,25 @@ bool fpga_apply_timebase(uint8_t code)
  * acquisition task would not park, in which case nothing was written. */
 bool fpga_apply_trigger_level(int level)
 {
+    return fpga_apply_trigger(level, acq_trig_src);
+}
+
+/* stage-091 (G-320): level and source in one park. Reg 0x06 (source) is
+ * written only when it changes, as stock does; reg 0x08 always. The bench
+ * (stage-091, no-flash test on 2910cef) showed 06 01 moves the comparison to
+ * the CH2 ADC: source CH2 + level at the CH2 middle 14 records / 4 s, + level
+ * at the CH1 middle 0. src: 0 = CH1, 1 = CH2 (other values refused). */
+bool fpga_apply_trigger(int level, uint8_t src)
+{
+    if (src > 1u)
+        return false;
     uint8_t code = fpga_trigger_code_from_level(level);
     if (!fpga_acq_pause())
         return false;
+    if (src != acq_trig_src) {
+        fpga_scope_write_reg(0x06, src);
+        acq_trig_src = src;
+    }
     fpga_scope_write_reg(0x08, code);
     acq_trig_code = code;
     acq_reprime_req = true;
@@ -4152,12 +4175,13 @@ static void fpga_warmtest_acq_task(void *pv)
         /* Edge filter (2026-09-22). A strobed record whose trigger crossing
          * runs the wrong way is handled exactly like a read that found the
          * roll: NORMAL/SINGLE keep holding (SINGLE is not consumed), AUTO
-         * keeps its fallback budget. Classified on CH1, where reg 0x08's
-         * level was measured. UNKNOWN (seam not recoverable -- typically a
+         * keeps its fallback budget. Classified on the trigger source in
+         * force (reg 0x06; CH1 only before stage-091). UNKNOWN (seam not recoverable -- typically a
          * fast periodic signal, whose display the soft trigger already
          * aligns to the chosen edge) is committed unfiltered and counted. */
         if (triggered && acq_edge_filter) {
-            trig_edge_class_t ec = trig_edge_classify(w1, (int)acq_trig_code + (int)FPGA_ADC_OFFSET);
+            trig_edge_class_t ec = trig_edge_classify(acq_trig_src ? w2 : w1,
+                                                    (int)acq_trig_code + (int)FPGA_ADC_OFFSET);
             bool want_rising = (fpga_stock_trigger_edge_byte() == (uint8_t)TRIG_RISING);
             if (ec == TRIG_EDGE_CLASS_UNKNOWN) {
                 fpga.acq_edge_unknown++;
@@ -4877,6 +4901,13 @@ void fpga_reconcile_trigger_after_arm(void)
     SPI3_CS_DEASSERT();
     acq_trig_code = code;
     fpga_trig_reconcile_code = code;
+    /* stage-091: the source too (settings_store may have restored CH2). */
+    uint8_t src = (ss->trigger.source == TRIG_SRC_CH2) ? 1u : 0u;
+    SPI3_CS_ASSERT();
+    spi3_xfer(0x06);
+    spi3_xfer(src);
+    SPI3_CS_DEASSERT();
+    acq_trig_src = src;
 }
 
 /* Vertical sibling of the reconcile above: fpga_init() applies the frontend

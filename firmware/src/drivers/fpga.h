@@ -1111,6 +1111,11 @@ bool    fpga_apply_timebase(uint8_t code);
 /* Trigger sibling (EXP-41): write the digital trigger level, reg 0x08, from
  * the UI's -100..100 and record the code in force. Same park contract. */
 bool    fpga_apply_trigger_level(int level);
+/* stage-091 (G-320): level and trigger source (SPI3 reg 0x06: 0 = CH1,
+ * 1 = CH2) in one park; reg 0x06 is written only on a change. Same park
+ * contract; false and nothing written for src > 1. */
+bool    fpga_apply_trigger(int level, uint8_t src);
+uint8_t fpga_acq_trig_src_get(void);
 uint8_t fpga_trigger_code_from_level(int level);
 /* The level->code relation, as constants so the remote DESCRIPTION (stage-086)
  * reports the same numbers the function uses:

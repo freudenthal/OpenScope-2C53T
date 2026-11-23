@@ -1241,11 +1241,10 @@ static uint16_t scope_soft_trigger_offset(const scope_state_t *ss,
 
     /* 1. Hardware anchor (2026-09-22): a time-ordered record carries the
      *    hardware trigger at index 512, and the crossing nearest it IS the
-     *    event that fired. CH1 only -- the level register was measured there.
-     *    Tested on the trigger SOURCE, not the buffer address: `spi3 frame`
-     *    passes a snapshot copy, and an address test made the bench check
-     *    exercise the fallback while the screen used the anchor (v17). */
-    if (ss->trigger.source != TRIG_SRC_CH2 && fpga_acq_record_time_ordered()) {
+     *    event that fired. src_buf is the trigger source's record: since
+     *    stage-091 (G-320) reg 0x06 makes the FPGA fire on that channel, so
+     *    CH2 gets the anchor too (before it, CH1 only: CH2 never fired). */
+    if (fpga_acq_record_time_ordered()) {
         int a = hw_trigger_anchor(ss, src_buf);
         if (a >= 0) {
             int start = a - tx;

@@ -2787,8 +2787,10 @@ static void cmd_fpga_scope_level(const char *args)
             usb_send_str("acq task would not park — reg 0x08 NOT written\r\n"); return;
         }
     }
-    usb_debug_printf("trigger level %d -> reg 0x08 code 0x%02X in force (boot reconcile wrote 0x%02X)\r\n",
-                     ss->trigger.level, fpga_acq_trig_code_get(), fpga_trigger_reconcile_code());
+    usb_debug_printf("trigger level %d -> reg 0x08 code 0x%02X in force (boot reconcile wrote 0x%02X), "
+                     "source reg 0x06 = %u (CH%u)\r\n",
+                     ss->trigger.level, fpga_acq_trig_code_get(), fpga_trigger_reconcile_code(),
+                     fpga_acq_trig_src_get(), fpga_acq_trig_src_get() + 1u);
 }
 
 /* `fpga acqgate [on|off]` — stock's PRE-read gate (EXP-29/30). Pairs with
@@ -8658,14 +8660,16 @@ static esp_ctrl_result_t remote_set_vdiv(uint8_t ch, uint8_t range)
     return ESP_CTRL_OK;
 }
 
-/* Level through fpga_apply_trigger_level() (the one writer of reg 0x08);
- * mode/edge/source are state the acq task and the edge filter read every
- * cycle, set the way `fpga scope trigmode` sets them. The register write
- * goes first: if it fails nothing at all has changed. */
+/* Level and source through fpga_apply_trigger() (the one runtime writer of
+ * reg 0x08 and reg 0x06; stage-091, G-320: before it the source was state
+ * only and the FPGA always compared CH1); mode/edge are state the acq task
+ * and the edge filter read every cycle, set the way `fpga scope trigmode`
+ * sets them. The register writes go first: if they fail nothing at all has
+ * changed. */
 static esp_ctrl_result_t remote_set_trigger(uint8_t mode, uint8_t edge, uint8_t source, int16_t level)
 {
     scope_state_t *ss = scope_state_get();
-    if (!fpga_apply_trigger_level(level))
+    if (!fpga_apply_trigger(level, source))
         return ESP_CTRL_NOT_READY;
     ss->trigger.level  = level;
     ss->trigger.edge   = (trigger_edge_t)edge;

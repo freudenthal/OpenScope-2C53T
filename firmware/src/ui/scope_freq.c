@@ -96,6 +96,12 @@ static bool analyse(const uint8_t *s, uint16_t n, float *bin, float *sharp)
     float total = 0.0f;
     uint16_t peak = 0;
     float peak_p = 0.0f;
+    /* Bin 0 as a POWER too, though it is never counted: a peak at bin 1 reads
+     * fft_re[0] as its left neighbour below. Left raw, it is the DC real part,
+     * which mean removal + the window can make negative; sqrtf() of it gave a
+     * NaN bin and the harmonic loop never ended (stage-086 bench: a range
+     * sweep froze the display task, G-200). */
+    fft_re[0] = fft_re[0] * fft_re[0] + fft_im[0] * fft_im[0];
     for (uint16_t k = 1u; k < half; k++) {
         const float p = fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k];
         fft_re[k] = p;                       /* reuse: power in place */
@@ -136,11 +142,13 @@ static bool analyse(const uint8_t *s, uint16_t n, float *bin, float *sharp)
     const float den = m_lo - 2.0f * m_pk + m_hi;
     const float frac = (den != 0.0f) ? (0.5f * (m_lo - m_hi) / den) : 0.0f;
     const float fbin = (float)peak + frac;
+    if (!(fbin > 0.5f) || !(fbin < (float)half))
+        return false;                        /* not finite or off the axis: no tone */
 
     {
         float sig = 0.0f;
         uint16_t counted_to = 0u;           /* highest bin already summed */
-        for (uint16_t h = 1u; ; h++) {
+        for (uint16_t h = 1u; h < half; h++) {   /* bounded: fbin >= 0.5 ends it sooner */
             const uint32_t c = (uint32_t)(fbin * (float)h + 0.5f);   /* on the comb */
             if (c + 1u >= half)
                 break;

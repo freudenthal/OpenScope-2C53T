@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
 
 #define MAXN 1024
 
@@ -39,6 +40,37 @@ static int failures = 0;
             failures++;                                                       \
         }                                                                     \
     } while (0)
+
+/* ── stage-086: a peak at bin 1 must not hang the estimator ─────────────── */
+
+/* Under 1 cycle per record (a railing range, or 10 Hz at 12.5 kS/s) puts the
+ * spectral peak at bin 1. The left neighbour was then the raw DC real part,
+ * negative for these phases; sqrtf() made the bin NaN and the harmonic loop
+ * spun forever (the display task froze on the unit). main() arms alarm(), so
+ * a regression fails the run instead of hanging it. */
+static void test_peak_at_bin_one_terminates(void)
+{
+    uint8_t s[MAXN];
+    scope_freq_t r;
+    static const double cycles[] = { 0.5, 0.7, 0.9 };
+    for (int c = 0; c < 3; c++) {
+        for (int ph = 0; ph < 360; ph += 30) {
+            for (int i = 0; i < MAXN; i++)
+                s[i] = (uint8_t)lround(128.0 + 100.0 * sin(2.0 * M_PI * cycles[c] * i / MAXN +
+                                                            ph * M_PI / 180.0));
+            (void)scope_freq_estimate(s, MAXN, 12490.0f, &r);
+            CHECK(r.hz == 0.0f || isfinite(r.hz), "finite answer or a refusal (%.1f cyc, %d deg)",
+                  cycles[c], ph);
+            CHECK(r.hz < 2.0f * 12490.0f / MAXN, "no tone above bin 2 for %.1f cycles (%.1f Hz)",
+                  cycles[c], (double)r.hz);
+        }
+    }
+    /* a railed range: flat with one code of noise */
+    for (int i = 0; i < MAXN; i++)
+        s[i] = (uint8_t)(255 - ((i * 7) % 3 == 0));
+    (void)scope_freq_estimate(s, MAXN, 12490.0f, &r);
+    CHECK(isfinite(r.hz), "railed record: finite");
+}
 
 /* ── synthetic sanity, before touching real data ──────────────────────── */
 
@@ -256,6 +288,8 @@ int main(int argc, char **argv)
 {
     const char *path = (argc > 1) ? argv[1]
                                   : "tests/fixtures/scope_records.txt";
+    alarm(20);                  /* a hang in the estimator is a failure, not a stall */
+    test_peak_at_bin_one_terminates();
     test_synthetic();
     test_bench_records(path);
 

@@ -8919,6 +8919,7 @@ static void vUsbDebugTask(void *pvParameters)
     bool usb_banner_sent = false;   /* a banner went out since enumeration */
     bool usb_rx_seen = false;       /* the first input since enumeration arrived */
     uint8_t usb_dtr_prev = 0;
+    (void)usb_dtr_prev;             /* read only where USB exists (not the emu build) */
     bool rtt_banner_sent = false;
     /* When a transfer dies mid-stream the host still has bytes in flight, and
      * without this they land in shell_feed() and are parsed as command lines —

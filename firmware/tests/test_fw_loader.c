@@ -18,6 +18,9 @@
  *   6. apply() refuses anything not STAGED.
  *   7. No-buffer gate: until the shell task lends a scratch area, begin()
  *      and install_slot() refuse with ERR_NO_BUFFER and consume nothing.
+ *   8. Slot check (stage-167): begin() erases a slot only when each byte
+ *      its staging will erase is ours (FWC1/FWCP manifest span) or 0xFF;
+ *      a refusal names the first foreign byte and changes nothing.
  */
 
 #include "../src/drivers/fw_loader.h"
@@ -244,15 +247,131 @@ static void test_breadcrumb_decode(void)
         CHECK(codes[i] >= 1 && codes[i] <= 7, "failure exit %u blinks %u times", i, codes[i]);
 }
 
+/* ── Slot check (stage-167) ────────────────────────────────────────────
+ * The slots lie inside the stock FAT volume "2:". begin() may erase a slot
+ * only when every byte its staging will erase is ours or 0xFF. */
+#define SLOT_A_IDX 0x000000u
+#define SLOT_B_IDX 0x100000u
+#define SLOT_SPAN  0x100000u
+
+static uint8_t slot_copy[SLOT_SPAN];
+
+static void blank_slot(uint32_t idx)
+{
+    memset(&fw_loader_test_w25q[idx], 0xFF, SLOT_SPAN);
+}
+
+/* begin() must refuse, name `want_off`, erase nothing, arm nothing. */
+static void expect_refused(uint32_t idx, uint8_t slot, uint32_t size, uint32_t want_off,
+                           const char *what)
+{
+    memcpy(slot_copy, &fw_loader_test_w25q[idx], SLOT_SPAN);
+    CHECK(!fw_loader_begin(size, 0x1234u, slot), "%s: begin must refuse", what);
+    CHECK(fw_loader_error() == FW_LOADER_ERR_SLOT_NOT_BLANK,
+          "%s: err must be SLOT_NOT_BLANK (err=%d)", what, fw_loader_error());
+    CHECK(fw_loader_slot_dirty_offset() == want_off,
+          "%s: dirty offset 0x%X, want 0x%X", what,
+          (unsigned)fw_loader_slot_dirty_offset(), (unsigned)want_off);
+    CHECK(memcmp(slot_copy, &fw_loader_test_w25q[idx], SLOT_SPAN) == 0,
+          "%s: a refused slot must be byte-for-byte unchanged", what);
+    CHECK(!fw_loader_active(), "%s: a refused begin must not activate RX routing", what);
+}
+
+static void stage(uint8_t slot, const uint8_t *img, uint32_t size, const char *what)
+{
+    CHECK(fw_loader_begin(size, crc32_ref(img, size), slot), "%s: begin must accept (err=%d)",
+          what, fw_loader_error());
+    feed_in_chunks(img, size, 777);
+    CHECK(fw_loader_state() == FW_LOADER_STAGED, "%s: must stage (state=%d err=%d)", what,
+          fw_loader_state(), fw_loader_error());
+}
+
+static void test_slot_check(void)
+{
+    enum { SZ = 20000, BIG = 40000 };
+    static uint8_t img[BIG];
+    /* Staging SZ erases the manifest sector + data up to this sector end. */
+    const uint32_t erase_end = (4096u + SZ + 4095u) & ~4095u;   /* 0x6000 */
+    make_image(img, BIG);
+
+    /* 1. Foreign data in the data span, no manifest. */
+    blank_slot(SLOT_A_IDX);
+    fw_loader_test_w25q[SLOT_A_IDX + 0x2345u] = 0x00;
+    expect_refused(SLOT_A_IDX, 0, SZ, 0x2345u, "foreign byte in data span");
+
+    /* 2. Foreign data in the manifest sector (a FAT sector, say). */
+    blank_slot(SLOT_A_IDX);
+    memcpy(&fw_loader_test_w25q[SLOT_A_IDX], "\xEB\x3C\x90MSDOS5.0", 11);
+    expect_refused(SLOT_A_IDX, 0, SZ, 0u, "FAT boot sector at slot base");
+
+    /* 3. The last byte the staging would erase counts; the next one does not. */
+    blank_slot(SLOT_A_IDX);
+    fw_loader_test_w25q[SLOT_A_IDX + erase_end - 1u] = 0x7E;
+    expect_refused(SLOT_A_IDX, 0, SZ, erase_end - 1u, "byte in the last erased sector");
+    blank_slot(SLOT_A_IDX);
+    fw_loader_test_w25q[SLOT_A_IDX + erase_end] = 0x7E;
+    stage(0, img, SZ, "byte past the last erased sector");
+    CHECK(fw_loader_test_w25q[SLOT_A_IDX + erase_end] == 0x7E,
+          "a byte outside the erase span must survive the staging");
+
+    /* 4. A blank slot is accepted. fwload alone erases nothing (the
+     *    stage-310 silence check relies on it); the first data chunk marks
+     *    the slot ours before any data erase. */
+    blank_slot(SLOT_B_IDX);
+    CHECK(fw_loader_begin(SZ, crc32_ref(img, SZ), 1), "blank slot must be accepted");
+    for (uint32_t i = 0; i < SLOT_SPAN; ++i) {
+        if (fw_loader_test_w25q[SLOT_B_IDX + i] != 0xFF) {
+            CHECK(0, "begin with no data must change nothing (offset 0x%X)", (unsigned)i);
+            break;
+        }
+    }
+    fw_loader_feed(img, 600);           /* one 512 B chunk commits */
+    CHECK(memcmp(&fw_loader_test_w25q[SLOT_B_IDX], "FWCP", 4) == 0,
+          "the first chunk must write the FWCP marker");
+    CHECK(memcmp(&fw_loader_test_w25q[SLOT_B_IDX + 0x1000u], img, 512) == 0,
+          "the first chunk must land after the manifest sector");
+    CHECK(fw_loader_slot_size(1) == 0, "FWCP must never read as an installable image");
+
+    /* 5. A torn staging of ours (FWCP + partial data) is accepted again. */
+    fw_loader_feed(img + 600, 2400);
+    for (int i = 0; i < 400; ++i)
+        fw_loader_poll();
+    CHECK(fw_loader_error() == FW_LOADER_ERR_TIMEOUT, "partial transfer must time out");
+    CHECK(!fw_loader_install_slot(1), "fwswap of a torn FWCP slot must refuse");
+    stage(1, img, SZ, "re-stage over a torn staging of ours");
+
+    /* 6. A slot with a valid FWC1 manifest is accepted (same size again). */
+    stage(1, img, SZ, "re-stage over FWC1");
+    CHECK(fw_loader_slot_size(1) == SZ, "re-stage must leave FWC1 with the size");
+
+    /* 7. A bigger image over FWC1: bytes past the old erase span must be 0xFF. */
+    fw_loader_test_w25q[SLOT_B_IDX + erase_end + 0x10u] = 0x55;
+    expect_refused(SLOT_B_IDX, 1, BIG, erase_end + 0x10u, "foreign byte past an old FWC1 image");
+    fw_loader_test_w25q[SLOT_B_IDX + erase_end + 0x10u] = 0xFF;
+    stage(1, img, BIG, "bigger image over FWC1, blank tail");
+
+    /* 8. A FWCP marker with an impossible size is not ours. */
+    blank_slot(SLOT_A_IDX);
+    memcpy(&fw_loader_test_w25q[SLOT_A_IDX], "FWCP\x01\x00\x00\x00", 8);
+    expect_refused(SLOT_A_IDX, 0, SZ, 0u, "FWCP with size 1");
+
+    blank_slot(SLOT_A_IDX);
+    blank_slot(SLOT_B_IDX);
+}
+
 int main(void)
 {
     /* Same shape as the target: one 2 KB arena lent by the shell task. */
     static uint8_t scratch[2048];
 
+    /* An erased W25Q reads 0xFF (stage-167: begin() now checks the slot). */
+    memset(fw_loader_test_w25q, 0xFF, sizeof(fw_loader_test_w25q));
+
     test_no_buffer_gate();
     fw_loader_attach_scratch(scratch, sizeof(scratch));
 
     test_size_gate();
+    test_slot_check();
     test_happy_path();
     test_crc_gate();
     test_vector_gate();

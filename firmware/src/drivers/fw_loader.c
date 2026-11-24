@@ -64,6 +64,7 @@ enum {
 };
 
 #define FWL_MANIFEST_MAGIC 0x31435746u /* 'FWC1' little-endian */
+#define FWL_STAGING_MAGIC  0x50435746u /* 'FWCP': staging began (stage-167) */
 
 typedef struct {
     uint32_t magic;
@@ -81,6 +82,7 @@ static uint32_t fwl_received;
 static uint32_t fwl_running_crc;  /* pre-xorout */
 static uint32_t fwl_erase_mark;
 static uint32_t fwl_silence_polls;
+static uint32_t fwl_dirty_off = FW_LOADER_NO_DIRTY;
 
 /* RX chunk accumulator; also the CRC/verify read buffer and the
  * installer's transfer buffer (never active at the same time). Not owned
@@ -200,6 +202,62 @@ static void fwl_fail(fw_loader_error_t err)
     fwl_error = err;
 }
 
+static bool fwl_manifest_size_ok(uint32_t size)
+{
+    return size >= FWL_MIN_IMAGE && size <= FWL_DATA_MAX && !(size & 1u);
+}
+
+static uint32_t fwl_sector_roundup(uint32_t off)
+{
+    return (off + FWL_SECTOR - 1u) & ~(FWL_SECTOR - 1u);
+}
+
+typedef enum {
+    FWL_SLOT_OURS = 0,
+    FWL_SLOT_FOREIGN,
+    FWL_SLOT_IOERR,
+} fwl_slot_verdict_t;
+
+/* Stage-167 slot check (fw_loader.h). The staging that follows erases every
+ * sector from the slot base up to the sector that holds the image's last
+ * byte. Each byte in that span must be ours: inside the span an earlier
+ * staging of ours erased (FWC1 or FWCP marker, its size), or 0xFF. */
+static fwl_slot_verdict_t fwl_slot_check(uint8_t slot, uint32_t size)
+{
+    fwl_manifest_t m;
+    uint32_t base = fwl_slot_base(slot);
+    uint32_t end = fwl_sector_roundup(FWL_DATA_OFF + size);
+    uint32_t off = 0;
+
+    fwl_dirty_off = FW_LOADER_NO_DIRTY;
+    if (fwl_w25q_read(base, (uint8_t *)&m, sizeof(m)) != 0) {
+        return FWL_SLOT_IOERR;
+    }
+    if ((m.magic == FWL_MANIFEST_MAGIC || m.magic == FWL_STAGING_MAGIC) &&
+        fwl_manifest_size_ok(m.size)) {
+        off = fwl_sector_roundup(FWL_DATA_OFF + m.size);
+    }
+    while (off < end) {
+        uint32_t n = end - off;
+        if (n > FWL_CHUNK) {
+            n = FWL_CHUNK;
+        }
+        if (fwl_w25q_read(base + off, fwl_buf, n) != 0) {
+            return FWL_SLOT_IOERR;
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            if (fwl_buf[i] != 0xFFu) {
+                fwl_dirty_off = off + i;
+                return FWL_SLOT_FOREIGN;
+            }
+        }
+        off += n;
+    }
+    return FWL_SLOT_OURS;
+}
+
+uint32_t fw_loader_slot_dirty_offset(void) { return fwl_dirty_off; }
+
 bool fw_loader_begin(uint32_t size, uint32_t crc32, uint8_t slot)
 {
     fwl_state = FW_LOADER_IDLE;
@@ -217,13 +275,25 @@ bool fw_loader_begin(uint32_t size, uint32_t crc32, uint8_t slot)
         fwl_fail(FW_LOADER_ERR_SIZE);
         return false;
     }
+    switch (fwl_slot_check(slot, size)) {
+    case FWL_SLOT_OURS:
+        break;
+    case FWL_SLOT_FOREIGN:
+        fwl_fail(FW_LOADER_ERR_SLOT_NOT_BLANK);
+        return false;
+    default:
+        fwl_fail(FW_LOADER_ERR_FLASH);
+        return false;
+    }
     fwl_slot = slot;
     fwl_expected = size;
     fwl_crc_announced = crc32;
     fwl_running_crc = 0xFFFFFFFFu;
     fwl_erase_mark = fwl_slot_base(slot); /* manifest sector erased too:
                                              a began transfer invalidates
-                                             the slot until it re-STAGES */
+                                             the slot until it re-STAGES.
+                                             Nothing is erased before the
+                                             first data chunk arrives. */
     fwl_state = FW_LOADER_RECEIVING;
     return true;
 }
@@ -242,8 +312,21 @@ bool fw_loader_active(void)
 
 static bool fwl_commit_chunk(void)
 {
-    uint32_t addr = fwl_slot_base(fwl_slot) + FWL_DATA_OFF +
-                    (fwl_received - fwl_buf_fill);
+    uint32_t base = fwl_slot_base(fwl_slot);
+    uint32_t addr = base + FWL_DATA_OFF + (fwl_received - fwl_buf_fill);
+    if (fwl_erase_mark == base) {
+        /* First chunk (stage-167): mark the slot ours BEFORE the first data
+         * erase, so a torn transfer leaves a slot the next fwload accepts.
+         * This also invalidates any FWC1 image here until the slot
+         * re-STAGES (fwl_finish writes FWC1 last). */
+        fwl_manifest_t mk = { FWL_STAGING_MAGIC, fwl_expected,
+                              fwl_crc_announced, 0u };
+        if (fwl_w25q_erase(base, FWL_SECTOR) != 0 ||
+            fwl_w25q_write(base, (const uint8_t *)&mk, sizeof(mk)) != 0) {
+            return false;
+        }
+        fwl_erase_mark = base + FWL_DATA_OFF;
+    }
     while (fwl_erase_mark < addr + fwl_buf_fill) {
         if (fwl_w25q_erase(fwl_erase_mark, FWL_SECTOR) != 0) {
             return false;
@@ -375,8 +458,7 @@ static bool fwl_read_manifest(uint8_t slot, fwl_manifest_t *m)
     if (fwl_w25q_read(fwl_slot_base(slot), (uint8_t *)m, sizeof(*m)) != 0) {
         return false;
     }
-    return m->magic == FWL_MANIFEST_MAGIC && m->size >= FWL_MIN_IMAGE &&
-           m->size <= FWL_DATA_MAX && !(m->size & 1u);
+    return m->magic == FWL_MANIFEST_MAGIC && fwl_manifest_size_ok(m->size);
 }
 
 uint32_t fw_loader_slot_size(uint8_t slot)

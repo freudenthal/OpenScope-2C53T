@@ -45,6 +45,7 @@ SUITES = (
     "test_iap_disk_pick.py",
     "test_flash_regions.py",
     "test_config_persist.py",
+    "test_fw_loader.py",
     "test_cal_backup.py",
     "test_flash_switcher.py",
     "test_flash_preflight.py",

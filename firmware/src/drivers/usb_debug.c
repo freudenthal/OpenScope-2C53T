@@ -7931,6 +7931,7 @@ static const char *fwl_err_name(fw_loader_error_t e)
     case FW_LOADER_ERR_TIMEOUT: return "rx went silent; run fwload again";
     case FW_LOADER_ERR_NO_IMAGE: return "slot holds no valid image";
     case FW_LOADER_ERR_NO_BUFFER: return "no scratch attached (shell task bug)";
+    case FW_LOADER_ERR_SLOT_NOT_BLANK: return "slot not blank and not ours; nothing erased";
     }
     return "?";
 }
@@ -8016,6 +8017,17 @@ static void cmd_fwload(const char *args)
         return;
     }
     if (!fw_loader_begin((uint32_t)size, (uint32_t)crc, slot)) {
+        if (fw_loader_error() == FW_LOADER_ERR_SLOT_NOT_BLANK) {
+            /* stage-167: the slot holds bytes that no staging of ours wrote
+             * (it lies inside the stock FAT volume "2:"). Name the byte. */
+            uint32_t off = fw_loader_slot_dirty_offset();
+            usb_debug_printf("fwload: REFUSED slot %c (W25Q 0x%06lX): byte at offset "
+                             "0x%05lX (0x%06lX) is not 0xFF and the slot has no "
+                             "FWC1/FWCP manifest; nothing erased\r\n",
+                             slot ? 'b' : 'a', slot ? 0xE00000ul : 0xD00000ul,
+                             (unsigned long)off,
+                             (slot ? 0xE00000ul : 0xD00000ul) + (unsigned long)off);
+        }
         fwl_print_status();
         return;
     }

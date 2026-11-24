@@ -82,7 +82,25 @@ typedef enum {
     FW_LOADER_ERR_TIMEOUT,  /* RX went silent mid-transfer                */
     FW_LOADER_ERR_NO_IMAGE, /* slot holds no valid manifest               */
     FW_LOADER_ERR_NO_BUFFER,/* no scratch attached — a programming error   */
+    FW_LOADER_ERR_SLOT_NOT_BLANK, /* slot holds bytes that are not ours;
+                                     fw_loader_slot_dirty_offset() names the
+                                     first non-0xFF byte (stage-167)        */
 } fw_loader_error_t;
+
+/* ── Slot check (stage-167) ──────────────────────────────────────────────
+ * The slots lie inside the stock FAT volume "2:", and staging erases sector
+ * by sector. fw_loader_begin() erases a slot only when it is ours:
+ *   - it holds a valid FWC1 manifest (an earlier staging finished), or
+ *   - its manifest sector holds the FWCP "staging" marker that the first
+ *     data chunk writes before any data erase (an earlier staging of ours
+ *     was torn: timeout, CRC or vector failure), or
+ *   - it reads all 0xFF over the manifest sector + the new image's size.
+ * Anything else is refused with ERR_SLOT_NOT_BLANK and nothing is erased.
+ * fwload with no data still erases nothing (the stage-310 silence check).
+ * FWCP is not FWC1, so no installer (ours or the 2C23T port's) can take a
+ * torn slot for an image. */
+#define FW_LOADER_NO_DIRTY 0xFFFFFFFFu
+uint32_t fw_loader_slot_dirty_offset(void); /* from slot base, or NO_DIRTY */
 
 /* The loader owns no buffer. The shell task lends it one — at least
  * FW_LOADER_SCRATCH_MIN bytes — before the first fwload/fwswap; every entry

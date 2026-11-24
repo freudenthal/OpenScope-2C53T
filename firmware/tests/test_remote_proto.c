@@ -866,6 +866,117 @@ static void test_host_active_clock(void)
     CHECK(!esp_comm_host_active(20001), "a corrupt frame does not count");
 }
 
+/* ─── stage-155: parser gaps (code-review-2026-11-23 §90) ─── */
+
+static void test_payload_cap_256_accepted_257_refused(void)
+{
+    static uint8_t buf[600];
+    uint8_t p[300], payload[257]; uint16_t pl = 0; size_t off = 0, n;
+    for (int i = 0; i < 257; i++) payload[i] = (uint8_t)('a' + i % 26);
+    reset();
+    n = frame(buf, ESP_CMD_PING, payload, ESP_MAX_PAYLOAD);
+    CHECK(ESP_MAX_PAYLOAD == 256, "host-to-device cap is 256 (protocol doc; O-8 is a user decision)");
+    route(buf, n, 0);
+    CHECK(take(&off, p, &pl) == ESP_RSP_DATA, "a 256-byte payload (the cap) is accepted and answered");
+    CHECK(shell_len == 0, "no byte of the 256-byte frame reaches the shell");
+    reset(); off = 0;
+    n = frame(buf, ESP_CMD_PING, payload, 257);
+    memcpy(buf + n, "ls\r", 3); n += 3;
+    route(buf, n, 0);
+    CHECK(take(&off, p, &pl) == ESP_RSP_NAK && p[0] == ESP_ERR_BAD_LENGTH,
+          "a 257-byte payload (one over the cap) gets NAK(BAD_LENGTH)");
+    CHECK(take(&off, p, &pl) == -1, "and nothing else: the 257-byte frame is not also answered");
+    CHECK(strcmp(shell, "ls\r") == 0, "its payload is swallowed; the text after it reaches the shell");
+}
+
+static void test_sync_byte_inside_frame(void)
+{
+    static uint8_t buf[400];
+    uint8_t p[300], payload[0xAA]; uint16_t pl = 0; size_t off = 0, n;
+    const uint8_t aa[] = { 0xAA, 0xAA, 0x01, 0xAA };
+    reset();
+    route(buf, frame(buf, ESP_CMD_PING, aa, sizeof aa), 0);
+    CHECK(take(&off, p, &pl) == ESP_RSP_DATA, "0xAA bytes inside a payload are data, not a new frame");
+    CHECK(take(&off, p, &pl) == -1, "exactly one reply");
+    CHECK(shell_len == 0, "nothing leaks to the shell");
+    /* Length low byte 0xAA (170) and a payload of 0xAA only. */
+    memset(payload, 0xAA, sizeof payload);
+    reset(); off = 0;
+    n = frame(buf, ESP_CMD_PING, payload, sizeof payload);
+    CHECK(buf[3] == 0xAA, "the length byte itself is 0xAA");
+    route(buf, n, 0);
+    CHECK(take(&off, p, &pl) == ESP_RSP_DATA, "length 0xAA with an all-0xAA payload is one frame");
+    CHECK(take(&off, p, &pl) == -1 && shell_len == 0, "one reply, no leak");
+    esp_rx_stats_t st; esp_comm_get_rx_stats(&st);
+    CHECK(st.frames_ok == 1 && st.bad_checksum == 0, "counted as one good frame, no checksum error");
+}
+
+static void test_two_frames_in_one_chunk(void)
+{
+    uint8_t buf[32], p[128]; uint16_t pl = 0; size_t off = 0, n;
+    reset();
+    n = frame(buf, ESP_CMD_STATUS, 0, 0);
+    n += frame(buf + n, ESP_CMD_PING, 0, 0);
+    route(buf, n, 0);
+    CHECK(take(&off, p, &pl) == ESP_RSP_STATUS, "first frame of the chunk answered first");
+    CHECK(take(&off, p, &pl) == ESP_RSP_DATA, "second frame of the same chunk answered second");
+    CHECK(shell_len == 0, "no leak");
+}
+
+static void test_bad_checksum_then_good_frame(void)
+{
+    uint8_t buf[32], p[128]; uint16_t pl = 0; size_t off = 0, n;
+    reset();
+    n = frame(buf, ESP_CMD_STATUS, 0, 0);
+    buf[n - 1] ^= 0x33;                          /* corrupt the first frame's checksum */
+    n += frame(buf + n, ESP_CMD_PING, 0, 0);     /* a good frame right behind it */
+    route(buf, n, 0);
+    CHECK(take(&off, p, &pl) == ESP_RSP_NAK && p[0] == ESP_ERR_BAD_CHECKSUM,
+          "the corrupt frame gets NAK(BAD_CHECKSUM)");
+    CHECK(take(&off, p, &pl) == ESP_RSP_DATA, "the parser resyncs: the next frame is answered");
+    CHECK(shell_len == 0, "no leak");
+}
+
+static void test_gap_timeout_across_tick_wrap(void)
+{
+    uint8_t buf[16], p[64]; size_t off = 0, n = frame(buf, ESP_CMD_PING, 0, 0);
+    const uint32_t t0 = 0xFFFFFFF0u;
+    reset();
+    route(buf, 2, t0);
+    CHECK(!esp_comm_rx_poll(t0 + 5), "5 ms later, before the wrap: frame still open");
+    CHECK(!esp_comm_rx_poll(0x00000010u), "32 ms later, across the 32-bit wrap: frame still open");
+    route(buf + 2, n - 2, 0x00000015u);
+    CHECK(take(&off, p, 0) == ESP_RSP_DATA, "the frame completed across the wrap is answered");
+    reset();
+    route(buf, 2, t0);
+    CHECK(!esp_comm_rx_poll(t0 + ESP_RX_GAP_MS - 1), "one ms short of the gap across the wrap: open");
+    CHECK(esp_comm_rx_poll(t0 + ESP_RX_GAP_MS), "the full gap across the wrap: abandoned");
+}
+
+static int fail_on_call, fail_calls;
+static bool failing_writer(const uint8_t *d, uint16_t n)
+{
+    fail_calls++;
+    if (fail_calls == fail_on_call) return false;
+    return block_writer(d, n);
+}
+
+static void test_write_failure_ends_the_frame(void)
+{
+    uint8_t buf[16];
+    reset();
+    fail_calls = 0; fail_on_call = 2;
+    esp_comm_set_block_writer(failing_writer);
+    route(buf, frame(buf, ESP_CMD_PING, 0, 0), 0);      /* reply = header, version, checksum */
+    CHECK(fail_calls == 2, "a write that fails mid-frame ends it: no later write (stage-150 U-3)");
+    CHECK(tx_len == ESP_HEADER_SIZE, "only the header went out");
+    reset();
+    fail_calls = 0; fail_on_call = 99;
+    esp_comm_set_block_writer(failing_writer);
+    route(buf, frame(buf, ESP_CMD_PING, 0, 0), 0);
+    CHECK(fail_calls == 3, "control: a reply with a payload is three writes when none fails");
+}
+
 int main(void)
 {
     printf("test_remote_proto\n");
@@ -900,6 +1011,12 @@ int main(void)
     test_set_probe();
     test_scope_state_probe_append();
     test_host_active_clock();
+    test_payload_cap_256_accepted_257_refused();
+    test_sync_byte_inside_frame();
+    test_two_frames_in_one_chunk();
+    test_bad_checksum_then_good_frame();
+    test_gap_timeout_across_tick_wrap();
+    test_write_failure_ends_the_frame();
     printf("%d/%d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;
 }

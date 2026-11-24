@@ -10,6 +10,14 @@ Same method as test_cal_backup.py: for each guard, copy the source, remove
 the guard, rebuild, and REQUIRE the C suite to go red. A mutation that still
 passes is a failure here. If a substitution string is no longer found (the
 code was refactored), this suite fails loudly instead of skipping.
+
+Three C suites run here (stage-155), each base build with -Werror:
+  * test_remote_proto.c    against esp_comm.c        (MUTATIONS)
+  * test_usb_link_policy.c against usb_link_policy.c (POLICY_MUTATIONS): the
+    CDC link decisions usb_debug.c makes (stall, heal, TX gates, RX watchdog,
+    DTR)
+  * test_esp_comm.c        against esp_comm.c with ESP_COMM_TRANSFER_STUBS=1
+    (base run only; the framing guards are mutated through test_remote_proto)
 """
 
 from __future__ import annotations
@@ -23,11 +31,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-SRC = REPO / "firmware" / "src" / "drivers" / "esp_comm.c"
-HDR = REPO / "firmware" / "src" / "drivers" / "esp_comm.h"
-TEST_C = REPO / "firmware" / "tests" / "test_remote_proto.c"
+DRIVERS = REPO / "firmware" / "src" / "drivers"
+TESTS = REPO / "firmware" / "tests"
+SRC = DRIVERS / "esp_comm.c"
+HDR = DRIVERS / "esp_comm.h"
+TEST_C = TESTS / "test_remote_proto.c"
+POLICY_SRC = DRIVERS / "usb_link_policy.c"
+POLICY_HDR = DRIVERS / "usb_link_policy.h"
+POLICY_TEST_C = TESTS / "test_usb_link_policy.c"
+ESP_TEST_C = TESTS / "test_esp_comm.c"
 
 CFLAGS = ["-std=gnu11", "-Wall", "-Wextra", "-O1"]   # no -Werror: a mutant may leave an unused variable
+BASE_CFLAGS = [*CFLAGS, "-Werror"]                    # the unmutated suites build warning-free
 
 
 class BuildFailed(Exception):
@@ -39,6 +54,7 @@ class Mutation:
     name: str
     old: str
     new: str
+    in_header: bool = False     # mutate the suite's header instead of its source
 
 
 MUTATIONS: tuple[Mutation, ...] = (
@@ -290,17 +306,180 @@ MUTATIONS: tuple[Mutation, ...] = (
         old="    return host_seen && (uint32_t)(now_ms - host_last_ms) < ESP_HOST_ACTIVE_MS;",
         new="    return host_seen;",
     ),
+    # ── stage-155: parser gaps ──
+    Mutation(
+        name="payload cap off by one low (256 refused)",
+        old="if (rx_packet.payload_len > ESP_MAX_PAYLOAD) {",
+        new="if (rx_packet.payload_len >= ESP_MAX_PAYLOAD) {",
+    ),
+    Mutation(
+        name="payload cap off by one high (257 accepted)",
+        old="if (rx_packet.payload_len > ESP_MAX_PAYLOAD) {",
+        new="if (rx_packet.payload_len > ESP_MAX_PAYLOAD + 1) {",
+    ),
+    Mutation(
+        name="resync on a 0xAA inside the payload",
+        old="    case RX_WAIT_PAYLOAD:\n        rx_packet.payload[rx_payload_idx++] = byte;",
+        new="    case RX_WAIT_PAYLOAD:\n"
+            "        if (byte == ESP_SYNC_BYTE) { rx_state = RX_WAIT_CMD; rx_checksum_acc = 0; return RX_NONE; }\n"
+            "        rx_packet.payload[rx_payload_idx++] = byte;",
+    ),
+    Mutation(
+        name="bad checksum eats the next byte (no resync on the following frame)",
+        old="        rx_stats.bad_checksum++;\n        return RX_BAD_CHECKSUM;",
+        new="        rx_stats.bad_checksum++;\n        rx_discard = 1;\n        return RX_BAD_CHECKSUM;",
+    ),
+    Mutation(
+        name="gap timeout breaks at the 32-bit tick wrap",
+        old="if ((uint32_t)(now_ms - rx_last_ms) < ESP_RX_GAP_MS)\n        return false;",
+        new="if (now_ms < rx_last_ms + ESP_RX_GAP_MS)\n        return false;",
+    ),
+    Mutation(
+        name="send_frame2 keeps writing after a failed part",
+        old="        if (alen && !block_write(a, alen))\n            return;",
+        new="        if (alen) (void)block_write(a, alen);",
+    ),
+)
+
+# ── stage-155: usb_link_policy.c, the CDC link decisions usb_debug.c makes ──
+POLICY_MUTATIONS: tuple[Mutation, ...] = (
+    Mutation("stall: completion flag wins over a VALID packet",
+             "    if (ept_tx_valid)\n        return USB_LINK_STALL_HOST_SLOW;",
+             "    if (ept_tx_valid && !tx_completed)\n        return USB_LINK_STALL_HOST_SLOW;"),
+    Mutation("stall: late completion counted as lost",
+             "    if (tx_completed)\n        return USB_LINK_STALL_LATE;\n", ""),
+    Mutation("stall: host-slow counted as lost",
+             "    if (ept_tx_valid)\n        return USB_LINK_STALL_HOST_SLOW;\n", ""),
+    Mutation("stall counter wraps at 0xFF",
+             "return (consecutive < 0xFFu) ? (uint8_t)(consecutive + 1u) : consecutive;",
+             "return (uint8_t)(consecutive + 1u);"),
+    Mutation("heal ignores the enable switch",
+             "    return heal_enabled && dtr_seen && dtr &&",
+             "    (void)heal_enabled;\n    return dtr_seen && dtr &&"),
+    Mutation("heal without a DTR seen since enumeration",
+             "    return heal_enabled && dtr_seen && dtr &&",
+             "    (void)dtr_seen;\n    return heal_enabled && dtr &&"),
+    Mutation("heal with the port closed",
+             "    return heal_enabled && dtr_seen && dtr &&",
+             "    (void)dtr;\n    return heal_enabled && dtr_seen &&"),
+    Mutation("heal one stall late",
+             "consecutive >= USB_LINK_HEAL_AFTER_STALLS &&",
+             "consecutive > USB_LINK_HEAL_AFTER_STALLS &&"),
+    Mutation("heal before the scheduler runs",
+             "consecutive >= USB_LINK_HEAL_AFTER_STALLS &&\n           scheduler_running;",
+             "consecutive >= USB_LINK_HEAL_AFTER_STALLS;\n    (void)scheduler_running;"),
+    Mutation("heal threshold changed",
+             "#define USB_LINK_HEAL_AFTER_STALLS  2", "#define USB_LINK_HEAL_AFTER_STALLS  3",
+             in_header=True),
+    Mutation("closed port still written",
+             "    if (dtr_opened && !dtr)\n        return USB_LINK_TX_DROP_CLOSED;",
+             "    (void)dtr_opened; (void)dtr;"),
+    Mutation("host that never raised DTR is dropped",
+             "    if (dtr_opened && !dtr)\n        return USB_LINK_TX_DROP_CLOSED;",
+             "    (void)dtr_opened;\n    if (!dtr)\n        return USB_LINK_TX_DROP_CLOSED;"),
+    Mutation("latch gate acts when not latched",
+             "    if (!latched)\n        return USB_LINK_TX_SEND;\n", "    (void)latched;\n"),
+    Mutation("latch not cleared by a completion",
+             "    if (tx_completed)\n        return USB_LINK_TX_CLEAR_LATCH;\n", ""),
+    Mutation("latched write waits instead of dropping",
+             "    if (ept_tx_valid)\n        return USB_LINK_TX_DROP_STALLED;\n", ""),
+    Mutation("latch kept on a lost completion (heal unreachable)",
+             "        return USB_LINK_TX_DROP_STALLED;\n    return USB_LINK_TX_CLEAR_LATCH;",
+             "        return USB_LINK_TX_DROP_STALLED;\n    return USB_LINK_TX_DROP_STALLED;"),
+    Mutation("RX lost: NAK not required",
+             "return rx_nak && !rxtc_pending && !rx_completed;",
+             "(void)rx_nak;\n    return !rxtc_pending && !rx_completed;"),
+    Mutation("RX lost: pending RXTC ignored",
+             "return rx_nak && !rxtc_pending && !rx_completed;",
+             "(void)rxtc_pending;\n    return rx_nak && !rx_completed;"),
+    Mutation("RX lost: unconsumed packet ignored",
+             "return rx_nak && !rxtc_pending && !rx_completed;",
+             "(void)rx_completed;\n    return rx_nak && !rxtc_pending;"),
+    Mutation("RX watchdog keeps suspicion after the state clears",
+             "    if (!lost_now) {\n        wd->suspect = false;\n        return false;",
+             "    if (!lost_now) {\n        return false;"),
+    Mutation("RX watchdog recovers with no confirm window",
+             "    if ((uint32_t)(now_tick - wd->suspect_tick) < confirm_ticks)\n        return false;\n",
+             "    (void)confirm_ticks;\n"),
+    Mutation("RX watchdog restarts the window on every poll",
+             "    if (!wd->suspect) {", "    if (1) {"),
+    Mutation("RX watchdog breaks at the tick wrap",
+             "if ((uint32_t)(now_tick - wd->suspect_tick) < confirm_ticks)",
+             "if (now_tick < wd->suspect_tick + confirm_ticks)"),
+    Mutation("RX watchdog keeps suspicion after a recovery",
+             "    wd->suspect = false;\n    return true;", "    return true;"),
+    Mutation("banner on every DTR-high setup",
+             "    if (dtr && !s.dtr)\n        s.banner_pending = 1;",
+             "    if (dtr)\n        s.banner_pending = 1;"),
+    Mutation("DTR setup not recorded as seen",
+             "    s.dtr_seen = 1;\n    if (dtr)", "    if (dtr)"),
+    Mutation("DTR rise not recorded as opened",
+             "    if (dtr)\n        s.dtr_opened = 1;", "    if (0)\n        s.dtr_opened = 1;"),
+    Mutation("RTS read as DTR",
+             "uint8_t dtr = (uint8_t)(w_value & 0x0001u);",
+             "uint8_t dtr = (uint8_t)(w_value & 0x0003u);"),
+    Mutation("reopen on input with DTR high",
+             "return rx_len > 0 && !s.dtr && s.dtr_opened;", "return rx_len > 0 && s.dtr_opened;"),
+    Mutation("reopen when never opened",
+             "return rx_len > 0 && !s.dtr && s.dtr_opened;", "return rx_len > 0 && !s.dtr;"),
+    Mutation("reopen with no input",
+             "return rx_len > 0 && !s.dtr && s.dtr_opened;",
+             "(void)rx_len;\n    return !s.dtr && s.dtr_opened;"),
+    Mutation("forget keeps DTR high",
+             "    s.dtr = 0;                      /* the next open", "    /* the next open"),
+    Mutation("forget keeps dtr_seen",
+             "    s.dtr_seen = 0;\n    s.dtr_opened = 0;\n    return s;",
+             "    s.dtr_opened = 0;\n    return s;"),
+    Mutation("forget keeps dtr_opened",
+             "    s.dtr_seen = 0;\n    s.dtr_opened = 0;\n    return s;",
+             "    s.dtr_seen = 0;\n    return s;"),
+    Mutation("forget clears the pending banner",
+             "    s.dtr_opened = 0;\n    return s;\n}\n\nbool usb_link_forget_on_unconfigured",
+             "    s.dtr_opened = 0;\n    s.banner_pending = 0;\n    return s;\n}\n\n"
+             "bool usb_link_forget_on_unconfigured"),
+    Mutation("DTR forgotten on a suspend",
+             "    return !suspended;", "    (void)suspended;\n    return true;"),
+    Mutation("DTR fall detected on any change",
+             "return dtr_prev && !dtr_now;", "return dtr_prev != dtr_now;"),
+    Mutation("banner for a binary host",
+             "return !banner_sent && first_byte != sync_byte && !loader_busy;",
+             "(void)first_byte; (void)sync_byte;\n    return !banner_sent && !loader_busy;"),
+    Mutation("banner during a firmware transfer",
+             "return !banner_sent && first_byte != sync_byte && !loader_busy;",
+             "(void)loader_busy;\n    return !banner_sent && first_byte != sync_byte;"),
+    Mutation("second banner",
+             "return !banner_sent && first_byte != sync_byte && !loader_busy;",
+             "(void)banner_sent;\n    return first_byte != sync_byte && !loader_busy;"),
 )
 
 
-def compile_and_run(source_text: str, workdir: Path) -> subprocess.CompletedProcess:
-    (workdir / "esp_comm.c").write_text(source_text)
-    shutil.copy(HDR, workdir / "esp_comm.h")
-    shutil.copy(TEST_C, workdir / "test_remote_proto.c")
+@dataclass
+class Suite:
+    src: Path
+    hdr: Path
+    test_c: Path
+    defines: tuple[str, ...] = ()
+
+
+REMOTE_PROTO = Suite(SRC, HDR, TEST_C)
+LINK_POLICY = Suite(POLICY_SRC, POLICY_HDR, POLICY_TEST_C)
+ESP_COMM = Suite(SRC, HDR, ESP_TEST_C, ("-DESP_COMM_TRANSFER_STUBS=1",))
+
+
+def compile_and_run(suite: Suite, workdir: Path, source_text: str | None = None,
+                    header_text: str | None = None,
+                    cflags: list[str] = CFLAGS) -> subprocess.CompletedProcess:
+    src = workdir / suite.src.name
+    src.write_text(suite.src.read_text(encoding="utf-8") if source_text is None else source_text,
+                   encoding="utf-8")
+    (workdir / suite.hdr.name).write_text(
+        suite.hdr.read_text(encoding="utf-8") if header_text is None else header_text,
+        encoding="utf-8")
+    shutil.copy(suite.test_c, workdir / suite.test_c.name)
     binary = workdir / "t"
     build = subprocess.run(
-        ["cc", *CFLAGS, "-o", str(binary), str(workdir / "test_remote_proto.c"),
-         str(workdir / "esp_comm.c"), "-I", str(workdir)],
+        ["cc", *cflags, *suite.defines, "-o", str(binary), str(workdir / suite.test_c.name),
+         str(src), "-I", str(workdir)],
         capture_output=True, text=True,
     )
     if build.returncode != 0:
@@ -308,33 +487,80 @@ def compile_and_run(source_text: str, workdir: Path) -> subprocess.CompletedProc
     return subprocess.run([str(binary)], capture_output=True, text=True)
 
 
-class TestRemoteProto(unittest.TestCase):
+class _SuiteChecks:
+    """Base build (-Werror) passes; each mutation turns it red."""
+    suite: Suite
+    mutations: tuple[Mutation, ...] = ()
+
     def test_source_files_present(self):
-        for path in (SRC, HDR, TEST_C):
+        for path in (self.suite.src, self.suite.hdr, self.suite.test_c):
             self.assertTrue(path.is_file(), f"missing {path}")
 
     def test_base_suite_passes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            proc = compile_and_run(SRC.read_text(), Path(tmp))   # BuildFailed = error
+            proc = compile_and_run(self.suite, Path(tmp), cflags=BASE_CFLAGS)   # BuildFailed = error
             self.assertEqual(proc.returncode, 0,
                              f"base suite failed:\n{proc.stdout}\n{proc.stderr}")
 
-    def test_mutations_are_caught(self):
-        base = SRC.read_text()
-        for m in MUTATIONS:
+    def run_mutations(self):
+        src = self.suite.src.read_text(encoding="utf-8")
+        hdr = self.suite.hdr.read_text(encoding="utf-8")
+        for m in self.mutations:
             with self.subTest(mutation=m.name):
+                base = hdr if m.in_header else src
                 self.assertIn(m.old, base, f"mutation string not found (refactor?): {m.name}")
                 mutated = base.replace(m.old, m.new, 1)
                 self.assertNotEqual(mutated, base, "replacement was a no-op")
                 with tempfile.TemporaryDirectory() as tmp:
                     try:
-                        proc = compile_and_run(mutated, Path(tmp))
+                        proc = compile_and_run(
+                            self.suite, Path(tmp),
+                            source_text=None if m.in_header else mutated,
+                            header_text=mutated if m.in_header else None)
                     except BuildFailed as e:
                         self.fail(f"mutant '{m.name}' did not build, so it proves nothing:\n{e}")
                 self.assertNotEqual(
                     proc.returncode, 0,
                     f"mutation '{m.name}' did NOT make the suite fail — the guard is not tested.\n"
                     f"{proc.stdout}{proc.stderr}")
+
+
+class TestRemoteProto(_SuiteChecks, unittest.TestCase):
+    suite = REMOTE_PROTO
+    mutations = MUTATIONS
+
+    def test_mutations_are_caught(self):
+        self.run_mutations()
+
+
+class TestUsbLinkPolicy(_SuiteChecks, unittest.TestCase):
+    suite = LINK_POLICY
+    mutations = POLICY_MUTATIONS
+
+    def test_mutations_are_caught(self):
+        self.run_mutations()
+
+    def test_policy_has_no_vendor_or_rtos_header(self):
+        # The point of the file: decisions testable without the USB stack.
+        for path in (POLICY_SRC, POLICY_HDR):
+            text = path.read_text(encoding="utf-8")
+            for banned in ("FreeRTOS.h", "task.h", "at32f403a_407.h", "usbd_", "cdc_class.h"):
+                self.assertNotIn(banned, text, f"{path.name} includes {banned}")
+
+    def test_usb_debug_calls_every_decision(self):
+        # Each decision tested here is the one that runs on the unit.
+        text = (DRIVERS / "usb_debug.c").read_text(encoding="utf-8")
+        for fn in ("usb_link_classify_stall", "usb_link_count_lost", "usb_link_heal_due",
+                   "usb_link_tx_open_gate", "usb_link_tx_latch_gate",
+                   "usb_link_rx_completion_lost", "usb_link_rx_watchdog_step",
+                   "usb_link_dtr_on_setup", "usb_link_dtr_reopen_on_input",
+                   "usb_link_dtr_forget", "usb_link_forget_on_unconfigured",
+                   "usb_link_dtr_fell", "usb_link_banner_on_first_input"):
+            self.assertIn(fn + "(", text, f"usb_debug.c does not call {fn}")
+
+
+class TestEspComm(_SuiteChecks, unittest.TestCase):
+    suite = ESP_COMM
 
 
 def setUpModule():

@@ -57,7 +57,10 @@
 /* Hook functions */
 #define configUSE_IDLE_HOOK                     0
 #define configUSE_TICK_HOOK                     0
-#define configUSE_MALLOC_FAILED_HOOK            1
+/* 0 since stage-160 (2026-11-23): the hook stopped the unit on any failed
+ * allocation, also the optional ones (X-Y buffers, mask, holdlog). Every
+ * pvPortMalloc() caller checks for NULL and goes on without the feature. */
+#define configUSE_MALLOC_FAILED_HOOK            0
 #define configCHECK_FOR_STACK_OVERFLOW          2
 
 /* Runtime stats and trace — enable trace for task listing */

@@ -59,6 +59,8 @@
 #include "../ui/meter_voltage_wave.h"
 
 #include "fpga_cal_table.h"
+#include "fault.h"
+#include "watchdog.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -883,9 +885,106 @@ static void cmd_usbstat_heal(const char *args)
     usb_debug_printf("usb self-heal %s\r\n", s_usb.heal_enabled ? "on" : "off");
 }
 
+/* ── Reset report (stage-160) ───────────────────────────────────────────
+ * Why the unit reset and, if a fault path or the health monitor caused it,
+ * where. The records live in .noinit (fault.c, watchdog.c) and are copied at
+ * boot; after this report they are marked read, so the NEXT boot does not
+ * show them again. They stay visible here ("read") for the rest of this boot,
+ * so a second `status` cannot lose them. */
+
+static const char *reset_reason_name(uint32_t sts)
+{
+    if (sts & (1u << 29)) return "watchdog";
+    if (sts & (1u << 30)) return "window watchdog";
+    if (sts & (1u << 31)) return "low-power";
+    if (sts & (1u << 28)) return "software";
+    if (sts & (1u << 27)) return "power-on";
+    if (sts & (1u << 26)) return "pin";
+    return "none";
+}
+
+static void boots_ago_str(char *out, size_t n, uint32_t rec_boot)
+{
+    uint32_t now = fault_boot_count();
+    if (rec_boot == now)
+        snprintf(out, n, "this boot");
+    else if (rec_boot < now)
+        snprintf(out, n, "%lu boot(s) ago", (unsigned long)(now - rec_boot));
+    else
+        snprintf(out, n, "boot %lu", (unsigned long)rec_boot);
+}
+
+static void status_print_reset(void)
+{
+    extern uint32_t reset_ctrlsts;
+    fault_record_t f;
+    stall_record_t s;
+    bool f_read = false, s_read = false;
+    char ago[24];
+
+    usb_debug_printf(
+        "=== Reset ===\r\n"
+        "Boot: %lu\r\n"
+        "Reset reason: %s (CRM_CTRLSTS 0x%08lX:%s%s%s%s%s%s)\r\n",
+        (unsigned long)fault_boot_count(),
+        reset_reason_name(reset_ctrlsts), (unsigned long)reset_ctrlsts,
+        (reset_ctrlsts & (1u << 26)) ? " pin" : "",
+        (reset_ctrlsts & (1u << 27)) ? " por" : "",
+        (reset_ctrlsts & (1u << 28)) ? " sw" : "",
+        (reset_ctrlsts & (1u << 29)) ? " wdt" : "",
+        (reset_ctrlsts & (1u << 30)) ? " wwdt" : "",
+        (reset_ctrlsts & (1u << 31)) ? " lp" : "");
+
+    if (fault_previous(&f, &f_read)) {
+        boots_ago_str(ago, sizeof(ago), f.boot_count);
+        usb_debug_printf(
+            "Fault record: %s task=%s pc=0x%08lX lr=0x%08lX sp=0x%08lX (%s, %s)\r\n",
+            fault_kind_name(f.kind), f.task[0] ? f.task : "?",
+            (unsigned long)f.pc, (unsigned long)f.lr, (unsigned long)f.sp,
+            ago, f_read ? "read" : "new");
+        if (f.kind != FAULT_KIND_STACK) {
+            usb_debug_printf(
+                "  cfsr=0x%08lX hfsr=0x%08lX mmfar=0x%08lX bfar=0x%08lX "
+                "exc_return=0x%08lX xpsr=0x%08lX cyc=%lu\r\n",
+                (unsigned long)f.cfsr, (unsigned long)f.hfsr,
+                (unsigned long)f.mmfar, (unsigned long)f.bfar,
+                (unsigned long)f.exc_return, (unsigned long)f.xpsr,
+                (unsigned long)f.cyccnt);
+        }
+    } else {
+        usb_send_str("Fault record: none\r\n");
+    }
+
+    if (health_stall_previous(&s, &s_read)) {
+        boots_ago_str(ago, sizeof(ago), s.boot_count);
+        usb_debug_printf(
+            "Stall record: task=%s since=%lu ms at uptime %lu ms pc=0x%08lX lr=0x%08lX "
+            "top=0x%08lX (%s, %s)\r\n",
+            s.task[0] ? s.task : "?", (unsigned long)s.since_ms,
+            (unsigned long)s.uptime_ms, (unsigned long)s.pc, (unsigned long)s.lr,
+            (unsigned long)s.top, ago, s_read ? "read" : "new");
+        if (s.recovered_ms != 0u)
+            usb_debug_printf("  recovered after %lu ms (no watchdog reset)\r\n",
+                             (unsigned long)s.recovered_ms);
+    } else {
+        usb_send_str("Stall record: none\r\n");
+    }
+
+#if !defined(GUEST_BUILD) || (defined(OPENSCOPE_WATCHDOG) && OPENSCOPE_WATCHDOG)
+    usb_send_str("Watchdog: armed by this image\r\n\r\n");
+#else
+    usb_send_str("Watchdog: not armed by this image\r\n\r\n");
+#endif
+
+    fault_previous_mark_read();
+    health_stall_mark_read();
+}
+
 static void cmd_status(void)
 {
     extern volatile uint32_t uptime_seconds;
+
+    status_print_reset();
 
     /*
      * Keep the status header in chunks smaller than usb_debug_printf()'s
@@ -7715,6 +7814,99 @@ static void cmd_spi3_probe(void)
  * string, CMD_V if it takes void). Help is part of the row; keep the
  * left-aligned name+argspec column at 32 chars like the rows around it.
  * ═══════════════════════════════════════════════════════════════════ */
+#if defined(FAULT_SELFTEST) && FAULT_SELFTEST == 2
+/* ── faulttest — stage-160 fault paths, test image only ─────────────────
+ * guest-coldtrace-faulttest. 1-3 reset the unit (watchdog armed): CDC drops
+ * and comes back, then `status` shows the record. The test runs in its own
+ * task ("ftest") after delay_s, so it also runs with USB unplugged
+ * (battery check). */
+
+extern volatile bool faulttest_stall_display;   /* main.c */
+
+static volatile uint32_t ft_mode;
+static volatile uint32_t ft_delay_s;
+static volatile uint32_t ft_depth_limit = 100000u;   /* never reached */
+static void *ft_moat;
+
+/* 16-byte frames and a yield per level: the overflow check (method 2) runs at
+ * each context switch, so the overshoot below the stack is one frame plus the
+ * saved context. */
+static uint32_t ft_recurse(uint32_t depth)
+{
+    volatile uint8_t pad[16];
+    pad[0] = (uint8_t)depth;
+    pad[15] = (uint8_t)depth;
+    taskYIELD();
+    if (depth >= ft_depth_limit)
+        return pad[0];
+    return ft_recurse(depth + 1u) + pad[15];
+}
+
+static void ft_task(void *arg)
+{
+    (void)arg;
+    if (ft_delay_s != 0u)
+        vTaskDelay(pdMS_TO_TICKS(ft_delay_s * 1000u));
+    switch (ft_mode) {
+    case 1:
+        __asm volatile ("udf #0");     /* UNDEFINSTR -> UsageFault */
+        break;
+    case 2:
+        (void)ft_recurse(0u);
+        break;
+    case 3:
+        faulttest_stall_display = true;
+        break;
+    default:
+        break;
+    }
+    vTaskDelete(NULL);
+}
+
+static void cmd_faulttest(const char *args)
+{
+    char *end = NULL;
+    unsigned long n = strtoul(args, &end, 10);
+    unsigned long delay = 0;
+    if (end != NULL && end != args) {
+        while (*end == ' ') end++;
+        if (*end != '\0') delay = strtoul(end, NULL, 10);
+    }
+    if (n < 1u || n > 4u || delay > 600u) {
+        usb_send_str("Usage: faulttest <1-4> [delay_s 0-600]\r\n"
+                     "  1 UsageFault  2 stack overflow  3 display stall  4 malloc 64 KB\r\n");
+        return;
+    }
+
+    if (n == 4u) {
+        /* configUSE_MALLOC_FAILED_HOOK is 0: expect NULL and no reset. */
+        void *p = pvPortMalloc(64u * 1024u);
+        usb_debug_printf("faulttest 4: pvPortMalloc(65536) = %p%s\r\n", p,
+                         p ? " (NOT NULL: unexpected)" : " (NULL, the unit runs on)");
+        if (p) vPortFree(p);
+        return;
+    }
+
+    if (ft_mode != 0u) {
+        usb_send_str("faulttest: a test is already pending\r\n");
+        return;
+    }
+    ft_mode = (uint32_t)n;
+    ft_delay_s = (uint32_t)delay;
+    if (n == 2u && ft_moat == NULL)
+        ft_moat = pvPortMalloc(512u);  /* likely just below the test stack */
+    if (xTaskCreate(ft_task, "ftest", 256, NULL, 1, NULL) != pdPASS) {
+        ft_mode = 0u;
+        usb_send_str("faulttest: xTaskCreate failed\r\n");
+        return;
+    }
+    usb_debug_printf("faulttest %lu in %lu s: %s\r\n", n, delay,
+                     n == 1u ? "UsageFault, red screen, reset" :
+                     n == 2u ? "stack overflow, red screen, reset" :
+                               "display stall, watchdog reset ~10 s later");
+}
+#endif /* FAULT_SELFTEST == 2 */
+
 /* ── fwload / fwstat / fwapply — image loading over this shell ──────────
  * The state machine and every flash touch live in fw_loader.c; these
  * handlers are parsing and printing only. The RX rerouting that feeds the
@@ -8118,6 +8310,10 @@ static const shell_cmd_t shell_cmds[] = {
           "version                         Firmware info\r\n"),
     CMD_V("status", cmd_status, SC_EXACT,
           "status                          FPGA & system status\r\n"),
+#if defined(FAULT_SELFTEST) && FAULT_SELFTEST == 2
+    CMD_A("faulttest", cmd_faulttest, SC_NEEDARGS,
+          "faulttest <1-4> [delay_s]       TEST IMAGE: 1 fault 2 stack 3 stall 4 malloc\r\n"),
+#endif
     CMD_V("usbstat", cmd_usbstat, SC_EXACT,
           "usbstat                         USB CDC health + remote protocol counters (#39)\r\n"),
     CMD_A("usbstat heal", cmd_usbstat_heal, SC_NEEDARGS,
@@ -8985,8 +9181,10 @@ static void vUsbDebugTask(void *pvParameters)
         bool did_work = false;
         dbg_shell_loops++;
 
-#if defined(FAULT_SELFTEST) && FAULT_SELFTEST
-        /* Deliberate, self-inflicted fault ~10 s after boot, from a task (so the
+#if defined(FAULT_SELFTEST) && FAULT_SELFTEST == 1
+        /* (== 1 only: FAULT_SELFTEST == 2 is the stage-160 `faulttest`
+         * image, which must not fault by itself after each boot.)
+         * Deliberate, self-inflicted fault ~10 s after boot, from a task (so the
          * frame lands on the PSP exactly like the fault under investigation).
          *
          * Two questions at once:

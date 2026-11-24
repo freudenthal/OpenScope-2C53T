@@ -196,6 +196,17 @@ static QueueHandle_t xInputQueue        = NULL;
 static int health_slot_display = -1;
 static int health_slot_input   = -1;
 
+/* CRM_CTRLSTS (0x40021024) as main() found it, before the flags were cleared
+ * (stage-160). Bits 26 pin, 27 power-on, 28 software, 29 watchdog, 30 window
+ * watchdog, 31 low-power. Read by the shell `status`. 0 in the emulator. */
+uint32_t reset_ctrlsts;
+
+#if defined(FAULT_SELFTEST) && FAULT_SELFTEST == 2
+/* `faulttest 3` (usb_debug.c): the display task stops checking in and spins,
+ * so the health monitor starves the watchdog. Test image only. */
+volatile bool faulttest_stall_display;
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════
  * Simple delay (used before RTOS starts)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -599,6 +610,13 @@ static void vDisplayTask(void *pvParameters)
             }
         }
 
+#if defined(FAULT_SELFTEST) && FAULT_SELFTEST == 2
+        /* faulttest 3: a stuck display task, no check-in from here on. */
+        while (faulttest_stall_display) {
+            __asm volatile ("nop");
+        }
+#endif
+
         /* Check in with health monitor */
         health_checkin(health_slot_display);
 
@@ -936,8 +954,17 @@ int main(void)
      * before this firmware will work. See eopb0_setup.c or use:
      *   dfu-util -a 1 -d 2e3c:df11 -s 0x1FFFF800 -D option_bytes48.bin */
 
-    /* Feed watchdog early — IWDG may still be running from previous boot
-     * (it can't be stopped once started, survives system reset) */
+    /* Reset reason (stage-160): keep CRM_CTRLSTS for the shell `status`, then
+     * clear the flags (rstfc, write 1) so the next boot reads only its own
+     * reset. The factory IAP bootloader runs before this and does not clear
+     * them (EXP-201 read 0x14000000 after a software reset). */
+    reset_ctrlsts = CRM->ctrlsts;
+    CRM->ctrlsts_bit.rstfc = 1;
+
+    /* Feed the watchdog early in case it is already running at this point.
+     * Software cannot stop it once armed; whether it also runs on after a
+     * reset (or the option byte starts it at reset) is measured in stage-160
+     * step 4, not assumed. A feed of a stopped watchdog does nothing. */
     wdt_counter_reload();
 
     /* Arm the RTT console before anything else can want to print. Costs a few
@@ -950,6 +977,7 @@ int main(void)
      * survives reset in .noinit — the point of the whole exercise for a fault
      * that only shows up ~55s in. */
     fault_init();
+    health_records_init();   /* stall record of a previous boot (watchdog.c) */
 
     /* Clock init to 240MHz */
     system_clock_config();
@@ -1238,9 +1266,11 @@ int main(void)
 
     /* Initialize watchdog LAST — after all tasks and timers are running.
      * Once enabled, the FWDGT cannot be stopped (hardware limitation).
-     * Skipped in GUEST_BUILD so interactive SPI3 shell sessions on unit #2
-     * can't trip a watchdog reset mid-experiment. */
-#ifndef GUEST_BUILD
+     * Guest builds skip it unless they set OPENSCOPE_WATCHDOG=1, so the
+     * experiment images can hold the CPU in long shell sessions. The shipping
+     * guest-coldtrace (and -meter) set it since stage-160: a stuck task then
+     * resets the unit instead of freezing it with the power hold on. */
+#if !defined(GUEST_BUILD) || (defined(OPENSCOPE_WATCHDOG) && OPENSCOPE_WATCHDOG)
     watchdog_init();
 #endif
 
@@ -1253,21 +1283,20 @@ int main(void)
  * FreeRTOS Hooks
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* Called from vTaskSwitchContext() (PendSV) after the task's context was
+ * saved, so its pxTopOfStack frame is current. Record, show, reset: before
+ * stage-160 this spun with the power hold on ("watchdog will reset us"), and
+ * guest builds had no watchdog. configUSE_MALLOC_FAILED_HOOK is 0 since
+ * stage-160: pvPortMalloc() returns NULL to its callers, which all check it. */
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
 {
-    (void)xTask;
-    taskDISABLE_INTERRUPTS();
-    fault_display("STACK OVERFLOW", pcTaskName);
-    /* Watchdog will reset us */
-    for (;;) {}
-}
+    uint32_t top, exc, pc, lr;
 
-void vApplicationMallocFailedHook(void)
-{
     taskDISABLE_INTERRUPTS();
-    fault_display("HEAP EXHAUSTED", "pvPortMalloc returned NULL");
-    /* Watchdog will reset us */
-    for (;;) {}
+    health_saved_context(xTask, &top, &exc, &pc, &lr);
+    fault_record_event(FAULT_KIND_STACK, pcTaskName, pc, lr, top);
+    fault_display("STACK OVERFLOW", pcTaskName);
+    fault_restart();
 }
 
 /* ═══════════════════════════════════════════════════════════════════

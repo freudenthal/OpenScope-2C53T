@@ -327,8 +327,9 @@ emu: clean all
 
 # Build a GUEST image that runs at 0x08007000 under the FNIRSI STOCK bootloader
 # (unit #2), flashed via the stock IAP drive (mcopy). main.c adjusts VTOR to
-# 0x7000 and skips the watchdog when GUEST_BUILD is defined. Used to run the
-# SPI3/FPGA debug shell on a known-good FPGA.
+# 0x7000 and skips the watchdog when GUEST_BUILD is defined (unless the target
+# also sets OPENSCOPE_WATCHDOG=1: guest-coldtrace and -meter do, stage-160).
+# Used to run the SPI3/FPGA debug shell on a known-good FPGA.
 # [LIVE] Standard bench image. The default for every bench session:
 #        `make guest` -> factory IAP -> read the LCD SCOPE_DEBUG_OVERLAY.
 guest: CFLAGS += -DGUEST_BUILD
@@ -729,7 +730,7 @@ $(BUILD_DIR)/test_mask_pf: tests/test_mask_pf.c src/dsp/mask_pf.c src/dsp/mask_p
 test-mask-pf: $(BUILD_DIR)/test_mask_pf
 	$<
 
-.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-fft-live test-trig-edge test-mask-pf test-fuse test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk guest-configA-gap guest-configA-csdummy guest-configA-gapless guest-bringup guest-bringup-bb guest-bringup-bb-slow guest-coldtrace-hwspi guest-coldtrace-usbtask guest-coldtrace-hwspi-usbtask guest-bringup-bb-faithful fpga-alt-header guest-coldtrace-meter test-bode test-shmem-layout
+.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-fft-live test-trig-edge test-mask-pf test-fuse test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk guest-configA-gap guest-configA-csdummy guest-configA-gapless guest-bringup guest-bringup-bb guest-bringup-bb-slow guest-coldtrace-hwspi guest-coldtrace-usbtask guest-coldtrace-hwspi-usbtask guest-bringup-bb-faithful fpga-alt-header guest-coldtrace-meter guest-coldtrace-faulttest test-bode test-shmem-layout
 
 # Bode sweep maths (step frequency, gain/phase, -3 dB bandwidth) and
 # bode_init(), which since the 2026-11-11 RAM diet fills a caller-owned result
@@ -1074,9 +1075,18 @@ guest-coldtrace-usart: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA
 guest-coldtrace-usart: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace-usart: clean all
 
-guest-coldtrace: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1
+guest-coldtrace: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DOPENSCOPE_WATCHDOG=1
 guest-coldtrace: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace: clean all
+
+# Stage-160 (2026-11-23) fault-path test image. guest-coldtrace (watchdog on)
+# plus the shell command `faulttest <n> [delay_s]` (usb_debug.c, FAULT_SELFTEST
+# == 2): 1 UsageFault, 2 stack overflow, 3 display task stall, 4 failed 64 KB
+# allocation. Every test except 4 resets the unit. Never leave a unit on this
+# image; the shipping guest-coldtrace has no faulttest command.
+guest-coldtrace-faulttest: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DOPENSCOPE_WATCHDOG=1 -DFAULT_SELFTEST=2
+guest-coldtrace-faulttest: LDSCRIPT = ld/at32f403a_guest.ld
+guest-coldtrace-faulttest: clean all
 
 # [M1 2026-09-04] guest-coldtrace-meter — coldtrace plus reachable meter submodes.
 #
@@ -1099,7 +1109,7 @@ guest-coldtrace: clean all
 #   3. mode meter 6, `gpio scan` diff vs step 2 NON-EMPTY    <- the actual fix
 #   4. mode scope, SPI3 OK still climbing, trace still right <- the regression
 # Step 4 is the one that decides whether this ships.
-guest-coldtrace-meter: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_METER_SUBMODES=1
+guest-coldtrace-meter: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_METER_SUBMODES=1 -DOPENSCOPE_WATCHDOG=1
 guest-coldtrace-meter: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace-meter: clean all
 

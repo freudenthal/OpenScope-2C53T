@@ -3676,16 +3676,16 @@ uint16_t fpga_acq_post_edge_get(void)
     return (uint16_t)ms;
 }
 bool fpga_acq_post_edge_is_override(void) { return acq_post_edge_ms != 0; }
-/* stage-091: how long after a reg 0x01/0x06/0x08 write a strobed record can
- * still be one that triggered before the write: its 512 post-trigger samples
- * at the rate in force, plus one poll and 10 ms. Unmeasured rates: 600 ms.
- * (After a timebase write the old rate decides; the new rate is used here,
- * so a write to a slower code drops a little more, never less.) */
+/* stage-091: how long after a reg 0x01/0x06/0x08 write the first handover
+ * can still come from the cycle that was armed before the write: one FPGA
+ * cycle (EXP-72: fill + ~202 ms hold), plus one poll and a margin, so
+ * 1024 samples + 250 ms + poll. Unmeasured rates: 1000 ms. (After a timebase
+ * write the old rate decides; the new rate is used here.) */
 static uint16_t fpga_acq_reprime_window_ms(void)
 {
     float fs = scope_timebase_sample_rate(acq_rate_idx);
-    if (fs <= 0.0f) return 600u;
-    float ms = 512.0f / fs * 1000.0f + (float)acq_poll_gap_ms + 10.0f;
+    if (fs <= 0.0f) return 1000u;
+    float ms = 1024.0f / fs * 1000.0f + 250.0f + (float)acq_poll_gap_ms;
     if (ms > 5000.0f) ms = 5000.0f;
     return (uint16_t)ms;
 }
@@ -4173,19 +4173,21 @@ static void fpga_warmtest_acq_task(void *pv)
                 continue;
             }
         }
-        /* stage-091: a reg 0x01/0x06/0x08 write does not discard a capture
-         * that triggered before it: the FPGA completes it (512 post-trigger
-         * samples) and hands it over on a later read. Bench, Normal, 4 s
-         * after a source change with the level kept: one record each time,
-         * crossing on the OLD source (3713d78 at 0x0F and 0x12; b28d078,
-         * which dropped only the first read after the write, still at 0x12,
-         * where 512 samples take 205 ms). A record strobed within 512
-         * samples + one poll of the write triggered before it: drop it, as
-         * the record held across STOP is dropped. */
+        /* stage-091: the FPGA applies a reg 0x06 write from its NEXT cycle:
+         * the first handover after the write still comes from the cycle that
+         * was armed before it. Bench at 0x12, Normal, source CH2 -> CH1 with
+         * the level kept: 4/4 times one record with its crossing on CH2 came
+         * 560-590 ms after the write (one cycle = fill 410 ms + ~202 ms hold);
+         * a 512-sample window (089f2c2) and "first read only" (b28d078)
+         * missed it. Drop the first strobed record inside one cycle of the
+         * write, and only that one, as the record held across STOP is
+         * dropped. If the FPGA was in its hold at the write, this drops one
+         * good record. */
         if (after_reprime) {
             if ((int32_t)(last_read_tick - reprime_tick) >= (int32_t)fpga_acq_reprime_window_ms()) {
                 after_reprime = false;
             } else if (triggered) {
+                after_reprime = false;
                 fpga.acq_reprime_stale_dropped++;
                 continue;
             }

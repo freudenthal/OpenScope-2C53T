@@ -157,6 +157,16 @@ typedef struct {
     uint8_t  stall_flag;         /* g_tx_completed at the last stall */
     uint32_t stall_ept;          /* USB->ept[1] at the last stall */
     uint32_t stall_tick;
+    /* stage-150 (U-3): after a host-slow stall the next writes are dropped at
+     * once until the armed packet completes, so a host that stops reading
+     * costs the shell task one 1 s wait, not one per 64-byte chunk. */
+    uint8_t  tx_latched;
+    uint32_t tx_dropped_stalled; /* writes dropped while tx_latched */
+    uint16_t in_cancels;         /* armed IN packets cancelled on a DTR fall */
+    /* stage-150 (U-5): the banner goes out on a DTR rise (set by the setup
+     * hook) or on the first input of a terminal that never sets DTR. */
+    volatile uint8_t banner_pending;
+    uint16_t banners;
 } usb_health_t;
 
 static usb_health_t s_usb = { .heal_enabled = USB_TX_SELF_HEAL };
@@ -168,7 +178,9 @@ static usb_sts_type cdc_setup_spy(void *udev, usb_setup_type *setup)
 {
     if ((setup->bmRequestType & USB_REQ_TYPE_RESERVED) == USB_REQ_TYPE_CLASS &&
         setup->bRequest == CDC_SET_CONTROL_LINE_STATE) {
-        s_usb.dtr = (uint8_t)(setup->wValue & 0x0001u);
+        uint8_t dtr = (uint8_t)(setup->wValue & 0x0001u);
+        if (dtr && !s_usb.dtr) s_usb.banner_pending = 1;   /* DTR 0 -> 1: a port open */
+        s_usb.dtr = dtr;
         s_usb.dtr_seen = 1;
         if (s_usb.dtr) s_usb.dtr_opened = 1;
     }
@@ -190,6 +202,7 @@ static void usb_tx_stalled(cdc_struct_type *pcdc)
     if ((s_usb.stall_ept & USB_TXSTS) == USB_TX_VALID) {
         s_usb.tx_host_slow++;
         s_usb.consecutive = 0;              /* a slow reader never counts toward a heal */
+        s_usb.tx_latched = 1;               /* drop later writes until it completes */
         return;
     }
     /* The task can be preempted between the timeout and this capture; if the
@@ -212,6 +225,27 @@ static void usb_tx_stalled(cdc_struct_type *pcdc)
         s_usb.heals++;
         usbd_connect(&usb_core_dev);
     }
+}
+
+/* The host dropped DTR (closed the port) with a packet still armed: nobody
+ * will send IN tokens for it, and the next open would get it in front of its
+ * first reply. Take it back (TX NAK) and free the endpoint. The host never
+ * saw the packet, so the data toggle has not moved and the next packet uses
+ * the same toggle the host expects. */
+static void usb_cancel_armed_in(void)
+{
+    uint8_t ept = USBD_CDC_BULK_IN_EPT & 0x0F;
+    cdc_struct_type *pcdc = (cdc_struct_type *)usb_core_dev.class_handler->pdata;
+
+    nvic_irq_disable(USBFS_L_CAN1_RX0_IRQn);
+    if (!pcdc->g_tx_completed && (USB->ept[ept] & USB_TXSTS) == USB_TX_VALID) {
+        USB_SET_TXSTS(ept, USB_TX_NAK);
+        usb_core_dev.ept_in[ept].total_len = 0;
+        pcdc->g_tx_completed = 1;
+        s_usb.in_cancels++;
+    }
+    s_usb.tx_latched = 0;
+    nvic_irq_enable(USBFS_L_CAN1_RX0_IRQn, 6, 0);
 }
 #endif
 
@@ -262,21 +296,23 @@ bool usb_debug_connected(void)
 #endif
 }
 
-/* USB CDC half of the console output (also the remote protocol's writer). */
-static void cdc_send_bytes(const uint8_t *data, uint16_t len)
+/* USB CDC half of the console output (also the remote protocol's writer).
+ * Returns false when any part of `data` was not sent (the caller stops the
+ * frame it is writing). */
+static bool cdc_send_bytes(const uint8_t *data, uint16_t len)
 {
 #if DEBUG_SHELL_RTT_ONLY || defined(EMULATOR_BUILD)
     (void)data; (void)len;
-    return;
+    return false;
 #else
-    if (!usb_debug_connected()) return;
+    if (!usb_debug_connected()) return false;
     if (s_usb.dtr_opened && !s_usb.dtr) {
         /* Host raised DTR earlier and has now dropped it: it closed the port,
          * nothing will read this, and waiting costs the shell task a 1 s stall
          * per write. A host that never raises DTR (CDC does not require it;
          * .NET SerialPort defaults it off) is still answered. */
         s_usb.tx_dropped_closed++;
-        return;
+        return false;
     }
 
     cdc_struct_type *pcdc = (cdc_struct_type *)usb_core_dev.class_handler->pdata;
@@ -286,6 +322,22 @@ static void cdc_send_bytes(const uint8_t *data, uint16_t len)
         uint16_t chunk = (len > USBD_CDC_IN_MAXPACKET_SIZE) ?
                          USBD_CDC_IN_MAXPACKET_SIZE : len;
 
+        /* A host-slow stall latched: drop at once while the armed packet is
+         * still VALID (the host is still not reading). If the packet left but
+         * no completion came (TX NAK, flag 0: the #39 lost completion), unlatch
+         * and wait as usual, so the lost-completion stall is counted and the
+         * heal stays reachable. */
+        if (s_usb.tx_latched) {
+            if (pcdc->g_tx_completed) {
+                s_usb.tx_latched = 0;
+            } else if ((USB->ept[USBD_CDC_BULK_IN_EPT & 0x0F] & USB_TXSTS) == USB_TX_VALID) {
+                s_usb.tx_dropped_stalled++;
+                return false;
+            } else {
+                s_usb.tx_latched = 0;
+            }
+        }
+
         /* Wait for previous TX to complete (with timeout) */
         uint32_t timeout = 1000;
         while (!pcdc->g_tx_completed && --timeout) {
@@ -294,17 +346,18 @@ static void cdc_send_bytes(const uint8_t *data, uint16_t len)
         }
         if (!timeout) {
             usb_tx_stalled(pcdc);
-            return;
+            return false;
         }
         s_usb.consecutive = 0;
 
         if (usb_vcp_send_data(&usb_core_dev, (uint8_t *)data, chunk) != SUCCESS) {
             s_usb.tx_send_errors++;
-            return;
+            return false;
         }
         data += chunk;
         len -= chunk;
     }
+    return true;
 #endif
 }
 
@@ -772,6 +825,13 @@ static void cmd_usbstat(void)
         (unsigned long)s_usb.stall_ept,
         (unsigned long)rx.frames_ok, (unsigned long)rx.bad_checksum,
         (unsigned long)rx.bad_length, (unsigned long)rx.gap_timeouts);
+    /* Second call: usb_debug_printf() truncates at 255 bytes. */
+    usb_debug_printf(
+        "tx latch: latched=%u dropped_stalled=%lu in_cancels=%u banners=%u\r\n"
+        "rx: lost_out_recovered=%lu\r\n",
+        (unsigned)s_usb.tx_latched, (unsigned long)s_usb.tx_dropped_stalled,
+        (unsigned)s_usb.in_cancels, (unsigned)s_usb.banners,
+        (unsigned long)usb_rx_lost_completions);
 }
 
 static void cmd_usbstat_heal(const char *args)
@@ -8856,9 +8916,10 @@ static void vUsbDebugTask(void *pvParameters)
 
     uint8_t rx_buf[USBD_CDC_OUT_MAXPACKET_SIZE];
     uint8_t rtt_buf[64];
-    bool usb_banner_sent = false;
+    bool usb_banner_sent = false;   /* a banner went out since enumeration */
+    bool usb_rx_seen = false;       /* the first input since enumeration arrived */
+    uint8_t usb_dtr_prev = 0;
     bool rtt_banner_sent = false;
-    uint32_t usb_settle = 0;
     /* When a transfer dies mid-stream the host still has bytes in flight, and
      * without this they land in shell_feed() and are parsed as command lines —
      * a binary typed at the prompt. cdc_flash.py stops at the first chunk
@@ -8933,19 +8994,47 @@ static void vUsbDebugTask(void *pvParameters)
         /* ---- USB CDC transport ---- */
 #if !DEBUG_SHELL_RTT_ONLY
         if (usb_debug_connected()) {
-            if (!usb_banner_sent) {
-                /* Let the host finish enumerating before the first write. */
-                if (usb_settle < 50) {
-                    usb_settle++;
-                } else {
-                    usb_send_str(shell_banner);
-                    usb_banner_sent = true;
-                }
-            } else {
+            /* stage-150 (U-5): no banner at configuration time. Before a host
+             * opens the port nobody reads it: the banner cost a 1 s stall and
+             * left 64 stale bytes in the endpoint in front of the first reply.
+             * It goes out when a host raises DTR (a port open), or on the
+             * first input of a terminal that never sets DTR (below). */
+            uint8_t dtr_now = s_usb.dtr;
+#ifndef EMULATOR_BUILD
+            if (usb_dtr_prev && !dtr_now)
+                usb_cancel_armed_in();      /* port closed: no stale packet for the next open */
+#endif
+            usb_dtr_prev = dtr_now;
+            if (s_usb.banner_pending) {
+                s_usb.banner_pending = 0;
+                s_usb.banners++;
+                usb_send_str(shell_banner);
+                usb_banner_sent = true;
+            }
+            {
 #ifndef EMULATOR_BUILD
                 usb_rx_recover_lost_completion();
 #endif
                 uint16_t rx_len = usb_vcp_get_rxdata(&usb_core_dev, rx_buf);
+                if (rx_len > 0 && !s_usb.dtr && s_usb.dtr_opened) {
+                    /* Input with DTR low after an earlier host closed the
+                     * port: a new host opened it without DTR (stage-150
+                     * bench: before this, its requests ran and every reply
+                     * was dropped). A closed port sends nothing, so answer. */
+                    s_usb.dtr_opened = 0;
+                }
+                if (rx_len > 0 && !usb_rx_seen) {
+                    /* First input since enumeration. A binary host starts
+                     * with a frame (0xAA) and gets no banner; a terminal
+                     * that never raised DTR gets its prompt now. */
+                    usb_rx_seen = true;
+                    if (!usb_banner_sent && rx_buf[0] != ESP_SYNC_BYTE &&
+                        !fw_loader_active() && fwl_discard == 0) {
+                        s_usb.banners++;
+                        usb_send_str(shell_banner);
+                        usb_banner_sent = true;
+                    }
+                }
                 if (rx_len > 0) {
                     if (fw_loader_active()) {
                         /* Raw image bytes for fw_loader — no echo, no line
@@ -9000,18 +9089,21 @@ static void vUsbDebugTask(void *pvParameters)
              * not only when more bytes come (esp_comm.h, ESP_RX_GAP_MS). */
             (void)esp_comm_rx_poll((uint32_t)xTaskGetTickCount() * portTICK_PERIOD_MS);
         } else {
-            usb_banner_sent = false;
-            usb_settle = 0;
             /* Forget DTR only on a real re-enumeration. A suspend/resume keeps
              * the host's port open and it will not resend SET_CONTROL_LINE_STATE;
              * clearing here would disarm drop-when-closed and the #39 heal. */
             if (usbd_connect_state_get(&usb_core_dev) != USB_CONN_STATE_SUSPENDED) {
+                usb_banner_sent = false;
+                usb_rx_seen = false;
+                usb_dtr_prev = 0;
+                s_usb.dtr = 0;              /* the next open is a DTR rise again */
                 s_usb.dtr_seen = 0;
                 s_usb.dtr_opened = 0;
+                s_usb.tx_latched = 0;
             }
         }
 #else
-        (void)rx_buf; (void)usb_banner_sent; (void)usb_settle;
+        (void)rx_buf; (void)usb_banner_sent; (void)usb_rx_seen; (void)usb_dtr_prev;
 #endif
 
         /* Age the fw_loader RX-silence timeout, and report if it fires —

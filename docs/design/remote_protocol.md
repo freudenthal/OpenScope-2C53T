@@ -505,6 +505,38 @@ one two hours into a session — two consecutive lost-completion stalls during a
 heal fired once: the port re-enumerated by itself, no reset, no replug. One occurrence; the wedge's
 mechanism is still open, and PR #48 keeps the triggering stall's snapshot in its own fields.
 
+**Endpoint flag-clear fix (PR #83).** The mechanism: Artery's `USB_CLEAR_TXTC` / `USB_CLEAR_RXTC`
+read-modify-write `USB->ept[n]` and write the other completion flag back as read. Bulk IN and bulk
+OUT share EPT1, so a completion that lands between the read and the write is erased: a lost IN
+completion is the wedge above; a lost OUT completion leaves the OUT endpoint NAKing (the device
+stops hearing the host). `usb_conf.h` replaces both macros so the other flag is written as 1
+(`usb_ept_flags.h`, host test `make test-usb-ept-flags`). Safety net: the shell task finds the OUT
+endpoint at NAK with no completion pending on two polls 10 ms apart and finishes what the ISR would
+have done; `status` ("Lost OUT completions recovered") and `usbstat` (`lost_out_recovered`) count
+it, and it should stay 0. The heal stays on as the backstop for the IN side.
+
+**Host that stops reading (stage-150).** The first stall with the IN endpoint still VALID sets a
+latch. While the latch holds and the packet is still VALID, each write is dropped at once
+(`tx_dropped_stalled`) instead of waiting 1 s per 64-byte chunk; the frame being written stops at
+the first dropped part (the host decoder drops the truncated frame). The latch clears when the
+packet completes. If the packet leaves with no completion (endpoint NAK, flag 0), the latch clears
+and the normal wait runs, so lost-completion stalls still count toward the heal. A host that opens
+the port and stops reading costs the shell task about 1 s, not one second per chunk.
+
+**DTR, banner, stale bytes (stage-150).**
+
+* DTR low after DTR high (the host closed the port): output is dropped (`dropped_closed`) and an IN
+  packet still armed is taken back (`in_cancels`), so the next open does not get stale bytes.
+  Commands that arrive still run. Input that arrives while DTR is low ends the "closed" state: a
+  host that opens the port without DTR gets its replies.
+* The banner is never sent at configuration time (nobody reads the port then). It is sent when DTR
+  goes 0 → 1 (a port open), or on the first input after enumeration if that input does not start
+  with `0xAA` (a terminal that never sets DTR). A binary host that opens with DTR low gets no banner
+  and no bytes before its first reply. The host library opens with DTR high and drains the banner
+  (`Device.open()`); bytes outside frames are decoder text.
+* `usbstat` line 5: `tx latch: latched= dropped_stalled= in_cancels= banners=`; line 6:
+  `rx: lost_out_recovered=`.
+
 ### 9.1 Device description, probe, remote badge (stage-086)
 
 **`GET_DESCRIPTION` (`0x2A`, no payload) → `DESCRIPTION` (`0x94`).** One reply holds what a

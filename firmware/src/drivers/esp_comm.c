@@ -304,13 +304,17 @@ static void send_frame2(uint8_t cmd, const uint8_t *a, uint16_t alen,
                                                   ^ esp_comm_checksum(b, blen);
 
     if (block_write) {
-        /* One task writes the whole frame: nothing else can interleave. */
-        block_write(hdr, ESP_HEADER_SIZE);
-        if (alen)
-            block_write(a, alen);
-        if (blen)
-            block_write(b, blen);
-        block_write(&chk, ESP_CHECKSUM_SIZE);
+        /* One task writes the whole frame: nothing else can interleave.
+         * Stop at the first part that did not go out: the host is not
+         * reading, and the rest of the frame would only wait again
+         * (stage-150, U-3). The host drops a truncated frame. */
+        if (!block_write(hdr, ESP_HEADER_SIZE))
+            return;
+        if (alen && !block_write(a, alen))
+            return;
+        if (blen && !block_write(b, blen))
+            return;
+        (void)block_write(&chk, ESP_CHECKSUM_SIZE);
         return;
     }
     if (!uart_write) return;

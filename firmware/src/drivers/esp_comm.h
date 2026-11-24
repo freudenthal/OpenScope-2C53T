@@ -422,8 +422,10 @@ typedef struct {
  * not be queued, so the host gets NAK instead of a false ACK. */
 typedef bool (*esp_button_fn)(uint8_t button_id);
 /* Block writer: the whole of `len` bytes, in order. Preferred over the
- * byte writer — the USB CDC path sends 64-byte packets, not bytes. */
-typedef void (*esp_write_block_fn)(const uint8_t *data, uint16_t len);
+ * byte writer — the USB CDC path sends 64-byte packets, not bytes.
+ * Returns false if not all bytes went out (host not reading, port closed):
+ * the sender then stops the frame instead of waiting again for each part. */
+typedef bool (*esp_write_block_fn)(const uint8_t *data, uint16_t len);
 /* Where non-protocol bytes go when routing a shared stream (§3.2). */
 typedef void (*esp_passthrough_fn)(const uint8_t *data, uint16_t len, void *ctx);
 

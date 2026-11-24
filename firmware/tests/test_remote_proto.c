@@ -26,10 +26,11 @@ static int failures = 0, checks = 0;
 static uint8_t tx[8192];
 static size_t tx_len;
 static int block_calls;
-static void block_writer(const uint8_t *d, uint16_t n)
+static bool block_writer(const uint8_t *d, uint16_t n)
 {
     block_calls++;
     if (tx_len + n <= sizeof(tx)) { memcpy(tx + tx_len, d, n); tx_len += n; }
+    return true;
 }
 static uint8_t tx_bytes[8192];
 static size_t tx_bytes_len;

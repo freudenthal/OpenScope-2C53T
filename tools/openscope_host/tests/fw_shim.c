@@ -11,7 +11,7 @@ static esp_status_snapshot_t st;
 static int inject_ok = 1, last_button = -1, presses = 0;
 static esp_meter_snapshot_t mt; static int meter_ok = 0, meter_wrong = 0;
 
-static void wr(const uint8_t *d, uint16_t n) { if (tx_n + n <= sizeof tx) { memcpy(tx + tx_n, d, n); tx_n += n; } }
+static bool wr(const uint8_t *d, uint16_t n) { if (tx_n + n <= sizeof tx) { memcpy(tx + tx_n, d, n); tx_n += n; } return true; }
 static void to_shell(const uint8_t *d, uint16_t n, void *c) { (void)c; if (sh_n + n <= sizeof sh) { memcpy(sh + sh_n, d, n); sh_n += n; } }
 static void status(esp_status_snapshot_t *o) { *o = st; }
 static esp_meter_result_t meter(esp_meter_snapshot_t *o) { if (meter_wrong) return ESP_METER_WRONG_MODE; if (!meter_ok) return ESP_METER_NOT_READY; *o = mt; return ESP_METER_OK; }

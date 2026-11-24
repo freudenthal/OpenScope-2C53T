@@ -3680,7 +3680,9 @@ bool fpga_acq_post_edge_is_override(void) { return acq_post_edge_ms != 0; }
  * can still come from the cycle that was armed before the write: one FPGA
  * cycle (EXP-72: fill + ~202 ms hold), plus one poll and a margin, so
  * 1024 samples + 250 ms + poll. Unmeasured rates: 1000 ms. (After a timebase
- * write the old rate decides; the new rate is used here.) */
+ * write the old rate decides; the new rate is used here.) Its only caller is
+ * the warm-handoff acquisition task. */
+#if FPGA_WARM_HANDOFF_TEST
 static uint16_t fpga_acq_reprime_window_ms(void)
 {
     float fs = scope_timebase_sample_rate(acq_rate_idx);
@@ -3689,6 +3691,7 @@ static uint16_t fpga_acq_reprime_window_ms(void)
     if (ms > 5000.0f) ms = 5000.0f;
     return (uint16_t)ms;
 }
+#endif
 /* EXP-48/49 (2026-09-14): from the edge until the bracket ends the FPGA holds
  * the completed record and ignores reads as arms, so the record can be read
  * (and committed) at edge + fill + margin instead of at the bracket's end;

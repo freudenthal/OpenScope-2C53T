@@ -69,6 +69,7 @@ C_SOURCES += src/drivers/meter_data.c
 C_SOURCES += src/drivers/meter_auto.c
 C_SOURCES += src/drivers/meter_autoselect.c
 C_SOURCES += src/drivers/usb_debug.c
+C_SOURCES += src/drivers/usb_link_policy.c
 C_SOURCES += src/drivers/fw_loader.c
 C_SOURCES += src/drivers/rtt.c
 C_SOURCES += src/drivers/fault.c
@@ -575,7 +576,7 @@ test-fw-loader: $(BUILD_DIR)/test_fw_loader
 # the ESP32 staging flow covered with its (still TODO-on-flash) handlers
 # compiled in; test_remote_proto covers what the USB binding relies on.
 $(BUILD_DIR)/test_esp_comm: tests/test_esp_comm.c src/drivers/esp_comm.c src/drivers/esp_comm.h | $(BUILD_DIR)
-	$(HOST_CC) -std=gnu11 -Wall -Wextra -DESP_COMM_TRANSFER_STUBS=1 -Isrc/drivers $< src/drivers/esp_comm.c -o $@
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -DESP_COMM_TRANSFER_STUBS=1 -Isrc/drivers $< src/drivers/esp_comm.c -o $@
 
 test-esp-comm: $(BUILD_DIR)/test_esp_comm
 	$<
@@ -594,6 +595,15 @@ $(BUILD_DIR)/test_usb_ept_flags: tests/test_usb_ept_flags.c src/drivers/usb_ept_
 	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror $< -o $@
 
 test-usb-ept-flags: $(BUILD_DIR)/test_usb_ept_flags
+	$<
+
+# CDC link decisions (stage-155): stall, heal, TX gates, RX watchdog, DTR.
+# scripts/test_remote_proto.py runs it with mutations in the strict gate.
+.PHONY: test-usb-link-policy
+$(BUILD_DIR)/test_usb_link_policy: tests/test_usb_link_policy.c src/drivers/usb_link_policy.c src/drivers/usb_link_policy.h | $(BUILD_DIR)
+	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -Isrc/drivers $< src/drivers/usb_link_policy.c -o $@
+
+test-usb-link-policy: $(BUILD_DIR)/test_usb_link_policy
 	$<
 
 $(BUILD_DIR)/test_scope_timebase: tests/test_scope_timebase.c src/ui/scope_timebase.c src/ui/scope_timebase.h | $(BUILD_DIR)
@@ -719,7 +729,7 @@ $(BUILD_DIR)/test_mask_pf: tests/test_mask_pf.c src/dsp/mask_pf.c src/dsp/mask_p
 test-mask-pf: $(BUILD_DIR)/test_mask_pf
 	$<
 
-.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-fft-live test-trig-edge test-mask-pf test-fuse test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk guest-configA-gap guest-configA-csdummy guest-configA-gapless guest-bringup guest-bringup-bb guest-bringup-bb-slow guest-coldtrace-hwspi guest-bringup-bb-faithful fpga-alt-header guest-coldtrace-meter test-bode test-shmem-layout
+.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-fft-live test-trig-edge test-mask-pf test-fuse test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk guest-configA-gap guest-configA-csdummy guest-configA-gapless guest-bringup guest-bringup-bb guest-bringup-bb-slow guest-coldtrace-hwspi guest-coldtrace-usbtask guest-coldtrace-hwspi-usbtask guest-bringup-bb-faithful fpga-alt-header guest-coldtrace-meter test-bode test-shmem-layout
 
 # Bode sweep maths (step frequency, gain/phase, -3 dB bandwidth) and
 # bode_init(), which since the 2026-11-11 RAM diet fills a caller-owned result
@@ -1100,6 +1110,19 @@ guest-coldtrace-meter: clean all
 guest-coldtrace-hwspi: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_A_HWSPI=1
 guest-coldtrace-hwspi: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace-hwspi: clean all
+
+# [EXPERIMENT stage-155 U-2] usbd_connect() from the shell task instead of
+# usb_debug_init() (USB_CONNECT_IN_TASK, usb_debug.c). Tests whether the early
+# pull-up, with the USB IRQ masked by the pre-scheduler BASEPRI through
+# fpga_init(), is why CDC does not enumerate on some builds (G-40). Never the
+# shipping image without a user decision.
+guest-coldtrace-usbtask: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DUSB_CONNECT_IN_TASK=1
+guest-coldtrace-usbtask: LDSCRIPT = ld/at32f403a_guest.ld
+guest-coldtrace-usbtask: clean all
+
+guest-coldtrace-hwspi-usbtask: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_A_HWSPI=1 -DUSB_CONNECT_IN_TASK=1
+guest-coldtrace-hwspi-usbtask: LDSCRIPT = ld/at32f403a_guest.ld
+guest-coldtrace-hwspi-usbtask: clean all
 
 # [CH2 OFFSET 2026-08-17] guest-coldtrace-ch2 — coldtrace plus a boot-time arm
 # of the CH2 vertical-offset reference (TMR13 CH1 PWM-DAC on PA6).

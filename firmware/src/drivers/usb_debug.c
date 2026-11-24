@@ -22,6 +22,7 @@
 #include "rtt.h"
 #include "continuity_buzzer.h"
 #include "esp_comm.h"
+#include "usb_link_policy.h"
 #include "battery.h"
 #include "button_scan.h"
 
@@ -139,7 +140,19 @@ void USBFS_L_CAN1_RX0_IRQHandler(void)
 #ifndef USB_TX_SELF_HEAL
 #define USB_TX_SELF_HEAL 1
 #endif
-#define USB_HEAL_AFTER_STALLS   2
+
+/* stage-155 U-2 experiment: set the D+ pull-up from the shell task instead of
+ * usb_debug_init(). In the default build usbd_connect() runs in
+ * usb_debug_init() (main.c, before fpga_init() and the scheduler). Before the
+ * scheduler starts uxCriticalNesting is 0xaaaaaaaa, so the first critical
+ * section (flash_fs_init() makes a mutex) leaves BASEPRI raised and the USB
+ * IRQ (priority 6) masked through fpga_init(): a host that resets the device
+ * then gets no answer. Experiment builds only (guest-coldtrace-usbtask,
+ * guest-coldtrace-hwspi-usbtask); the port appears later, after fpga_init(). */
+#ifndef USB_CONNECT_IN_TASK
+#define USB_CONNECT_IN_TASK 0
+#endif
+/* Heal threshold: USB_LINK_HEAL_AFTER_STALLS (usb_link_policy.h). */
 #define USB_HEAL_OFF_MS         200
 #define CDC_SET_CONTROL_LINE_STATE 0x22
 
@@ -171,18 +184,41 @@ typedef struct {
 
 static usb_health_t s_usb = { .heal_enabled = USB_TX_SELF_HEAL };
 
+/* The DTR fields of s_usb as the policy's struct (usb_link_policy.c holds
+ * the rules; s_usb keeps its field names for usbstat). */
+static usb_link_dtr_t usb_dtr_get(void)
+{
+    usb_link_dtr_t s = { s_usb.dtr, s_usb.dtr_seen, s_usb.dtr_opened, s_usb.banner_pending };
+    return s;
+}
+
+/* Task side: forget DTR (re-enumeration or heal). Writes only the three
+ * fields stage-150 cleared; banner_pending belongs to the setup ISR and the
+ * banner code. */
+static void usb_dtr_forget_now(void)
+{
+    usb_link_dtr_t s = usb_link_dtr_forget(usb_dtr_get());
+    s_usb.dtr = s.dtr;
+    s_usb.dtr_seen = s.dtr_seen;
+    s_usb.dtr_opened = s.dtr_opened;
+}
+
 #ifndef EMULATOR_BUILD
 static usbd_class_handler s_cdc_handler;
+
+static void usb_dtr_put(usb_link_dtr_t s)
+{
+    s_usb.dtr = s.dtr;
+    s_usb.dtr_seen = s.dtr_seen;
+    s_usb.dtr_opened = s.dtr_opened;
+    s_usb.banner_pending = s.banner_pending;
+}
 
 static usb_sts_type cdc_setup_spy(void *udev, usb_setup_type *setup)
 {
     if ((setup->bmRequestType & USB_REQ_TYPE_RESERVED) == USB_REQ_TYPE_CLASS &&
         setup->bRequest == CDC_SET_CONTROL_LINE_STATE) {
-        uint8_t dtr = (uint8_t)(setup->wValue & 0x0001u);
-        if (dtr && !s_usb.dtr) s_usb.banner_pending = 1;   /* DTR 0 -> 1: a port open */
-        s_usb.dtr = dtr;
-        s_usb.dtr_seen = 1;
-        if (s_usb.dtr) s_usb.dtr_opened = 1;
+        usb_dtr_put(usb_link_dtr_on_setup(usb_dtr_get(), setup->wValue));
     }
     return cdc_class_handler.setup_handler(udev, setup);
 }
@@ -198,29 +234,30 @@ static void usb_tx_stalled(cdc_struct_type *pcdc)
      * the host has simply stopped reading (paused terminal, full OS buffer).
      * That is not a wedge and must not cost the host its port. Only a stall
      * with the endpoint NAK/disabled — packet gone, completion never seen —
-     * is the lost-completion case #39 is about. */
-    if ((s_usb.stall_ept & USB_TXSTS) == USB_TX_VALID) {
+     * is the lost-completion case #39 is about. The task can also be
+     * preempted between the timeout and this capture; if the completion
+     * landed meanwhile the endpoint is free, not wedged. */
+    switch (usb_link_classify_stall((s_usb.stall_ept & USB_TXSTS) == USB_TX_VALID,
+                                    s_usb.stall_flag != 0)) {
+    case USB_LINK_STALL_HOST_SLOW:
         s_usb.tx_host_slow++;
         s_usb.consecutive = 0;              /* a slow reader never counts toward a heal */
         s_usb.tx_latched = 1;               /* drop later writes until it completes */
         return;
-    }
-    /* The task can be preempted between the timeout and this capture; if the
-     * completion landed meanwhile the endpoint is free, not wedged. */
-    if (s_usb.stall_flag) {
+    case USB_LINK_STALL_LATE:
         s_usb.consecutive = 0;
         return;
+    case USB_LINK_STALL_LOST:
+        break;
     }
-    if (s_usb.consecutive < 0xFF) s_usb.consecutive++;
+    s_usb.consecutive = usb_link_count_lost(s_usb.consecutive);
 
-    if (s_usb.heal_enabled && s_usb.dtr_seen && s_usb.dtr &&
-        s_usb.consecutive >= USB_HEAL_AFTER_STALLS &&
-        xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+    if (usb_link_heal_due(s_usb.heal_enabled != 0, s_usb.dtr_seen != 0, s_usb.dtr != 0,
+                          s_usb.consecutive,
+                          xTaskGetSchedulerState() == taskSCHEDULER_RUNNING)) {
         usbd_disconnect(&usb_core_dev);
         vTaskDelay(pdMS_TO_TICKS(USB_HEAL_OFF_MS));
-        s_usb.dtr = 0;
-        s_usb.dtr_seen = 0;
-        s_usb.dtr_opened = 0;
+        usb_dtr_forget_now();
         s_usb.consecutive = 0;
         s_usb.heals++;
         usbd_connect(&usb_core_dev);
@@ -278,8 +315,10 @@ void usb_debug_init(void)
     s_cdc_handler.setup_handler = cdc_setup_spy;
     usbd_core_init(&usb_core_dev, USB, &s_cdc_handler, &cdc_desc_handler, 0);
 
+#if !USB_CONNECT_IN_TASK
     /* Enable USB pull-up — device becomes visible to host */
     usbd_connect(&usb_core_dev);
+#endif
 #endif
 }
 
@@ -306,7 +345,7 @@ static bool cdc_send_bytes(const uint8_t *data, uint16_t len)
     return false;
 #else
     if (!usb_debug_connected()) return false;
-    if (s_usb.dtr_opened && !s_usb.dtr) {
+    if (usb_link_tx_open_gate(s_usb.dtr_opened != 0, s_usb.dtr != 0) == USB_LINK_TX_DROP_CLOSED) {
         /* Host raised DTR earlier and has now dropped it: it closed the port,
          * nothing will read this, and waiting costs the shell task a 1 s stall
          * per write. A host that never raises DTR (CDC does not require it;
@@ -327,15 +366,17 @@ static bool cdc_send_bytes(const uint8_t *data, uint16_t len)
          * no completion came (TX NAK, flag 0: the #39 lost completion), unlatch
          * and wait as usual, so the lost-completion stall is counted and the
          * heal stays reachable. */
-        if (s_usb.tx_latched) {
-            if (pcdc->g_tx_completed) {
-                s_usb.tx_latched = 0;
-            } else if ((USB->ept[USBD_CDC_BULK_IN_EPT & 0x0F] & USB_TXSTS) == USB_TX_VALID) {
-                s_usb.tx_dropped_stalled++;
-                return false;
-            } else {
-                s_usb.tx_latched = 0;
-            }
+        switch (usb_link_tx_latch_gate(
+                    s_usb.tx_latched != 0, pcdc->g_tx_completed != 0,
+                    (USB->ept[USBD_CDC_BULK_IN_EPT & 0x0F] & USB_TXSTS) == USB_TX_VALID)) {
+        case USB_LINK_TX_DROP_STALLED:
+            s_usb.tx_dropped_stalled++;
+            return false;
+        case USB_LINK_TX_CLEAR_LATCH:
+            s_usb.tx_latched = 0;
+            break;
+        default:
+            break;
         }
 
         /* Wait for previous TX to complete (with timeout) */
@@ -8863,32 +8904,19 @@ volatile uint32_t dbg_shell_rtt_bytes;
 
 static bool usb_rx_completion_is_lost(const cdc_struct_type *pcdc, uint32_t endpoint_register)
 {
-    bool is_rx_nak = (endpoint_register & USB_RXSTS) == USB_RX_NAK;
-    bool has_pending_completion = (endpoint_register & USB_RXTC) != 0;
-    bool is_waiting_for_task = pcdc->g_rx_completed != 0;
-    return is_rx_nak && !has_pending_completion && !is_waiting_for_task;
+    return usb_link_rx_completion_lost((endpoint_register & USB_RXSTS) == USB_RX_NAK,
+                                       (endpoint_register & USB_RXTC) != 0,
+                                       pcdc->g_rx_completed != 0);
 }
 
 static void usb_rx_recover_lost_completion(void)
 {
-    static bool is_suspect;
-    static uint32_t suspect_tick;
+    static usb_link_rx_wd_t wd;
     uint8_t endpoint_number = USBD_CDC_BULK_OUT_EPT & 0x0F;
     cdc_struct_type *pcdc = (cdc_struct_type *)usb_core_dev.class_handler->pdata;
-    uint32_t now_tick = xTaskGetTickCount();
 
-    if (!usb_rx_completion_is_lost(pcdc, USB->ept[endpoint_number])) {
-        is_suspect = false;
-        return;
-    }
-
-    if (!is_suspect) {
-        is_suspect = true;
-        suspect_tick = now_tick;
-        return;
-    }
-
-    if (now_tick - suspect_tick < pdMS_TO_TICKS(USB_RX_LOST_CONFIRM_MS)) {
+    if (!usb_link_rx_watchdog_step(&wd, usb_rx_completion_is_lost(pcdc, USB->ept[endpoint_number]),
+                                   xTaskGetTickCount(), pdMS_TO_TICKS(USB_RX_LOST_CONFIRM_MS))) {
         return;
     }
 
@@ -8903,7 +8931,6 @@ static void usb_rx_recover_lost_completion(void)
         usbd_core_out_handler(&usb_core_dev, endpoint_number);
         usb_rx_lost_completions++;
     }
-    is_suspect = false;
     nvic_irq_enable(USBFS_L_CAN1_RX0_IRQn, 6, 0);
 }
 #endif
@@ -8913,6 +8940,12 @@ static void vUsbDebugTask(void *pvParameters)
     (void)pvParameters;
 
     dbg_shell_entered = 0xA5A5A5A5u;
+
+#if USB_CONNECT_IN_TASK && !defined(EMULATOR_BUILD)
+    /* U-2 experiment: the pull-up goes on with the scheduler running and the
+     * USB IRQ live (see USB_CONNECT_IN_TASK above). */
+    usbd_connect(&usb_core_dev);
+#endif
 
     uint8_t rx_buf[USBD_CDC_OUT_MAXPACKET_SIZE];
     uint8_t rtt_buf[64];
@@ -9002,7 +9035,7 @@ static void vUsbDebugTask(void *pvParameters)
              * first input of a terminal that never sets DTR (below). */
             uint8_t dtr_now = s_usb.dtr;
 #ifndef EMULATOR_BUILD
-            if (usb_dtr_prev && !dtr_now)
+            if (usb_link_dtr_fell(usb_dtr_prev, dtr_now))
                 usb_cancel_armed_in();      /* port closed: no stale packet for the next open */
 #endif
             usb_dtr_prev = dtr_now;
@@ -9017,7 +9050,7 @@ static void vUsbDebugTask(void *pvParameters)
                 usb_rx_recover_lost_completion();
 #endif
                 uint16_t rx_len = usb_vcp_get_rxdata(&usb_core_dev, rx_buf);
-                if (rx_len > 0 && !s_usb.dtr && s_usb.dtr_opened) {
+                if (usb_link_dtr_reopen_on_input(usb_dtr_get(), rx_len)) {
                     /* Input with DTR low after an earlier host closed the
                      * port: a new host opened it without DTR (stage-150
                      * bench: before this, its requests ran and every reply
@@ -9029,8 +9062,8 @@ static void vUsbDebugTask(void *pvParameters)
                      * with a frame (0xAA) and gets no banner; a terminal
                      * that never raised DTR gets its prompt now. */
                     usb_rx_seen = true;
-                    if (!usb_banner_sent && rx_buf[0] != ESP_SYNC_BYTE &&
-                        !fw_loader_active() && fwl_discard == 0) {
+                    if (usb_link_banner_on_first_input(usb_banner_sent, rx_buf[0], ESP_SYNC_BYTE,
+                                                       fw_loader_active() || fwl_discard != 0)) {
                         s_usb.banners++;
                         usb_send_str(shell_banner);
                         usb_banner_sent = true;
@@ -9093,13 +9126,12 @@ static void vUsbDebugTask(void *pvParameters)
             /* Forget DTR only on a real re-enumeration. A suspend/resume keeps
              * the host's port open and it will not resend SET_CONTROL_LINE_STATE;
              * clearing here would disarm drop-when-closed and the #39 heal. */
-            if (usbd_connect_state_get(&usb_core_dev) != USB_CONN_STATE_SUSPENDED) {
+            if (usb_link_forget_on_unconfigured(
+                    usbd_connect_state_get(&usb_core_dev) == USB_CONN_STATE_SUSPENDED)) {
                 usb_banner_sent = false;
                 usb_rx_seen = false;
                 usb_dtr_prev = 0;
-                s_usb.dtr = 0;              /* the next open is a DTR rise again */
-                s_usb.dtr_seen = 0;
-                s_usb.dtr_opened = 0;
+                usb_dtr_forget_now();       /* the next open is a DTR rise again */
                 s_usb.tx_latched = 0;
             }
         }

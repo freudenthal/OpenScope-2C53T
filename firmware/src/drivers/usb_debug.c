@@ -7822,6 +7822,7 @@ static void cmd_spi3_probe(void)
  * (battery check). */
 
 extern volatile bool faulttest_stall_display;   /* main.c */
+extern void battery_test_force_critical(uint32_t ms);   /* battery.c */
 
 static volatile uint32_t ft_mode;
 static volatile uint32_t ft_delay_s;
@@ -7872,9 +7873,16 @@ static void cmd_faulttest(const char *args)
         while (*end == ' ') end++;
         if (*end != '\0') delay = strtoul(end, NULL, 10);
     }
-    if (n < 1u || n > 4u || delay > 600u) {
-        usb_send_str("Usage: faulttest <1-4> [delay_s 0-600]\r\n"
-                     "  1 UsageFault  2 stack overflow  3 display stall  4 malloc 64 KB\r\n");
+    if (n < 1u || n > 5u || delay > 600u) {
+        usb_send_str("Usage: faulttest <1-5> [delay_s 0-600]\r\n"
+                     "  1 UsageFault  2 stack overflow  3 display stall  4 malloc 64 KB\r\n"
+                     "  5 battery critical 60 s (shutdown after 30 s unless charging)\r\n");
+        return;
+    }
+
+    if (n == 5u) {
+        battery_test_force_critical(60000u);
+        usb_send_str("faulttest 5: battery_is_critical() = 1 for 60 s\r\n");
         return;
     }
 
@@ -8312,7 +8320,7 @@ static const shell_cmd_t shell_cmds[] = {
           "status                          FPGA & system status\r\n"),
 #if defined(FAULT_SELFTEST) && FAULT_SELFTEST == 2
     CMD_A("faulttest", cmd_faulttest, SC_NEEDARGS,
-          "faulttest <1-4> [delay_s]       TEST IMAGE: 1 fault 2 stack 3 stall 4 malloc\r\n"),
+          "faulttest <1-5> [delay_s]       TEST IMAGE: 1 fault 2 stack 3 stall 4 malloc 5 battery\r\n"),
 #endif
     CMD_V("usbstat", cmd_usbstat, SC_EXACT,
           "usbstat                         USB CDC health + remote protocol counters (#39)\r\n"),

@@ -6355,8 +6355,10 @@ QueueHandle_t fpga_create_tasks(void)
      * gated on current_mode == MODE_MULTIMETER, so scope mode still sees a quiet
      * wire. Without them PC11 high produces an audible relay click and a frozen
      * DMM screen: nothing polls, nothing decodes. */
-    xTaskCreate(fpga_usart_tx_task,    "dvom_TX",   64,  NULL, 2, &tx_task_handle);
-    xTaskCreate(fpga_usart_rx_task,    "dvom_RX",   128, NULL, 3, &rx_task_handle);
+    /* 128/256 words, not stock's 64/128 (stage-165, S-2): a fork measured 9
+     * and 13 words free with deeper meter code (5411667d). */
+    xTaskCreate(fpga_usart_tx_task,    "dvom_TX",   128, NULL, 2, &tx_task_handle);
+    xTaskCreate(fpga_usart_rx_task,    "dvom_RX",   256, NULL, 3, &rx_task_handle);
     /* 192, not 64: function changes (fpga_set_meter_mode) now run here. */
     xTaskCreate(fpga_meter_poll_task,  "meter_poll", 192, NULL, 2, &meter_poll_handle);
 #elif FPGA_USART_SILENT_SCOPE
@@ -6366,9 +6368,11 @@ QueueHandle_t fpga_create_tasks(void)
      * + `spi3 xfer` from the debug shell on a quiet wire. */
     (void)tx_task_handle; (void)rx_task_handle; (void)acq_task_handle;
 #else
-    /* Create tasks (stack sizes and priorities match stock firmware) */
-    xTaskCreate(fpga_usart_tx_task,    "dvom_TX",   64,  NULL, 2, &tx_task_handle);
-    xTaskCreate(fpga_usart_rx_task,    "dvom_RX",   128, NULL, 3, &rx_task_handle);
+    /* Create tasks (priorities match stock firmware; dvom stacks are larger) */
+    /* 128/256 words, not stock's 64/128 (stage-165, S-2): a fork measured 9
+     * and 13 words free with deeper meter code (5411667d). */
+    xTaskCreate(fpga_usart_tx_task,    "dvom_TX",   128, NULL, 2, &tx_task_handle);
+    xTaskCreate(fpga_usart_rx_task,    "dvom_RX",   256, NULL, 3, &rx_task_handle);
     xTaskCreate(fpga_acquisition_task, "fpga",      256, NULL, 3, &acq_task_handle);
     xTaskCreate(fpga_meter_poll_task,  "meter_poll", 192, NULL, 2, &meter_poll_handle);
     xTaskCreate(fpga_meter_adc_sampler_task, "mtr_wave", 64, NULL, 2, NULL);

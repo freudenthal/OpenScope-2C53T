@@ -66,6 +66,11 @@
 /* GPIO port D registers (0x40011400) */
 #define GPIOD_CRL       (*(volatile uint32_t *)0x40011400)
 #define GPIOD_CRH       (*(volatile uint32_t *)0x40011404)
+#define GPIOD_SCR       (*(volatile uint32_t *)0x40011410)  /* set/clear (BSRR) */
+
+/* ST7789V RESX (active low) is on PD6 (upstream #85, PR #90). Stock drives it
+ * high-low-high at boot and then holds it as a push-pull output, high. */
+#define LCD_RESX_PIN    6u
 
 /* GPIO port E registers. */
 #define GPIOE_CRL       (*(volatile uint32_t *)(0x40010000UL + 6144UL))
@@ -204,6 +209,7 @@ void lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t fg, uint1
 void lcd_set_brightness(uint8_t level);  /* If backlight PWM is available */
 void lcd_display_on(void);
 void lcd_display_off(void);
+void lcd_resx_hold_high(void);  /* PD6 (RESX) push-pull high, as stock holds it */
 void lcd_set_orientation(uint8_t madctl);
 
 /* 4-bit indexed software shadow of pixels written through lcd_write_data().

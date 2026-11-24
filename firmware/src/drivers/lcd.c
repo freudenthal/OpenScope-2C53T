@@ -298,6 +298,9 @@ void lcd_gpio_init(void)
     RCU_APB2EN |= RCU_APB2EN_PDEN | RCU_APB2EN_PEEN | RCU_APB2EN_AFEN;
     RCU_AHBEN  |= RCU_AHBEN_EXMC;
 
+    /* PD6 = panel RESX: drive it high before the panel init (stage-165). */
+    lcd_resx_hold_high();
+
     /*
      * Configure Port D pins for EXMC (AF Push-Pull, 50MHz):
      * CRL (pins 0-7): PD0, PD1 = D2,D3; PD4 = NOE; PD5 = NWE; PD7 = NE1
@@ -730,7 +733,24 @@ void lcd_reset(void)
      *   gpio_set_pin(LCD_RST_PORT, LCD_RST_PIN, 1);  // RST high
      *   delay_ms(120);
      *
-     * TODO: Identify RST pin from hardware teardown.
+     * Stock V1.2.0 uses PD6 for this (upstream #85, PR #90 2c68e37): it
+     * pulses PD6 high-low-high at boot and then holds it high. The app
+     * resets the panel with SWRESET instead; see lcd_resx_hold_high().
      */
     delay_ms(120);
+}
+
+/*
+ * Hold the ST7789V's RESX (PD6) high as a push-pull output (PD6 half of
+ * upstream PR #90, 2c68e37). Before this the pin was not configured, so the
+ * panel's active-low reset input floated; a low pulse longer than ~9 us resets
+ * the panel to its power-on state (sleep in, display off: a white screen while
+ * the MCU runs). The output data is set high before the pin becomes an
+ * output, so the line does not glitch low. Clock for GPIOD must be on.
+ */
+void lcd_resx_hold_high(void)
+{
+    GPIOD_SCR = 1u << LCD_RESX_PIN;                                /* ODR high first */
+    GPIOD_CRL = (GPIOD_CRL & ~(0xFu << (LCD_RESX_PIN * 4u)))
+              | (0x3u << (LCD_RESX_PIN * 4u));                     /* push-pull, 50 MHz */
 }

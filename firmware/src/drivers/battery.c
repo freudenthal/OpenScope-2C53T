@@ -171,8 +171,31 @@ uint8_t battery_percent(void)
     return cached_percent;
 }
 
+#if defined(FAULT_SELFTEST) && FAULT_SELFTEST == 2
+/* faulttest 5 (stage-165, test image only): battery_is_critical() reads 1
+ * until this tick, so the critical-battery shutdown path can run with a
+ * charged cell. 0 = no override. */
+#include "FreeRTOS.h"
+#include "task.h"
+static volatile TickType_t test_critical_until;
+
+void battery_test_force_critical(uint32_t ms)
+{
+    TickType_t until = xTaskGetTickCount() + pdMS_TO_TICKS(ms);
+    test_critical_until = (until == 0) ? 1 : until;
+}
+#endif
+
 uint8_t battery_is_critical(void)
 {
+#if defined(FAULT_SELFTEST) && FAULT_SELFTEST == 2
+    TickType_t until = test_critical_until;
+    if (until != 0) {
+        if ((int32_t)(until - xTaskGetTickCount()) > 0)
+            return 1;
+        test_critical_until = 0;
+    }
+#endif
     return cached_critical;
 }
 

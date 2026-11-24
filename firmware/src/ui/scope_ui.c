@@ -1716,7 +1716,9 @@ static void draw_math_waveform(uint32_t frame)
        -100,-99,-98,-96,-92,-88,-83,-77,-71,-63,-56,-47,-38,-29,-19,-10,
     };
 
-    int16_t ch_a[LCD_WIDTH], ch_b[LCD_WIDTH], result[LCD_WIDTH];
+    /* static (stage-165, S-3): 1,920 B on the 3,072 B display stack. One
+     * caller, the display task. */
+    static int16_t ch_a[LCD_WIDTH], ch_b[LCD_WIDTH], result[LCD_WIDTH];
     for (uint16_t x = 0; x < LCD_WIDTH; x++) {
         uint8_t idx = (uint8_t)((x * 4 + frame) & 0x3F);
         ch_a[x] = (int16_t)(sin_lut_m[idx] * 40);

@@ -35,6 +35,7 @@
 #include "at32f403a_407.h"
 #include "button_scan.h"
 #include "settings_store.h"
+#include "watchdog.h"
 #include "task.h"
 #include <stdio.h>
 #include <string.h>
@@ -341,6 +342,61 @@ static void mask_auto_key(char *pb, size_t n)
         snprintf(pb, n, "%s", !ok ? "MASK: NOT SET" :
                               st == MASK_PF_TEACHING ? "MASK: cancelled" : "MASK: off");
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Power off (stage-165, after marcnnn 8914c03 + a1cb635)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Health check-in for the task that calls this, found by its handle. The
+ * power-off paths run inside input_handle_button() (key task) or
+ * draw_status_bar() (display task) and do not return to the loop that
+ * checks in, so they check in here. No match (not registered): no effect. */
+static void power_checkin_self(void)
+{
+    TaskHandle_t me = xTaskGetCurrentTaskHandle();
+    const task_health_t *t = health_get_tasks();
+    int n = health_get_count();
+    for (int i = 0; i < n; i++) {
+        if (t[i].registered && t[i].handle == me) {
+            health_checkin(i);
+            return;
+        }
+    }
+}
+
+/* Drop PC9 (power hold). On battery the rail goes within a few ms. If the
+ * MCU still runs 300 ms later, USB holds the rail: PC9 cannot switch the unit
+ * off while the cable is in. Before this the task spun in while(1) with the
+ * last message on the screen and every key dead (and, with the stage-160
+ * watchdog, the stopped check-ins reset the unit). Soft off: panel and
+ * backlight dark, PC9 stays LOW (pull the cable and the unit is off), the
+ * calling task keeps its health check-in, a POWER press resets the unit.
+ * The CDC port stays up. Task context only. */
+void power_off_now(void)
+{
+    GPIOC->clr = (1U << 9);
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    ui_modal_active = true;              /* the display task paints nothing more */
+    GPIOB->clr = (1U << 8);              /* PB8 = backlight off */
+    lcd_display_off();
+
+    /* Wait until a held POWER is released, then for a new press (PC8 active
+     * LOW, 5 x 20 ms debounce). The reset boots as from cold; main() sets
+     * PC9 high first. */
+    while (!(GPIOC->idt & (1U << 8))) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        power_checkin_self();
+    }
+    for (int held = 0; held < 5; ) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        power_checkin_self();
+        held = (GPIOC->idt & (1U << 8)) ? 0 : held + 1;
+    }
+    __DSB();
+    NVIC_SystemReset();
+    while (1) { }
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1096,6 +1152,7 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
                 /* Wait 1 second, polling button every 50ms */
                 for (int i = 0; i < 20; i++) {
                     vTaskDelay(pdMS_TO_TICKS(50));
+                    power_checkin_self();  /* 3.6 s > HEALTH_DEADLINE_MS */
                     /* PC8 active LOW — if released, cancel */
                     if (GPIOC->idt & (1U << 8)) {
                         /* Button released — cancel, hand the screen back */
@@ -1111,18 +1168,17 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
             font_draw_string_center(160, 110, "Goodbye!",
                                     th->success, bg, &font_large);
             vTaskDelay(pdMS_TO_TICKS(500));
+            power_checkin_self();
 
             /* Last chance to persist: an orderly power-off is the one place we
              * KNOW the settings are about to stop existing in RAM. Runs behind
              * the "Goodbye!" frame so its SPI2 traffic is invisible to the
              * user, and before the rail drops. */
             (void)settings_store_flush(settings_now_ms());
+            power_checkin_self();
 
-            /* Drop PC9 LOW — device powers off */
-            GPIOC->clr = (1U << 9);
-
-            /* Should never reach here */
-            while (1);
+            /* PC9 LOW: off on battery, soft off on USB. Does not return. */
+            power_off_now();
         }
         power_done:
         break;

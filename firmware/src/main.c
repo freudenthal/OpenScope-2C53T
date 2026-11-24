@@ -1053,6 +1053,11 @@ int main(void)
         for (int i = 7; i <= 15; i++)
             _GPIO_CFG(0x40011800, i, 3, 2);
 
+        /* PD6 is the panel's RESX (stage-165, PD6 half of upstream PR #90):
+         * hold it high, as stock does. Left floating, a stray low pulse
+         * resets the panel under the running app (white screen). */
+        lcd_resx_hold_high();
+
         /* EXMC config — proven working values */
         *(volatile uint32_t *)0xA0000000 = 0x00005010;
         *(volatile uint32_t *)0xA0000004 = 0x02020424;
@@ -1150,7 +1155,8 @@ int main(void)
     /* Initialize FPGA communication (USART2 + SPI3 + boot sequence).
      * Must happen after clock init and GPIO clocks are enabled.
      * Sends boot commands, configures SPI3 Mode 3, performs handshake,
-     * sets PB11 HIGH (FPGA active mode) and PC6 HIGH (SPI enable). */
+     * sets PB11 HIGH (FPGA active mode) and PC6 HIGH (FPGA supply switch per upstream
+     * #87; older notes say "SPI enable"). */
     /* Initialize USB CDC debug shell (HICK 48MHz clock + CDC class).
      * Must happen after clock init. Enables USB pull-up so device
      * appears on the bus immediately — the debug task handles data

@@ -39,6 +39,23 @@ def candidate_ports() -> List[str]:
         return hits
 
 
+def open_error_words(e: BaseException) -> str:
+    """The reason an open failed, in words. On Windows pyserial wraps the OS
+    error in SerialException: "could not open port 'COM7': PermissionError(13,
+    'Access is denied.', ...)" when another program holds the port, and
+    "FileNotFoundError(2, ...)" when the port does not exist. POSIX says
+    "busy" or (exclusive=True) "could not exclusively lock port"."""
+    text = str(e)
+    low = text.lower()
+    if (isinstance(e, PermissionError) or "busy" in low or "lock" in low
+            or "access is denied" in low or "permissionerror" in low):
+        return "in use by another process (only one client at a time)"
+    if (isinstance(e, FileNotFoundError) or "filenotfounderror" in low
+            or "cannot find the file" in low or "no such file" in low):
+        return "port not found (unplugged, or a wrong port name)"
+    return text
+
+
 def looked_where() -> str:
     return f"USB {AT32_VCP[0]:04x}:{AT32_VCP[1]:04x} (AT32 VCP)"
 
@@ -69,9 +86,7 @@ class SerialLink:
             self._ser = serial.Serial(port, 115200, timeout=0.05, write_timeout=2.0,
                                       exclusive=True)
         except (OSError, serial.SerialException) as e:
-            busy = "busy" in str(e).lower() or "lock" in str(e).lower()
-            raise NoDevice(f"cannot open {port}: "
-                           + ("in use by another process (only one client at a time)" if busy else str(e))) from None
+            raise NoDevice(f"cannot open {port}: {open_error_words(e)}") from None
         self.port = port
 
     def close(self) -> None:
@@ -82,11 +97,15 @@ class SerialLink:
                 self._ser = None
 
     def reopen(self) -> None:
-        """After the port vanished: wait for it to come back (any path)."""
+        """After the port vanished: wait for it to come back (any path).
+        reopen_wait <= 0: do not wait; raise NoDevice("port lost") at once
+        (the GUI worker owns reconnect, so a request never blocks)."""
         self.close()
-        deadline = time.time() + self.reopen_wait
+        if self.reopen_wait <= 0:
+            raise NoDevice("port lost")
+        deadline = time.monotonic() + self.reopen_wait
         last: Exception = NoDevice("not found")
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
                 self.open()
                 self.reopens += 1
@@ -104,10 +123,10 @@ class SerialLink:
         # only re-arms its OUT endpoint when the shell task polls, so a busy or
         # wedged device would hang the host with no timeout at all. Wait for
         # the OS queue to empty, but only up to a deadline.
-        deadline = time.time() + self.drain_timeout
+        deadline = time.monotonic() + self.drain_timeout
         try:
             while self._ser.out_waiting:
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     raise FlushFailed(f"device not accepting data after {self.drain_timeout:.0f} s")
                 time.sleep(0.005)
         except FlushFailed:
@@ -115,18 +134,23 @@ class SerialLink:
         except Exception as e:      # port vanished while draining (termios/serial errors)
             raise FlushFailed(f"port lost after write: {e}") from e
 
+    def discard_input(self) -> None:
+        """Drop the bytes the OS holds for us (a late reply, old text). Never
+        blocks; bytes still on the wire are not affected."""
+        self._ser.reset_input_buffer()
+
     def read(self, n: int = 4096) -> bytes:
         return self._ser.read(max(1, min(n, self._ser.in_waiting or 1)))
 
     def drain(self, quiet: float = 0.15, max_wait: float = 1.5) -> bytes:
         """Swallow whatever the device is still saying (banner, old output)."""
         out = bytearray()
-        start = last = time.time()
-        while time.time() - start < max_wait:
+        start = last = time.monotonic()
+        while time.monotonic() - start < max_wait:
             chunk = self.read()
             if chunk:
                 out += chunk
-                last = time.time()
-            elif time.time() - last >= quiet:
+                last = time.monotonic()
+            elif time.monotonic() - last >= quiet:
                 break
         return bytes(out)

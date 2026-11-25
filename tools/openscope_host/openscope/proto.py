@@ -119,7 +119,10 @@ class Decoder:
     or truncated frame cannot hide the next good one (resync).
 
     A frame is only returned once its checksum byte has arrived and matches.
+    `text` keeps only the last TEXT_CAP bytes (nothing takes it on a long
+    poll loop, so it must not grow without bound).
     """
+    TEXT_CAP = 4096
 
     def __init__(self, max_payload: int = MAX_RX_PAYLOAD):
         self._buf = bytearray()
@@ -136,11 +139,13 @@ class Decoder:
             if i < 0:
                 self.text += self._buf
                 self._buf.clear()
+                self._cap_text()
                 return frames
             if i:
                 self.text += self._buf[:i]
                 del self._buf[:i]
             if len(self._buf) < HEADER_LEN:
+                self._cap_text()
                 return frames                       # wait for the header
             n = (self._buf[2] << 8) | self._buf[3]
             if n > self.max_payload:
@@ -148,6 +153,7 @@ class Decoder:
                 continue
             total = HEADER_LEN + n + 1
             if len(self._buf) < total:
+                self._cap_text()
                 return frames                       # truncated so far: never accept
             body = bytes(self._buf[1:HEADER_LEN + n])
             if checksum(body) != self._buf[total - 1]:
@@ -156,6 +162,10 @@ class Decoder:
                 continue
             frames.append(Frame(self._buf[1], bytes(self._buf[HEADER_LEN:HEADER_LEN + n])))
             del self._buf[:total]
+
+    def _cap_text(self) -> None:
+        if len(self.text) > self.TEXT_CAP:
+            del self.text[:-self.TEXT_CAP]
 
     def pending(self) -> int:
         """Bytes held back waiting for the rest of a possible frame."""

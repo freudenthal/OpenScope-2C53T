@@ -54,8 +54,12 @@ Keep the library and the firmware at the same protocol version as the GUI expect
 | module | job |
 |---|---|
 | `proto.py` | framing, incremental `Decoder` (resyncs on garbage, never accepts a truncated frame), STATUS / METER / WAVEFORM codecs, waveform summary |
-| `link.py` | port discovery by VID:PID, reopen after the port vanishes |
-| `device.py` | one method per request; stateless; one retry after a replug (e.g. the firmware's CDC self-heal, #39) |
+| `link.py` | port discovery by VID:PID, reopen after the port vanishes (waits `reopen_wait`, default 6 s; 0 = raise `NoDevice("port lost")` at once) |
+| `device.py` | one method per request; stateless; one retry after a replug (e.g. the firmware's CDC self-heal, #39); input is discarded before each request, so a late reply cannot answer the next one |
+
+`Device.open(port, reopen_wait=0)` is for a caller that reconnects by itself (the GUI): a lost
+port then raises at once, so no request blocks for the reopen wait. The CLI keeps 6 s.
+`screenshot(cancel=f)` stops when `f()` is true. Library version 0.2.0 adds these.
 | `cli.py` | the `openscope` command |
 
 ## Tests (no hardware)

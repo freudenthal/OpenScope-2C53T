@@ -100,6 +100,20 @@ class TestDecoder(unittest.TestCase):
         self.assertEqual(d.feed(bytes([0xAA, 0x83, 0xFF, 0xFF]) + proto.encode(0x81)),
                          [proto.Frame(0x81, b"")])
 
+    def test_text_keeps_only_the_last_4096_bytes(self):
+        # stage-180 (H-5): nothing takes the text on a long poll loop
+        d = proto.Decoder()
+        for i in range(100):
+            d.feed(b"%04d" % i * 25 + proto.encode(0x81))     # 100 B of text, then a frame
+        self.assertEqual(len(d.text), proto.Decoder.TEXT_CAP)
+        self.assertTrue(d.take_text().endswith(b"0099" * 25), "the newest text must stay")
+        d.feed(b"x" * 10000)                                    # one big chunk with no frame
+        self.assertEqual(bytes(d.text), b"x" * proto.Decoder.TEXT_CAP)
+        d = proto.Decoder()
+        d.feed(b"y" * 5000 + bytes([0xAA, 0x81]))               # text, then a header still arriving
+        self.assertEqual(len(d.text), proto.Decoder.TEXT_CAP)
+        self.assertEqual(d.feed(proto.encode(0x81)[2:]), [proto.Frame(0x81, b"")])
+
 
 class TestStatus(unittest.TestCase):
     def test_parse(self):

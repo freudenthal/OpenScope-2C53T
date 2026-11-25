@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -136,6 +137,10 @@ class FakeLink:
 
     def drain(self, quiet=0.15, max_wait=1.5):
         return self.read(1 << 20)
+
+    def discard_input(self):
+        self._pump()                    # what the device sent so far is in the OS buffer
+        self.rx.clear()
 
     def reopen(self):
         self.reopens += 1
@@ -598,6 +603,111 @@ class TestRound6(unittest.TestCase):
         with self.assertRaises(DeviceError) as cm:
             dev.shell("version")
         self.assertNotIsInstance(cm.exception, Nak)
+
+
+class TestStage180(unittest.TestCase):
+    """Late replies, set timeouts and screenshot cancel (review H-3, H-4)."""
+
+    def test_late_ack_after_the_resync_window_does_not_answer_the_next_request(self):
+        dev = device()
+        dev.ping()
+        dev.link.L.shim_set_inject_ok(0)            # the next press is refused (NOT_READY)
+        # A set ACK that came after its request timed out and after _resync():
+        # it sits in the OS buffer when the next request is written.
+        dev.link.rx += proto.encode(proto.RSP_ACK, b"")
+        with self.assertRaises(Nak) as cm:
+            dev.press("OK")                         # without the discard: "success" from the stale ACK
+        self.assertEqual(proto.ERRORS[cm.exception.code], "NOT_READY")
+
+    def test_half_frame_left_in_the_decoder_is_dropped_before_a_request(self):
+        dev = device()
+        # a stale header that claims 1000 B: kept, it would swallow the next reply
+        dev.decoder.feed(bytes([proto.SYNC, proto.RSP_WAVEFORM_FRAME, 0x03, 0xE8]))
+        dev.press("OK")                             # without the decoder reset: Timeout
+        self.assertEqual(dev.link.L.shim_presses(), 1)
+
+    def test_discard_failure_is_a_write_failure_and_is_resent(self):
+        dev = device()
+        calls = {"n": 0}
+
+        def discard():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(22, "The device does not recognize the command")
+            dev.link.rx.clear()
+        dev.link.discard_input = discard
+        self.assertEqual(dev.ping(), "OpenScope 2C53T shim")
+        self.assertEqual(dev.link.reopens, 1)
+
+    def test_scope_sets_use_the_set_timeout(self):
+        dev = ctl_device()
+        seen = []
+        real = dev._request_frames
+
+        def spy(cmd, payload, expect, count):
+            seen.append((cmd, dev.timeout))
+            return real(cmd, payload, expect, count)
+        dev._request_frames = spy
+        dev.set_timebase(0x10)
+        dev.set_vdiv(1, 7)
+        dev.set_trigger("auto")
+        dev.run_stop(True)
+        dev.ping()
+        self.assertEqual([t for _, t in seen[:4]], [Device.SET_TIMEOUT_S] * 4)
+        self.assertEqual(seen[4][1], 0.3, "the set timeout leaked into the next request")
+
+    def test_screenshot_cancel_stops_in_under_half_a_second(self):
+        from openscope.device import Cancelled
+        dev = device()
+        t0 = time.monotonic()
+        stop_at = t0 + 0.2
+        with mock.patch.object(FakeLink, "_shell_reply", staticmethod(lambda line: b"")):
+            with self.assertRaises(Cancelled):
+                dev.screenshot(attempts=3, timeout=20.0, header_timeout=20.0,
+                               cancel=lambda: time.monotonic() > stop_at)
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_screenshot_with_no_header_gives_up_after_header_timeout(self):
+        dev = device()
+        t0 = time.monotonic()
+        with mock.patch.object(FakeLink, "_shell_reply", staticmethod(lambda line: b"")):
+            with self.assertRaises(DeviceError) as cm:
+                dev.screenshot(attempts=2, timeout=20.0, header_timeout=0.1)
+        self.assertIn("no SCREENBIN header", str(cm.exception))
+        self.assertLess(time.monotonic() - t0, 3.0)
+
+    def test_non_ascii_shell_line_is_refused_before_anything_is_sent(self):
+        dev = device()
+        with self.assertRaises(ValueError):
+            dev.shell("\u00e4")
+        self.assertEqual(bytes(dev.link.shell_seen), b"")
+
+    def test_reopen_wait_zero_loss_reaches_the_caller_at_once(self):
+        from openscope.link import NoDevice, SerialLink
+        dev = device()
+        dev._check_version()
+        real = SerialLink(reopen_wait=0)
+        dev.link.reopen = real.reopen                 # the real loop, with reopen_wait=0
+        dev.link.fail_next_read_after_write = True
+        t0 = time.monotonic()
+        with self.assertRaises(NoDevice) as cm:
+            dev.ping()
+        self.assertEqual(str(cm.exception), "port lost")
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_device_open_passes_reopen_wait(self):
+        from openscope import device as devmod
+        made = {}
+
+        def factory(port=None, **kw):
+            made.update(kw)
+            made["link"] = FakeLink()
+            return made["link"]
+        with mock.patch.object(devmod, "SerialLink", factory):
+            Device.open(reopen_wait=0)
+            self.assertEqual(made["reopen_wait"], 0)
+            Device.open()
+            self.assertEqual(made["reopen_wait"], 6.0, "the CLI default must stay 6 s")
 
 
 def _dumpbin(data, hdr_crc, trailer_crc):

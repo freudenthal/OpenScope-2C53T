@@ -31,6 +31,10 @@ class Timeout(DeviceError):
     pass
 
 
+class Cancelled(DeviceError):
+    """The caller's cancel() said stop (e.g. the GUI closes during a screenshot)."""
+
+
 class _WriteFailed(DeviceError):
     """The request never left the host: re-sending it cannot act twice.
     A DeviceError, so a second one (after the reopen) reaches every caller
@@ -84,8 +88,12 @@ class Device:
 
     # ── lifecycle ─────────────────────────────────────────────────
     @classmethod
-    def open(cls, port: Optional[str] = None, check_version: bool = True, **kw) -> "Device":
-        link = SerialLink(port)
+    def open(cls, port: Optional[str] = None, check_version: bool = True,
+             reopen_wait: float = 6.0, **kw) -> "Device":
+        """reopen_wait: how long a request waits for a lost port to come back
+        (6 s for the CLI and scripts). 0 = do not wait: a lost port raises
+        NoDevice("port lost") at once (the GUI reconnects by itself)."""
+        link = SerialLink(port, reopen_wait=reopen_wait)
         link.open()
         dev = cls(link, **kw)
         dev._settle()
@@ -226,9 +234,18 @@ class Device:
         # in one USB read): every one is kept, none dropped after the first.
         wanted = set(expect)
         got: List[proto.Frame] = []
+        # A reply that came after its request gave up (e.g. a set ACK after
+        # the firmware's 1 s pause wait) must not answer this request: drop
+        # what the OS holds and any half frame before the write. A reply still
+        # on the wire is not covered (no sequence byte in the framing, G-80).
+        try:
+            self.link.discard_input()
+        except OSError as e:
+            raise _WriteFailed() from e     # nothing was sent: safe to re-send
+        self.decoder = proto.Decoder()
         self._write(proto.encode(cmd, payload))
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
             chunk = self.link.read()
             if not chunk:
                 continue
@@ -288,27 +305,35 @@ class Device:
     # SET_MODE waits on the device for each injected MENU press to land
     # (up to 0.8 s each, at most 5): allow for it.
     MODE_TIMEOUT_S = 5.0
+    # The scope sets wait on the device for the acquisition pause (up to 1 s,
+    # G-300) before they answer; 1.5 s let a late ACK answer the next request.
+    # ASSUMPTION (stage-180): 3 s covers the pause wait and the transfer.
+    SET_TIMEOUT_S = 3.0
 
-    def set_mode(self, mode) -> None:
-        payload = proto.payload_set_mode(mode)
-        old, self.timeout = self.timeout, max(self.timeout, self.MODE_TIMEOUT_S)
+    def _request_slow(self, cmd: int, payload: bytes, timeout: float) -> proto.Frame:
+        old, self.timeout = self.timeout, max(self.timeout, timeout)
         try:
-            self.request(proto.CMD_SET_MODE, payload)
+            return self.request(cmd, payload)
         finally:
             self.timeout = old
 
+    def set_mode(self, mode) -> None:
+        self._request_slow(proto.CMD_SET_MODE, proto.payload_set_mode(mode), self.MODE_TIMEOUT_S)
+
     def set_timebase(self, code: int) -> None:
         """reg 0x01 code 0x00..0x14; ACK means the FPGA runs at it."""
-        self.request(proto.CMD_SET_TIMEBASE, proto.payload_set_timebase(code))
+        self._request_slow(proto.CMD_SET_TIMEBASE, proto.payload_set_timebase(code), self.SET_TIMEOUT_S)
 
     def set_vdiv(self, channel: int, range_idx: int) -> None:
-        self.request(proto.CMD_SET_VDIV, proto.payload_set_vdiv(channel, range_idx))
+        self._request_slow(proto.CMD_SET_VDIV, proto.payload_set_vdiv(channel, range_idx),
+                           self.SET_TIMEOUT_S)
 
     def set_trigger(self, mode, edge="rising", source="CH1", level: int = 0) -> None:
-        self.request(proto.CMD_SET_TRIGGER, proto.payload_set_trigger(mode, edge, source, level))
+        self._request_slow(proto.CMD_SET_TRIGGER, proto.payload_set_trigger(mode, edge, source, level),
+                           self.SET_TIMEOUT_S)
 
     def run_stop(self, running: bool) -> None:
-        self.request(proto.CMD_RUN_STOP, proto.payload_run_stop(running))
+        self._request_slow(proto.CMD_RUN_STOP, proto.payload_run_stop(running), self.SET_TIMEOUT_S)
 
     # ── device description (stage-086) ────────────────────────────
     def description(self, refresh: bool = False) -> proto.Description:
@@ -327,7 +352,7 @@ class Device:
         """x1 or x10, the same field the unit's probe menu writes."""
         payload = proto.payload_set_probe(channel, factor)
         self._description = None    # its probe section is now stale
-        self.request(proto.CMD_SET_PROBE, payload)
+        self._request_slow(proto.CMD_SET_PROBE, payload, self.SET_TIMEOUT_S)
 
     # ── ASCII shell (same port; §3.2 keeps it alive next to the protocol) ──
     def shell(self, line: str, timeout: float = 3.0) -> str:
@@ -339,6 +364,8 @@ class Device:
         e.g. `fwswap b` drops the port by design and must not run twice."""
         if "\n" in line or "\r" in line:
             raise ValueError("one command per call")
+        if not line.isascii():
+            raise ValueError("shell lines are ASCII only")
         self._ensure_verified()
         try:
             return self._shell_once(line, timeout)
@@ -374,12 +401,14 @@ class Device:
             text = text[:text.rfind(">")].rstrip("\r\n ")
         return text
 
-    def _with_reopen(self, fn):
+    def _with_reopen(self, fn, cancel=None):
         """For screenshot() only: `screen dumpbin` is read-only, so it may be
         re-run after a replug."""
         try:
             return fn()
         except (OSError, _WriteFailed) as e:
+            if cancel is not None and cancel():
+                raise Cancelled("screenshot cancelled") from None
             self._reopen()
             try:
                 return fn()
@@ -388,9 +417,9 @@ class Device:
 
     def _read_until_prompt(self, timeout: float) -> bytes:
         buf = bytearray()
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         quiet_since = None
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             chunk = self.link.read()
             if chunk:
                 buf += chunk
@@ -398,23 +427,29 @@ class Device:
                 continue
             if buf.endswith(PROMPT):
                 if quiet_since is None:
-                    quiet_since = time.time()
-                elif time.time() - quiet_since > 0.1:
+                    quiet_since = time.monotonic()
+                elif time.monotonic() - quiet_since > 0.1:
                     return bytes(buf[:-len(PROMPT)])
         raise Timeout(f"shell: no prompt within {timeout:.1f} s (got {bytes(buf[-60:])!r})")
 
     def screenshot(self, region: Optional[Tuple[int, int, int, int]] = None,
-                   attempts: int = 3, timeout: float = 20.0) -> Screen:
+                   attempts: int = 3, timeout: float = 20.0, header_timeout: float = 2.0,
+                   cancel: Optional[Callable[[], bool]] = None) -> Screen:
         """The device's own framebuffer via `screen dumpbin`, CRC-checked.
 
         The dump is raw bytes (it can contain 0xAA), so it is read directly,
         never through the frame decoder. A live trace can change the screen
         during the dump and fail the device's CRC: retried `attempts` times.
+        An attempt with no SCREENBIN header within `header_timeout` s fails
+        at once (not after `timeout`). `cancel()` is checked between attempts
+        and in each wait loop; True raises Cancelled.
         """
         self._ensure_verified()     # same rule as every other request
-        return self._with_reopen(lambda: self._screenshot_once(region, attempts, timeout))
+        return self._with_reopen(
+            lambda: self._screenshot_once(region, attempts, timeout, header_timeout, cancel), cancel)
 
-    def _screenshot_once(self, region, attempts: int, timeout: float) -> Screen:
+    def _screenshot_once(self, region, attempts: int, timeout: float, header_timeout: float = 2.0,
+                         cancel: Optional[Callable[[], bool]] = None) -> Screen:
         """Prefer a frame whose header CRC matches (consistent). On a live
         screen that may never happen: then accept a frame whose TRAILER CRC
         (firmware: CRC of the bytes actually sent) matches — transport intact,
@@ -423,13 +458,20 @@ class Device:
         cmd = "screen dumpbin" + ("" if region is None else " %d %d %d %d" % tuple(region))
         last = ""
         torn_frame = None
+
+        def stop() -> bool:
+            if cancel is not None and cancel():
+                raise Cancelled("screenshot cancelled")
+            return False
+
         for _ in range(attempts):
+            stop()
             self.link.drain(quiet=0.05, max_wait=0.3)
             self._write(cmd.encode() + b"\r")
             buf = bytearray()
-            t0 = time.time()
+            t0 = time.monotonic()
             m = None
-            while time.time() - t0 < timeout and not m:
+            while time.monotonic() - t0 < min(timeout, header_timeout) and not m and not stop():
                 buf += self.link.read()
                 m = SCREEN_HDR.search(buf)
             if not m:
@@ -438,12 +480,12 @@ class Device:
             x, y, w, h, n = (int(m.group(i)) for i in range(1, 6))
             crc_hdr = int(m.group(6), 16)
             rest = bytearray(buf[m.end():])
-            while len(rest) < n and time.time() - t0 < timeout:
+            while len(rest) < n and time.monotonic() - t0 < timeout and not stop():
                 rest += self.link.read(n - len(rest))
             data = bytes(rest[:n])
             tail = bytearray(rest[n:])
             end = SCREEN_END.search(tail)
-            while not end and time.time() - t0 < min(timeout, 3.0):
+            while not end and time.monotonic() - t0 < min(timeout, 3.0) and not stop():
                 tail += self.link.read()
                 end = SCREEN_END.search(tail)
             self._settle()

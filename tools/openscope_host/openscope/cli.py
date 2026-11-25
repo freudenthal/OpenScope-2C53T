@@ -461,6 +461,113 @@ def _backup(a) -> int:
     return EXIT_OK
 
 
+def _manifest(a) -> int:
+    """`openscope manifest IMAGE --target T [--api-level N | --source REPO]`."""
+    from pathlib import Path
+    from . import firmware as fw
+    image = Path(a.image)
+    data = image.read_bytes()
+    m = fw.make_manifest(data, a.target, api_level=a.api_level, version=a.version,
+                         source=a.source, product_commit=a.product_commit, image_name=image.name)
+    refusals = fw.check_image(data, m)
+    for r in refusals:
+        print(f"error: {r}", file=sys.stderr)
+    if refusals:
+        return EXIT_DEVICE_ERROR
+    out = Path(a.out) if a.out else fw.manifest_path_for(image)
+    m.save(out)
+    print(f"manifest  {out}")
+    print(f"image     {image.name}, {m.size} B, SHA-256 {m.sha256}")
+    print(f"build     {m.target} at git {m.git_rev or 'not in the image'}, {m.build_time}, "
+          f"API level {m.api_level}")
+    return EXIT_OK
+
+
+def _load_update_files(a):
+    """(data, manifest or None, image name) from --manifest / --image."""
+    from pathlib import Path
+    from . import firmware as fw
+    if not a.manifest and not a.image:
+        raise ValueError("give --manifest FILE or --image FILE")
+    m = None
+    if a.manifest:
+        m = fw.Manifest.load(a.manifest)
+        image = Path(a.image) if a.image else fw.image_path_for(a.manifest, m)
+    else:
+        image = Path(a.image)
+        side = fw.manifest_path_for(image)
+        if side.is_file():
+            m = fw.Manifest.load(side)
+            print(f"manifest  {side}")
+    return image.read_bytes(), m, image.name
+
+
+def _update_event(e) -> None:
+    if e.kind == "step":
+        print(f"[{e.step}] {e.text}", flush=True)
+    elif e.kind == "info":
+        print(f"          {e.text}", flush=True)
+    elif e.kind == "wait":
+        print(f"\n>>> {e.text}\n", flush=True)
+    elif e.kind == "progress" and e.step == "copy":
+        print(f"          {e.text}", flush=True)
+
+
+def _update(a) -> int:
+    """`openscope update ...` and `openscope update check --manifest FILE`."""
+    from . import firmware as fw, iapdrive, update as up
+    if a.update_cmd == "check":
+        m = fw.Manifest.load(a.check_manifest)
+        dev = Device.open(a.port)
+        try:
+            st = dev.status()
+            ident = _identity_of(dev)
+        finally:
+            dev.close()
+        diffs = fw.check_running(m, st.fw_version, ident)
+        print(f"unit      {st.fw_version}")
+        for line in identity_lines(ident):
+            print(line)
+        print(f"manifest  {m.fw_version} ({m.target}, API level {m.api_level})")
+        for d in diffs:
+            print(f"differs   {d}")
+        print("result    " + ("the unit runs this build" if not diffs else "NOT this build"))
+        return EXIT_OK if not diffs else EXIT_DEVICE_ERROR
+    data, m, name = _load_update_files(a)
+    try:
+        r = up.run_update(data, m, name, port=a.port, drive=a.drive, backup_root=a.backup_root,
+                          allow_unlisted=a.allow_unlisted, no_backup_ack=a.no_backup_ack,
+                          report=_update_event)
+    except up.Refused as e:
+        print(f"refused: {e} (nothing was written to the unit)", file=sys.stderr)
+        if e.log:
+            print(f"log       {e.log}", file=sys.stderr)
+        return EXIT_DEVICE_ERROR
+    except up.UpdateError as e:
+        print(f"error: {e}", file=sys.stderr)
+        if e.log:
+            print(f"log       {e.log}", file=sys.stderr)
+        return EXIT_DEVICE_ERROR
+    except iapdrive.DriveError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return EXIT_DEVICE_ERROR
+    except KeyboardInterrupt:
+        # The copy is one synchronous write: Ctrl-C lands before it or after it.
+        print("stopped by the user (if the copy had started, it finished; run "
+              "`openscope update check` when the port is back)", file=sys.stderr)
+        return EXIT_DEVICE_ERROR
+    for line in r.compare_lines:
+        print(f"          {line}")
+    for p in r.problems:
+        print(f"differs   {p}", file=sys.stderr)
+    print(f"backup    before {r.before_backup or 'none'}, after {r.after_backup}")
+    print(f"log       {r.log}")
+    print(f"time      {r.seconds:.0f} s ({r.seconds - r.user_wait_seconds:.0f} s without user waits)")
+    print("result    " + ("updated and verified" if r.ok
+                          else "the image was copied, but verify found differences"))
+    return EXIT_OK if r.ok else EXIT_DEVICE_ERROR
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="openscope", description="Drive an OpenScope 2C53T over USB.")
     ap.add_argument("--port", help="serial port (default: auto-detect by USB VID:PID)")
@@ -506,6 +613,32 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("dir", metavar="DIR")
     c.add_argument("dir2", metavar="DIR2", nargs="?")
     c.add_argument("--live", action="store_true", help="compare with the unit that is connected")
+    p = sub.add_parser("update", help="install a firmware image through the factory IAP drive "
+                                      "(backup first, then the user enters upgrade mode); "
+                                      "also: update check --manifest FILE")
+    p.add_argument("--manifest", metavar="FILE", help="image manifest (<image>.manifest.json)")
+    p.add_argument("--image", metavar="FILE", help="image file (its manifest is read from "
+                                                   "<image>.manifest.json when it exists)")
+    p.add_argument("--drive", metavar="X:", help="the IAP drive (default: find it)")
+    p.add_argument("--allow-unlisted", action="store_true",
+                   help="accept an image with no manifest (the other checks still apply)")
+    p.add_argument("--backup-root", metavar="DIR",
+                   help="backup root (default: %%LOCALAPPDATA%%\\OpenScope\\backups)")
+    p.add_argument("--no-backup-ack", metavar="TEXT",
+                   help="unit already in upgrade mode with no backup on disk: give the exact text "
+                        "'I HAVE NO BACKUP' to go on")
+    usub = p.add_subparsers(dest="update_cmd")
+    c = usub.add_parser("check", help="compare the running firmware with a manifest")
+    c.add_argument("--manifest", dest="check_manifest", metavar="FILE", required=True)
+    p = sub.add_parser("manifest", help="write <image>.manifest.json for an image")
+    p.add_argument("image", metavar="IMAGE")
+    p.add_argument("--target", required=True, help="make target, e.g. guest-coldtrace")
+    p.add_argument("--api-level", type=int, help="ESP_API_LEVEL of the source (or give --source)")
+    p.add_argument("--source", metavar="REPO", help="product source tree: read ESP_API_LEVEL "
+                                                     "from firmware/src/drivers/esp_comm.h")
+    p.add_argument("--version", help="text for people (default: '<target> <git rev>')")
+    p.add_argument("--product-commit", help="full commit of the source tree")
+    p.add_argument("--out", metavar="FILE", help="manifest path (default: <image>.manifest.json)")
     return ap
 
 
@@ -527,6 +660,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if a.cmd == "backup":               # opens the port itself, and only when it reads the unit
             return _backup(a)
+        if a.cmd == "manifest":             # no port
+            return _manifest(a)
+        if a.cmd == "update":               # opens the port and the drive itself
+            return _update(a)
         dev = Device.open(a.port)           # also checks the protocol major (§3.7)
         return handlers[a.cmd](dev, a)
     except NoDevice as e:                   # none found, busy, or did not come back

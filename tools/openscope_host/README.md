@@ -80,6 +80,55 @@ From Python: `openscope.calbackup` (`open_for_backup`, `make_backup`, `verify_ba
 `compare_cal`; the module text gives the arguments and the results). `Device.flash_dump(addr,
 length)` reads up to 4096 raw bytes of the W25Q. Library version 0.4.0 adds these.
 
+## Update the firmware (`openscope update`)
+The tool installs a guest image through the factory IAP drive (upgrade mode). It makes a
+calibration backup first and does not copy without a verified backup of this unit.
+
+```bash
+python3 -m openscope manifest guest-coldtrace-abc1234.bin --target guest-coldtrace --source <repo>
+python3 -m openscope update --manifest guest-coldtrace-abc1234.bin.manifest.json
+python3 -m openscope update --image guest-coldtrace-abc1234.bin   # reads <image>.manifest.json
+python3 -m openscope update check --manifest FILE                # does the unit run this build?
+```
+
+1. **check**: the image must match its manifest (SHA-256, size, target) and be a guest image:
+   initial SP in SRAM, reset vector in `0x08007000` to the image end, size at most 1,017,856 B
+   (it must end before `0x080FF800`), the text "OpenScope". The stock image is refused. With no
+   manifest the image is refused, unless you give `--allow-unlisted`.
+2. **backup**: the unit must be on USB power (STATUS charging flag, or battery at least 30 %).
+   The tool makes a backup (as `openscope backup`), verifies it, and checks that its unit ID is
+   the unit ID that the firmware reports. The unit must run an image with a unit identity
+   (API level 1 or higher).
+3. **enter upgrade mode** (you): keep USB connected, hold MENU and tap Power, keep MENU held
+   until the upgrade screen shows. If it does not show (an image with no input task), hold MENU,
+   press the pinhole reset and keep MENU held 3–5 s. The tool waits for the `IAP` drive. Press
+   Ctrl-C to stop; up to the copy nothing is written. Do not open the drive in Explorer.
+4. **drive**: exactly one drive with label `IAP`, 2048-byte sectors, about 8 MB and
+   `Ready.TXT`. The stock app's USB Sharing drive (no label, 4096-byte sectors) is refused. If an
+   other removable drive (a USB stick) is connected, the tool stops; remove it or give
+   `--drive X:`. When Windows gives the drive's USB serial, it must be the serial of the backed-up
+   unit.
+5. **copy**: one write of the whole file, then flush and fsync. The factory IAP programs the
+   bytes in the order they arrive, so nothing else writes to the drive. If Windows refuses the
+   write, a removable-storage policy (Microsoft Defender Device Control) can be the cause.
+6. **wait**: the drive must go (the unit restarts) and the port must come back within 60 s. If
+   the drive stays, the copy did not complete: enter upgrade mode again and run the update again.
+7. **verify**: the firmware text, build target, git revision and API level must be the
+   manifest's. A second backup goes into the same unit folder; the cal block (`0x025`–`0x12E`)
+   must be equal to the first backup.
+8. **log**: `update_<date_time>.json` in the backup folder (each step with its time, the
+   manifest, the results).
+
+A unit that is already in upgrade mode and has no port (recovery) also gets the image: the tool
+looks for a verified backup on disk with the drive's USB serial. With no such backup it stops,
+unless you give `--no-backup-ack "I HAVE NO BACKUP"`.
+
+Exit codes: 0 updated and verified; 1 no unit found; 2 refused (nothing written), a failure, or
+verify found differences. From Python: `openscope.update.run_update()`, `openscope.firmware`
+(`Manifest`, `make_manifest`, `check_image`, `check_running`) and `openscope.iapdrive`
+(`find_iap_drive`, `copy_image`). Library version 0.5.0 adds these. The drive search works on
+Windows only.
+
 ## GUI (`openscope-gui`)
 The desktop window moved to its own repository,
 [OpenScope-2C53T-GUI](https://github.com/freudenthal/OpenScope-2C53T-GUI) (package `openscope_gui`).

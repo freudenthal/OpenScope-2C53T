@@ -22,6 +22,7 @@
  */
 
 #include "fpga.h"
+#include "acq_ctrl.h"
 #include "fpga_cal_table.h"
 #include "fpga_meter_plan.h"
 #include "meter_data.h"
@@ -114,6 +115,10 @@ typedef struct {
 static QueueHandle_t meter_rx_queue = NULL;  /* Complete immutable 12-byte data frames */
 
 static TaskHandle_t      acq_task_handle = NULL;
+/* stage-230 (A-3): one owner for the park. Made before the acquisition task
+ * (fpga_init); see fpga_acq_pause() and acq_ctrl.h. */
+static SemaphoreHandle_t acq_park_mutex  = NULL;
+static acq_owner_t       acq_owner;
 static TaskHandle_t      tx_task_handle  = NULL;
 static TaskHandle_t      rx_task_handle  = NULL;
 
@@ -3014,6 +3019,11 @@ static void fpga_meter_adc_sampler_task(void *pv)
 static volatile bool acq_pause_req = false;
 #define ACQ_WAIT_SLICE_MS 20u     /* the capture task's longest sleep between pause checks */
 static volatile bool acq_pause_ack = false;
+/* stage-230: the longest a requester waits for the park mutex and the park
+ * together; and the count of resumes by a task that did not hold the park
+ * (refused: the kernel asserts on such a mutex give). */
+#define ACQ_PAUSE_BUDGET_MS 1000u
+static volatile uint32_t acq_resume_refused = 0;
 
 /* ── Torn-frame fix (audit 2026-08-20, P0.2) ─────────────────────────────
  * ch1_buf/ch2_buf used to be written IN PLACE, byte-by-byte, over the whole
@@ -4333,26 +4343,56 @@ static void fpga_warmtest_acq_task(void *pv)
 bool fpga_acq_pause(void)
 {
     if (acq_task_handle == NULL)
-        return true;
+        return true;                      /* boot, before the task: no park, no mutex */
+    const void *me = xTaskGetCurrentTaskHandle();
+    /* stage-230 (A-3): a pause inside a pause of the same task only counts. */
+    if (acq_owner_nested(&acq_owner, me))
+        return acq_owner_enter_nested(&acq_owner, me);
+    if (acq_park_mutex == NULL)
+        return false;                     /* no mutex (heap): refuse, as a timeout */
+    /* One budget for the mutex and the park. The key task waits here and must
+     * check in with the health monitor within HEALTH_DEADLINE_MS (2 s); before
+     * stage-230 the park alone could take the same 1 s. */
+    const TickType_t t0 = xTaskGetTickCount();
+    const TickType_t budget = pdMS_TO_TICKS(ACQ_PAUSE_BUDGET_MS);
+    if (xSemaphoreTake(acq_park_mutex, budget) != pdTRUE)
+        return false;                     /* the other requester holds the park */
     acq_pause_req = true;
     acq_pause_ack = false;      /* demand a FRESH ack from the park point */
-    /* Worst-case ack latency = one full loop pass. Warm-handoff task: the
-     * trigger-mode edge wait (≤FPGA_NORMAL_TRIG_WAIT_MS) + two 1026-byte
-     * reads + 10 ms. Queue task: one acquisition (≤ a few ms) or the 100 ms
-     * bounded queue wait. 1 s is comfortable margin for both. */
-    for (int i = 0; i < 100; i++) {
-        if (acq_pause_ack)
-            return true;
+    /* Worst-case ack latency = one loop pass. Warm-handoff task: since P-3
+     * (cf9fec7f) its fill wait sleeps in ACQ_WAIT_SLICE_MS slices and goes to
+     * the park point on a request, so a pass is two 1026-byte reads and one
+     * slice. Queue task: one acquisition or the 100 ms bounded queue wait. */
+    while ((TickType_t)(xTaskGetTickCount() - t0) < budget && !acq_pause_ack)
         vTaskDelay(pdMS_TO_TICKS(10));
+    if (acq_pause_ack) {                  /* tested again after the last delay */
+        acq_owner_took(&acq_owner, me);
+        return true;
     }
     acq_pause_req = false;      /* don't leave a half-armed request behind */
+    xSemaphoreGive(acq_park_mutex);
     return false;
 }
 
 void fpga_acq_resume(void)
 {
-    acq_pause_req = false;
+    if (acq_task_handle == NULL || acq_park_mutex == NULL)
+        return;
+    switch (acq_owner_release(&acq_owner, xTaskGetCurrentTaskHandle())) {
+    case ACQ_RELEASE_GIVE:                /* last level: end the park */
+        acq_pause_req = false;
+        xSemaphoreGive(acq_park_mutex);
+        break;
+    case ACQ_RELEASE_KEEP:                /* a nested level ended */
+        break;
+    case ACQ_RELEASE_REFUSE:              /* not the holder: change nothing */
+    default:
+        acq_resume_refused++;
+        break;
+    }
 }
+
+uint32_t fpga_acq_resume_refused_get(void) { return acq_resume_refused; }
 
 /* ═══════════════════════════════════════════════════════════════════
  * SPI3 FPGA config handshake (shared by fpga_init and `fpga reinit`)
@@ -6340,6 +6380,8 @@ QueueHandle_t fpga_create_tasks(void)
     usart_tx_queue = xQueueCreate(10, sizeof(uint32_t));
     spi3_acq_queue = xQueueCreate(15, sizeof(uint8_t));
     meter_rx_queue = xQueueCreate(8, sizeof(fpga_meter_rx_event_t));
+    /* stage-230: the park mutex exists before any task can ask for a park. */
+    acq_park_mutex = xSemaphoreCreateMutex();
 
     /* P0.2 frame staging (see fpga_acq_frames_commit). Heap, not BSS — the
      * boot-stack headroom over BSS is ~2 KB (flash_fs.c has the same note).

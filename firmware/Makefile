@@ -591,7 +591,7 @@ $(BUILD_DIR)/test_esp_comm: tests/test_esp_comm.c src/drivers/esp_comm.c src/dri
 test-esp-comm: $(BUILD_DIR)/test_esp_comm
 	$<
 
-$(BUILD_DIR)/test_remote_proto: tests/test_remote_proto.c src/drivers/esp_comm.c src/drivers/esp_comm.h | $(BUILD_DIR)
+$(BUILD_DIR)/test_remote_proto: tests/test_remote_proto.c src/drivers/esp_comm.c src/drivers/esp_comm.h src/drivers/acq_ctrl.h | $(BUILD_DIR)
 	$(HOST_CC) -std=gnu11 -Wall -Wextra -Werror -Isrc/drivers $< src/drivers/esp_comm.c -o $@
 
 test-remote-proto: $(BUILD_DIR)/test_remote_proto test-esp-comm

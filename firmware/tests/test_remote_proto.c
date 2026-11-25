@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "esp_comm.h"
+#include "acq_ctrl.h"
 
 static int failures = 0, checks = 0;
 #define CHECK(cond, msg) do { checks++; if (!(cond)) { failures++; \
@@ -905,6 +906,262 @@ static void test_host_active_clock(void)
     CHECK(!esp_comm_host_active(20001), "a corrupt frame does not count");
 }
 
+/* ─── stage-230: park owner, scope sets in scope mode, trigger write ─── */
+
+/* A fake unit for the M6 sets: each set answers as usb_debug.c does, through
+ * the same acq_ctrl.h helpers, so the mode gate and the write decision are
+ * the ones that run on the unit. `set_result` forces NOT_READY. */
+static uint8_t fake_mode;                   /* current_mode */
+static esp_ctrl_result_t set_result;
+static int set_calls, hw_writes;
+static uint8_t trig_code_now, trig_src_now;
+static int16_t level_seen;
+static uint8_t args_seen[4];
+
+static uint8_t code_from_level(int16_t level)    /* the fpga.c relation */
+{
+    int c = 128 + (level * 256) / 206;
+    return (uint8_t)(c < 1 ? 1 : (c > 254 ? 254 : c));
+}
+static esp_ctrl_result_t set_mode_fn(uint8_t m)
+{
+    set_calls++; args_seen[0] = m;
+    if (set_result != ESP_CTRL_OK) return set_result;
+    fake_mode = m;
+    return ESP_CTRL_OK;
+}
+static esp_ctrl_result_t set_timebase_fn(uint8_t code)
+{
+    set_calls++; args_seen[0] = code;
+    if (!acq_scope_set_allowed(fake_mode)) return ESP_CTRL_WRONG_MODE;
+    if (set_result != ESP_CTRL_OK) return set_result;
+    hw_writes++;
+    return ESP_CTRL_OK;
+}
+static esp_ctrl_result_t set_vdiv_fn(uint8_t ch, uint8_t r)
+{
+    set_calls++; args_seen[0] = ch; args_seen[1] = r;
+    if (!acq_scope_set_allowed(fake_mode)) return ESP_CTRL_WRONG_MODE;
+    if (set_result != ESP_CTRL_OK) return set_result;
+    hw_writes++;
+    return ESP_CTRL_OK;
+}
+static esp_ctrl_result_t set_trigger_fn(uint8_t mode, uint8_t edge, uint8_t src, int16_t level)
+{
+    set_calls++; args_seen[0] = mode; args_seen[1] = edge; args_seen[2] = src; level_seen = level;
+    if (!acq_scope_set_allowed(fake_mode)) return ESP_CTRL_WRONG_MODE;
+    if (acq_trigger_needs_write(trig_code_now, trig_src_now, code_from_level(level), src)) {
+        if (set_result != ESP_CTRL_OK) return set_result;
+        hw_writes++;
+        trig_code_now = code_from_level(level);
+        trig_src_now = src;
+    }
+    return ESP_CTRL_OK;
+}
+static esp_ctrl_result_t run_stop_fn(bool running)
+{
+    set_calls++; args_seen[0] = running ? 1 : 0;
+    return set_result;
+}
+static const esp_control_ops_t set_ops = {
+    .get_state = ctl_get_state,
+    .set_mode = set_mode_fn,
+    .set_timebase = set_timebase_fn,
+    .set_vdiv = set_vdiv_fn,
+    .set_trigger = set_trigger_fn,
+    .run_stop = run_stop_fn,
+};
+
+static void sets_reset(void)
+{
+    reset();
+    esp_comm_set_control_provider(&set_ops);
+    fake_mode = 0; set_result = ESP_CTRL_OK; set_calls = 0; hw_writes = 0;
+    trig_code_now = 128; trig_src_now = 0; level_seen = 0;
+    memset(args_seen, 0, sizeof(args_seen));
+}
+
+/* reply = ACK, or NAK with this error */
+static bool nak_is(int rsp, const uint8_t *pl, uint8_t err) { return rsp == ESP_RSP_NAK && pl[0] == err; }
+
+static void test_acq_owner_two_requesters(void)
+{
+    acq_owner_t o = { 0 };
+    int a = 0, b = 0;                       /* two task handles */
+    CHECK(!acq_owner_nested(&o, &a) && !acq_owner_nested(&o, &b), "no holder: nobody nested");
+    CHECK(acq_owner_release(&o, &a) == ACQ_RELEASE_REFUSE, "resume with no park: refused");
+    acq_owner_took(&o, &a);
+    CHECK(acq_owner_nested(&o, &a), "A holds");
+    CHECK(!acq_owner_nested(&o, &b), "B is not nested in A's park (it must wait for the mutex)");
+    CHECK(!acq_owner_enter_nested(&o, &b) && o.depth == 1, "B cannot count itself into A's park");
+    CHECK(acq_owner_release(&o, &b) == ACQ_RELEASE_REFUSE, "B's resume does not end A's park");
+    CHECK(o.holder == &a && o.depth == 1, "A's park unchanged after B's resume");
+    CHECK(acq_owner_release(&o, NULL) == ACQ_RELEASE_REFUSE, "NULL is never a holder");
+    /* A nested pause in A (a shell command that pauses inside a parked command) */
+    CHECK(acq_owner_enter_nested(&o, &a) && o.depth == 2, "A nested: depth 2");
+    CHECK(acq_owner_release(&o, &a) == ACQ_RELEASE_KEEP, "inner resume keeps the park");
+    CHECK(acq_owner_nested(&o, &a), "A still holds after the inner resume");
+    CHECK(acq_owner_release(&o, &a) == ACQ_RELEASE_GIVE, "outer resume gives the mutex");
+    CHECK(o.holder == NULL && o.depth == 0, "no holder after the last resume");
+    CHECK(acq_owner_release(&o, &a) == ACQ_RELEASE_REFUSE, "a second resume is refused");
+    /* interleaved: A, then B (after A gave the mutex), A's late resume */
+    acq_owner_took(&o, &a);
+    CHECK(acq_owner_release(&o, &a) == ACQ_RELEASE_GIVE, "A gives");
+    acq_owner_took(&o, &b);
+    CHECK(acq_owner_release(&o, &a) == ACQ_RELEASE_REFUSE, "A's late resume does not end B's park");
+    CHECK(acq_owner_nested(&o, &b) && o.depth == 1, "B keeps its park");
+    CHECK(acq_owner_release(&o, &b) == ACQ_RELEASE_GIVE, "B gives");
+    /* the count does not wrap */
+    acq_owner_took(&o, &a);
+    o.depth = UINT8_MAX;
+    CHECK(!acq_owner_enter_nested(&o, &a) && o.depth == UINT8_MAX, "full count: refused, no wrap");
+}
+
+static void test_acq_mode_gate_and_write_decision(void)
+{
+    CHECK(acq_scope_set_allowed(0), "scope mode: scope sets allowed");
+    for (uint8_t m = 1; m < 8; m++)
+        CHECK(!acq_scope_set_allowed(m), "meter, siggen, settings, other: refused");
+    CHECK(!acq_trigger_needs_write(150, 0, 150, 0), "same code and source: no write");
+    CHECK(acq_trigger_needs_write(150, 0, 151, 0), "code change: write");
+    CHECK(acq_trigger_needs_write(150, 0, 150, 1), "source change: write");
+    CHECK(acq_trigger_needs_write(150, 1, 150, 0), "source back to CH1: write");
+}
+
+static void test_sets_length_and_args(void)
+{
+    uint8_t pl[16]; uint16_t n = 0;
+    static const uint8_t z[6] = { 0 };
+    static const struct { uint8_t cmd; uint16_t len; } lens[] = {
+        { ESP_CMD_SET_MODE, 1 }, { ESP_CMD_SET_TIMEBASE, 1 }, { ESP_CMD_SET_VDIV, 2 },
+        { ESP_CMD_SET_TRIGGER, 5 }, { ESP_CMD_RUN_STOP, 1 },
+    };
+    sets_reset();
+    for (unsigned i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+        CHECK(nak_is(request(lens[i].cmd, z, (uint16_t)(lens[i].len - 1), pl, &n), pl, ESP_ERR_BAD_LENGTH),
+              "short payload: BAD_LENGTH");
+        CHECK(nak_is(request(lens[i].cmd, z, (uint16_t)(lens[i].len + 1), pl, &n), pl, ESP_ERR_BAD_LENGTH),
+              "long payload: BAD_LENGTH");
+    }
+    {   uint8_t m = 4;  CHECK(nak_is(request(ESP_CMD_SET_MODE, &m, 1, pl, &n), pl, ESP_ERR_BAD_ARG), "mode 4: BAD_ARG"); }
+    {   uint8_t c = ESP_TIMEBASE_CODES;
+        CHECK(nak_is(request(ESP_CMD_SET_TIMEBASE, &c, 1, pl, &n), pl, ESP_ERR_BAD_ARG), "timebase past the table: BAD_ARG"); }
+    {   static const uint8_t bad[][2] = { {0, 0}, {3, 0}, {1, ESP_VDIV_RANGES}, {2, 255} };
+        for (unsigned i = 0; i < 4; i++)
+            CHECK(nak_is(request(ESP_CMD_SET_VDIV, bad[i], 2, pl, &n), pl, ESP_ERR_BAD_ARG), "vdiv channel/range: BAD_ARG"); }
+    {   uint8_t r = 2;  CHECK(nak_is(request(ESP_CMD_RUN_STOP, &r, 1, pl, &n), pl, ESP_ERR_BAD_ARG), "run 2: BAD_ARG"); }
+    {   /* mode, edge, source, level LE */
+        static const uint8_t bad[][5] = {
+            {3, 0, 0, 0, 0}, {0, 2, 0, 0, 0}, {0, 0, 2, 0, 0},
+            {0, 0, 0, 101, 0}, {0, 0, 0, 0x9B, 0xFF},          /* +101, -101 */
+            {0, 0, 0, 0x00, 0x80},                             /* -32768 */
+        };
+        for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+            CHECK(nak_is(request(ESP_CMD_SET_TRIGGER, bad[i], 5, pl, &n), pl, ESP_ERR_BAD_ARG), "trigger field: BAD_ARG"); }
+    CHECK(set_calls == 0, "no refused request reached the provider");
+    {   uint8_t p[5] = {1, 1, 1, 100, 0};
+        CHECK(request(ESP_CMD_SET_TRIGGER, p, 5, pl, &n) == ESP_RSP_ACK && level_seen == 100, "level +100 ACK");
+        p[3] = 0x9C; p[4] = 0xFF;                                /* -100 */
+        CHECK(request(ESP_CMD_SET_TRIGGER, p, 5, pl, &n) == ESP_RSP_ACK && level_seen == -100, "level -100 ACK, sign kept");
+        p[3] = 0xCE;                                             /* -50 */
+        CHECK(request(ESP_CMD_SET_TRIGGER, p, 5, pl, &n) == ESP_RSP_ACK && level_seen == -50, "level -50 reaches the provider");
+        CHECK(args_seen[0] == 1 && args_seen[1] == 1 && args_seen[2] == 1, "mode, edge, source reach the provider"); }
+    {   uint8_t v[2] = {2, 9};
+        CHECK(request(ESP_CMD_SET_VDIV, v, 2, pl, &n) == ESP_RSP_ACK && args_seen[0] == 2 && args_seen[1] == 9, "vdiv CH2 range 9 ACK"); }
+    {   uint8_t c = ESP_TIMEBASE_CODES - 1;
+        CHECK(request(ESP_CMD_SET_TIMEBASE, &c, 1, pl, &n) == ESP_RSP_ACK && args_seen[0] == c, "last timebase code ACK"); }
+}
+
+static void test_sets_reply_mapping(void)
+{
+    uint8_t pl[16]; uint16_t n = 0;
+    uint8_t one = 1, tb = 0x10, v[2] = {1, 5}, tr[5] = {0, 0, 0, 20, 0};
+    sets_reset();
+    set_result = ESP_CTRL_NOT_READY;
+    CHECK(nak_is(request(ESP_CMD_SET_TIMEBASE, &tb, 1, pl, &n), pl, ESP_ERR_NOT_READY), "NOT_READY -> NAK NOT_READY");
+    CHECK(nak_is(request(ESP_CMD_RUN_STOP, &one, 1, pl, &n), pl, ESP_ERR_NOT_READY), "run_stop NOT_READY -> NAK");
+    CHECK(nak_is(request(ESP_CMD_SET_MODE, &one, 1, pl, &n), pl, ESP_ERR_NOT_READY), "set_mode NOT_READY -> NAK");
+    set_result = ESP_CTRL_WRONG_MODE;
+    CHECK(nak_is(request(ESP_CMD_RUN_STOP, &one, 1, pl, &n), pl, ESP_ERR_UNSUPPORTED_IN_MODE),
+          "WRONG_MODE -> NAK 0x0C");
+    set_result = ESP_CTRL_OK;
+    CHECK(request(ESP_CMD_SET_VDIV, v, 2, pl, &n) == ESP_RSP_ACK && n == 0, "OK -> ACK, no payload");
+    CHECK(request(ESP_CMD_SET_TRIGGER, tr, 5, pl, &n) == ESP_RSP_ACK, "trigger OK -> ACK");
+    esp_comm_set_control_provider(0);
+    CHECK(nak_is(request(ESP_CMD_SET_TIMEBASE, &tb, 1, pl, &n), pl, ESP_ERR_UNSUPPORTED), "no provider: UNSUPPORTED");
+}
+
+static void test_scope_sets_need_scope_mode(void)
+{
+    uint8_t pl[16]; uint16_t n = 0;
+    uint8_t meter = 1, scope = 0, tb = 0x14, v[2] = {1, 7}, tr[5] = {0, 0, 0, 30, 0}, run = 1;
+    sets_reset();
+    CHECK(request(ESP_CMD_SET_MODE, &meter, 1, pl, &n) == ESP_RSP_ACK && fake_mode == 1, "to meter mode");
+    CHECK(nak_is(request(ESP_CMD_SET_TIMEBASE, &tb, 1, pl, &n), pl, ESP_ERR_UNSUPPORTED_IN_MODE), "meter: SET_TIMEBASE NAK 0x0C");
+    CHECK(nak_is(request(ESP_CMD_SET_VDIV, v, 2, pl, &n), pl, ESP_ERR_UNSUPPORTED_IN_MODE), "meter: SET_VDIV NAK 0x0C");
+    CHECK(nak_is(request(ESP_CMD_SET_TRIGGER, tr, 5, pl, &n), pl, ESP_ERR_UNSUPPORTED_IN_MODE), "meter: SET_TRIGGER NAK 0x0C");
+    CHECK(hw_writes == 0 && trig_code_now == 128, "meter: no relay or register write");
+    CHECK(request(ESP_CMD_RUN_STOP, &run, 1, pl, &n) == ESP_RSP_ACK, "meter: RUN_STOP stays open");
+    for (uint8_t m = 2; m <= 3; m++) {
+        fake_mode = m;
+        CHECK(nak_is(request(ESP_CMD_SET_VDIV, v, 2, pl, &n), pl, ESP_ERR_UNSUPPORTED_IN_MODE), "siggen/settings: SET_VDIV NAK 0x0C");
+    }
+    CHECK(request(ESP_CMD_SET_MODE, &scope, 1, pl, &n) == ESP_RSP_ACK, "back to scope mode");
+    CHECK(request(ESP_CMD_SET_VDIV, v, 2, pl, &n) == ESP_RSP_ACK && hw_writes == 1, "scope: SET_VDIV writes");
+}
+
+static void test_trigger_mode_change_does_not_write(void)
+{
+    uint8_t pl[16]; uint16_t n = 0;
+    uint8_t tr[5] = {0, 0, 0, 0, 0};       /* level 0 = code 128 = in force */
+    sets_reset();
+    CHECK(request(ESP_CMD_SET_TRIGGER, tr, 5, pl, &n) == ESP_RSP_ACK && hw_writes == 0, "same code: ACK, no write");
+    tr[0] = 1; tr[1] = 1;                  /* NORMAL, falling */
+    CHECK(request(ESP_CMD_SET_TRIGGER, tr, 5, pl, &n) == ESP_RSP_ACK && hw_writes == 0, "mode/edge only: no write");
+    set_result = ESP_CTRL_NOT_READY;       /* a park would fail now ... */
+    tr[0] = 2;
+    CHECK(request(ESP_CMD_SET_TRIGGER, tr, 5, pl, &n) == ESP_RSP_ACK, "... but no park is needed: ACK");
+    tr[3] = 10;                            /* new code: needs the park */
+    CHECK(nak_is(request(ESP_CMD_SET_TRIGGER, tr, 5, pl, &n), pl, ESP_ERR_NOT_READY), "new code, park fails: NAK NOT_READY");
+    CHECK(trig_code_now == 128, "nothing written");
+    set_result = ESP_CTRL_OK;
+    CHECK(request(ESP_CMD_SET_TRIGGER, tr, 5, pl, &n) == ESP_RSP_ACK && hw_writes == 1 &&
+          trig_code_now == code_from_level(10), "new code: one write");
+    tr[2] = 1;                             /* CH2, same level */
+    CHECK(request(ESP_CMD_SET_TRIGGER, tr, 5, pl, &n) == ESP_RSP_ACK && hw_writes == 2 && trig_src_now == 1,
+          "source change: write");
+}
+
+static void test_scope_state_full_layout(void)
+{
+    uint8_t pl[64]; uint16_t n = 0; uint8_t junk = 0;
+    reset();
+    esp_comm_set_control_provider(&ctl_ops);
+    fake_state.mode = 0; fake_state.running = true;
+    fake_state.timebase_idx = 0x12; fake_state.timebase_code = 0x10; fake_state.timebase_tier = ESP_TIER_MEASURED;
+    fake_state.sample_rate_hz = 12490;
+    fake_state.trig_mode = 1; fake_state.trig_edge = 1; fake_state.trig_source = 1;
+    fake_state.trig_level = -37; fake_state.trig_code = 82; fake_state.counts_per_div = 32;
+    fake_state.ch[0].enabled = true; fake_state.ch[0].vdiv_idx = 6;
+    fake_state.ch[0].vdiv_tier = ESP_TIER_MEASURED; fake_state.ch[0].uv_per_div = 0x01020304;
+    fake_state.ch[1].enabled = false; fake_state.ch[1].vdiv_idx = 2;
+    fake_state.ch[1].vdiv_tier = ESP_TIER_NONE; fake_state.ch[1].uv_per_div = 999;
+    fake_state.ch[0].probe = 10; fake_state.ch[1].probe = 1;
+    CHECK(request(ESP_CMD_GET_SCOPE_STATE, 0, 0, pl, &n) == ESP_RSP_SCOPE_STATE && n == 38, "SCOPE_STATE 38 B");
+    CHECK(pl[2] == 0 && pl[3] == 1 && pl[4] == 0x12 && pl[5] == 0x10 && pl[6] == ESP_TIER_MEASURED,
+          "mode, running, display timebase, code in force, tier");
+    CHECK(pl[7] == 1 && pl[8] == 1 && pl[9] == 1, "trigger mode, edge, source");
+    CHECK(pl[10] == 0xDB && pl[11] == 0xFF, "level -37 as i16 LE");
+    CHECK(pl[12] == 0xCA && pl[13] == 0x30 && pl[14] == 0 && pl[15] == 0, "rate 12490 LE");
+    CHECK(pl[16] == 82 && pl[17] == 0 && pl[18] == 32 && pl[19] == 0, "trig code, pad, counts/div");
+    CHECK(pl[20] == 1 && pl[21] == 6 && pl[22] == ESP_TIER_MEASURED && pl[23] == 0 &&
+          pl[24] == 4 && pl[25] == 3 && pl[26] == 2 && pl[27] == 1, "CH1 block");
+    CHECK(pl[28] == 0 && pl[29] == 2 && pl[30] == ESP_TIER_NONE &&
+          pl[32] == 0 && pl[33] == 0 && pl[34] == 0 && pl[35] == 0, "CH2 block: disowned gain zeroed");
+    CHECK(pl[36] == 10 && pl[37] == 1, "probe bytes after the channel blocks");
+    CHECK(nak_is(request(ESP_CMD_GET_SCOPE_STATE, &junk, 1, pl, &n), pl, ESP_ERR_BAD_LENGTH), "payload: BAD_LENGTH");
+}
+
 /* ─── stage-155: parser gaps (code-review-2026-11-23 §90) ─── */
 
 static void test_payload_cap_256_accepted_257_refused(void)
@@ -1051,6 +1308,13 @@ int main(void)
     test_set_probe();
     test_scope_state_probe_append();
     test_host_active_clock();
+    test_acq_owner_two_requesters();
+    test_acq_mode_gate_and_write_decision();
+    test_sets_length_and_args();
+    test_sets_reply_mapping();
+    test_scope_sets_need_scope_mode();
+    test_trigger_mode_change_does_not_write();
+    test_scope_state_full_layout();
     test_payload_cap_256_accepted_257_refused();
     test_sync_byte_inside_frame();
     test_two_frames_in_one_chunk();

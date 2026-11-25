@@ -40,6 +40,7 @@ POLICY_SRC = DRIVERS / "usb_link_policy.c"
 POLICY_HDR = DRIVERS / "usb_link_policy.h"
 POLICY_TEST_C = TESTS / "test_usb_link_policy.c"
 ESP_TEST_C = TESTS / "test_esp_comm.c"
+ACQ_HDR = DRIVERS / "acq_ctrl.h"            # stage-230: park owner, mode gate, trigger write
 
 CFLAGS = ["-std=gnu11", "-Wall", "-Wextra", "-O1"]   # no -Werror: a mutant may leave an unused variable
 BASE_CFLAGS = [*CFLAGS, "-Werror"]                    # the unmutated suites build warning-free
@@ -55,6 +56,7 @@ class Mutation:
     old: str
     new: str
     in_header: bool = False     # mutate the suite's header instead of its source
+    in_file: str = ""           # or mutate this extra file of the suite (by name)
 
 
 MUTATIONS: tuple[Mutation, ...] = (
@@ -355,6 +357,100 @@ MUTATIONS: tuple[Mutation, ...] = (
         old="        if (alen && !block_write(a, alen))\n            return;",
         new="        if (alen) (void)block_write(a, alen);",
     ),
+    # ── stage-230: provider WRONG_MODE on the wire, SET argument guards ──
+    Mutation(
+        name="set: WRONG_MODE answered as NOT_READY",
+        old="    case ESP_CTRL_WRONG_MODE: esp_comm_send_nak(ESP_ERR_UNSUPPORTED_IN_MODE); break;\n",
+        new="",
+    ),
+    Mutation(
+        name="SET_TRIGGER: level lower bound unchecked",
+        old="level < -ESP_TRIG_LEVEL_MAX || level > ESP_TRIG_LEVEL_MAX",
+        new="level > ESP_TRIG_LEVEL_MAX",
+    ),
+    Mutation(
+        name="SET_TRIGGER: level read as unsigned",
+        old="static int16_t get_i16(const uint8_t *p) { return (int16_t)(uint16_t)(p[0] | (p[1] << 8)); }",
+        new="static int16_t get_i16(const uint8_t *p) { return (int16_t)(p[0] & 0x7F); }",
+    ),
+    Mutation(
+        name="SET_VDIV: range past the table accepted",
+        old="pkt->payload[1] >= ESP_VDIV_RANGES",
+        new="pkt->payload[1] > ESP_VDIV_RANGES",
+    ),
+    Mutation(
+        name="RUN_STOP: argument 2 accepted",
+        old="    if (pkt->payload[0] > 1) {\n        esp_comm_send_nak(ESP_ERR_BAD_ARG);\n        return;\n    }\n"
+            "    ctrl_reply(control_ops->run_stop",
+        new="    ctrl_reply(control_ops->run_stop",
+    ),
+    # ── stage-230: acq_ctrl.h, the park owner and the scope-set decisions ──
+    Mutation(
+        name="park: another task counts itself into the holder's park",
+        old="return me != NULL && o->depth > 0u && o->holder == me;",
+        new="return me != NULL && o->depth > 0u;",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="park: a resume by a non-holder ends the park",
+        old="if (me == NULL || o->depth == 0u || o->holder != me)",
+        new="if (me == NULL || o->depth == 0u)",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="park: a resume with no park is accepted",
+        old="if (me == NULL || o->depth == 0u || o->holder != me)",
+        new="if (me == NULL || (o->depth != 0u && o->holder != me))",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="park: the inner resume of a nested pause ends the park",
+        old="    if (o->depth > 1u) {",
+        new="    if (0) {",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="park: a nested pause is not counted",
+        old="    o->depth++;\n    return true;",
+        new="    return true;",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="park: the nested count wraps",
+        old="if (!acq_owner_nested(o, me) || o->depth == UINT8_MAX)",
+        new="if (!acq_owner_nested(o, me))",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="park: the last resume keeps the holder",
+        old="    o->depth = 0u;\n    o->holder = NULL;\n    return ACQ_RELEASE_GIVE;",
+        new="    o->depth = 0u;\n    return ACQ_RELEASE_GIVE;",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="U-4: scope sets allowed in every mode",
+        old="    return mode == ACQ_CTRL_SCOPE_MODE;",
+        new="    (void)mode;\n    return true;",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="U-4: scope sets refused in scope mode",
+        old="    return mode == ACQ_CTRL_SCOPE_MODE;",
+        new="    return mode != ACQ_CTRL_SCOPE_MODE && mode < 2u;",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="A-8: every SET_TRIGGER writes (and parks)",
+        old="    return code_new != code_now || src_new != src_now;",
+        new="    (void)code_now; (void)src_now; (void)code_new; (void)src_new;\n    return true;",
+        in_file="acq_ctrl.h",
+    ),
+    Mutation(
+        name="A-8: a source change alone is not written",
+        old="    return code_new != code_now || src_new != src_now;",
+        new="    (void)src_now; (void)src_new;\n    return code_new != code_now;",
+        in_file="acq_ctrl.h",
+    ),
 )
 
 # ── stage-155: usb_link_policy.c, the CDC link decisions usb_debug.c makes ──
@@ -475,16 +571,18 @@ class Suite:
     hdr: Path
     test_c: Path
     defines: tuple[str, ...] = ()
+    extras: tuple[Path, ...] = ()       # headers the test includes besides hdr
 
 
-REMOTE_PROTO = Suite(SRC, HDR, TEST_C)
+REMOTE_PROTO = Suite(SRC, HDR, TEST_C, extras=(ACQ_HDR,))
 LINK_POLICY = Suite(POLICY_SRC, POLICY_HDR, POLICY_TEST_C)
 ESP_COMM = Suite(SRC, HDR, ESP_TEST_C, ("-DESP_COMM_TRANSFER_STUBS=1",))
 
 
 def compile_and_run(suite: Suite, workdir: Path, source_text: str | None = None,
                     header_text: str | None = None,
-                    cflags: list[str] = CFLAGS) -> subprocess.CompletedProcess:
+                    cflags: list[str] = CFLAGS,
+                    extra_texts: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     src = workdir / suite.src.name
     src.write_text(suite.src.read_text(encoding="utf-8") if source_text is None else source_text,
                    encoding="utf-8")
@@ -492,6 +590,10 @@ def compile_and_run(suite: Suite, workdir: Path, source_text: str | None = None,
         suite.hdr.read_text(encoding="utf-8") if header_text is None else header_text,
         encoding="utf-8")
     shutil.copy(suite.test_c, workdir / suite.test_c.name)
+    for extra in suite.extras:
+        text = (extra_texts or {}).get(extra.name)
+        (workdir / extra.name).write_text(
+            extra.read_text(encoding="utf-8") if text is None else text, encoding="utf-8")
     binary = workdir / "t"
     build = subprocess.run(
         ["cc", *cflags, *suite.defines, "-o", str(binary), str(workdir / suite.test_c.name),
@@ -509,7 +611,7 @@ class _SuiteChecks:
     mutations: tuple[Mutation, ...] = ()
 
     def test_source_files_present(self):
-        for path in (self.suite.src, self.suite.hdr, self.suite.test_c):
+        for path in (self.suite.src, self.suite.hdr, self.suite.test_c, *self.suite.extras):
             self.assertTrue(path.is_file(), f"missing {path}")
 
     def test_base_suite_passes(self):
@@ -521,18 +623,25 @@ class _SuiteChecks:
     def run_mutations(self):
         src = self.suite.src.read_text(encoding="utf-8")
         hdr = self.suite.hdr.read_text(encoding="utf-8")
+        extras = {p.name: p.read_text(encoding="utf-8") for p in self.suite.extras}
         for m in self.mutations:
             with self.subTest(mutation=m.name):
-                base = hdr if m.in_header else src
+                if m.in_file:
+                    self.assertIn(m.in_file, extras, f"{m.in_file} is not a file of this suite")
+                    base = extras[m.in_file]
+                else:
+                    base = hdr if m.in_header else src
                 self.assertIn(m.old, base, f"mutation string not found (refactor?): {m.name}")
                 mutated = base.replace(m.old, m.new, 1)
                 self.assertNotEqual(mutated, base, "replacement was a no-op")
+                in_src = not m.in_header and not m.in_file
                 with tempfile.TemporaryDirectory() as tmp:
                     try:
                         proc = compile_and_run(
                             self.suite, Path(tmp),
-                            source_text=None if m.in_header else mutated,
-                            header_text=mutated if m.in_header else None)
+                            source_text=mutated if in_src else None,
+                            header_text=mutated if m.in_header else None,
+                            extra_texts={m.in_file: mutated} if m.in_file else None)
                     except BuildFailed as e:
                         self.fail(f"mutant '{m.name}' did not build, so it proves nothing:\n{e}")
                 self.assertNotEqual(
@@ -547,6 +656,26 @@ class TestRemoteProto(_SuiteChecks, unittest.TestCase):
 
     def test_mutations_are_caught(self):
         self.run_mutations()
+
+    def test_acq_ctrl_has_no_rtos_or_vendor_header(self):
+        # stage-230: the park and scope-set decisions compile on the host as is.
+        text = ACQ_HDR.read_text(encoding="utf-8")
+        for banned in ("FreeRTOS.h", "task.h", "semphr.h", "at32f403a_407.h"):
+            self.assertNotIn(banned, text, f"acq_ctrl.h includes {banned}")
+
+    def test_firmware_calls_every_acq_decision(self):
+        # The decisions tested here are the ones that run on the unit.
+        fpga = (DRIVERS / "fpga.c").read_text(encoding="utf-8")
+        for fn in ("acq_owner_nested", "acq_owner_enter_nested", "acq_owner_took",
+                   "acq_owner_release", "xSemaphoreTake(acq_park_mutex", "xSemaphoreGive(acq_park_mutex"):
+            self.assertIn(fn + ("" if "(" in fn else "("), fpga, f"fpga.c does not call {fn}")
+        usb = (DRIVERS / "usb_debug.c").read_text(encoding="utf-8")
+        for fn in ("acq_scope_set_allowed", "acq_trigger_needs_write"):
+            self.assertIn(fn + "(", usb, f"usb_debug.c does not call {fn}")
+        for setter in ("remote_set_timebase", "remote_set_vdiv", "remote_set_trigger"):
+            body = usb.split(f"static esp_ctrl_result_t {setter}(", 1)[1].split("\n}\n", 1)[0]
+            self.assertIn("remote_scope_set_allowed()", body, f"{setter} has no mode gate")
+            self.assertIn("ESP_CTRL_WRONG_MODE", body, f"{setter} does not return WRONG_MODE")
 
 
 class TestUsbLinkPolicy(_SuiteChecks, unittest.TestCase):

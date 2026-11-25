@@ -22,6 +22,7 @@
 #include "rtt.h"
 #include "continuity_buzzer.h"
 #include "esp_comm.h"
+#include "acq_ctrl.h"
 #include "usb_link_policy.h"
 #include "battery.h"
 #include "button_scan.h"
@@ -1076,6 +1077,8 @@ static void cmd_status(void)
         fpga.acq_hdr_ch1[0], fpga.acq_hdr_ch1[1], fpga.acq_hdr_ch1[2],
         fpga.acq_hdr_ch2[0], fpga.acq_hdr_ch2[1], fpga.acq_hdr_ch2[2]
     );
+    usb_debug_printf("acq park: resumes by a non-holder refused %lu\r\n",
+                     (unsigned long)fpga_acq_resume_refused_get());   /* stage-230 */
     usb_print_last_tx_frame();
     usb_print_recent_tx_frames();
 
@@ -9080,8 +9083,19 @@ static esp_ctrl_result_t remote_set_mode(uint8_t target)
     return ((uint8_t)current_mode == target) ? ESP_CTRL_OK : ESP_CTRL_NOT_READY;
 }
 
+/* stage-230 (U-4): the scope sets act only in scope mode. SET_VDIV moves the
+ * front-end relays that the meter uses too; NAK UNSUPPORTED_IN_MODE, nothing
+ * changed. RUN_STOP and SET_PROBE change state only and stay open. */
+_Static_assert((int)MODE_OSCILLOSCOPE == (int)ACQ_CTRL_SCOPE_MODE, "acq_ctrl.h scope mode");
+static bool remote_scope_set_allowed(void)
+{
+    return acq_scope_set_allowed((uint8_t)current_mode);
+}
+
 static esp_ctrl_result_t remote_set_timebase(uint8_t code)
 {
+    if (!remote_scope_set_allowed())
+        return ESP_CTRL_WRONG_MODE;
     if (!fpga_apply_timebase(code))
         return ESP_CTRL_NOT_READY;                          /* acq task would not park */
     scope_state_get()->timebase_idx = code;
@@ -9091,6 +9105,8 @@ static esp_ctrl_result_t remote_set_timebase(uint8_t code)
 static esp_ctrl_result_t remote_set_vdiv(uint8_t ch, uint8_t range)
 {
     scope_state_t *ss = scope_state_get();
+    if (!remote_scope_set_allowed())
+        return ESP_CTRL_WRONG_MODE;
     if (!fpga_apply_vdiv(ch, range))
         return ESP_CTRL_NOT_READY;
     (ch == 1u ? &ss->ch1 : &ss->ch2)->vdiv_idx = range;
@@ -9102,11 +9118,17 @@ static esp_ctrl_result_t remote_set_vdiv(uint8_t ch, uint8_t range)
  * only and the FPGA always compared CH1); mode/edge are state the acq task
  * and the edge filter read every cycle, set the way `fpga scope trigmode`
  * sets them. The register writes go first: if they fail nothing at all has
- * changed. */
+ * changed. stage-230 (A-8): when the code and the source stay the same (a mode
+ * or edge change, or a level with the same code) there is no write, no park
+ * and no re-prime: the capture in flight stays valid. */
 static esp_ctrl_result_t remote_set_trigger(uint8_t mode, uint8_t edge, uint8_t source, int16_t level)
 {
     scope_state_t *ss = scope_state_get();
-    if (!fpga_apply_trigger(level, source))
+    if (!remote_scope_set_allowed())
+        return ESP_CTRL_WRONG_MODE;
+    if (acq_trigger_needs_write(fpga_acq_trig_code_get(), fpga_acq_trig_src_get(),
+                                fpga_trigger_code_from_level(level), source) &&
+        !fpga_apply_trigger(level, source))
         return ESP_CTRL_NOT_READY;
     ss->trigger.level  = level;
     ss->trigger.edge   = (trigger_edge_t)edge;

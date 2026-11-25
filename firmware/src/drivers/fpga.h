@@ -855,6 +855,11 @@ void fpga_edgecap_15(uint8_t reps);
  */
 bool fpga_acq_pause(void);
 void fpga_acq_resume(void);
+/* stage-230 (G-300, A-3): one owner. The pause takes a mutex and gives up
+ * after 1 s for the mutex and the park together; a pause inside a pause of
+ * the same task only counts; a resume by a task that does not hold the park
+ * does nothing and is counted here (`status`). */
+uint32_t fpga_acq_resume_refused_get(void);
 
 /* RECONFIG_N candidate pin sweep. Pulses each candidate LOW->HIGH, sends
  * CONFIG_ENABLE, and reads the anchored STATUS, looking for any pin that makes

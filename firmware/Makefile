@@ -1075,7 +1075,9 @@ guest-coldtrace-usart: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA
 guest-coldtrace-usart: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace-usart: clean all
 
-guest-coldtrace: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DOPENSCOPE_WATCHDOG=1
+# stage-177 (O-8): -DOPENSCOPE_NO_RTT=1 compiles RTT out (rtt.c stubs). RDP is
+# set on the unit, so RTT can never be read; the image keeps 1,224 B of RAM.
+guest-coldtrace: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DOPENSCOPE_WATCHDOG=1 -DOPENSCOPE_NO_RTT=1
 guest-coldtrace: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace: clean all
 

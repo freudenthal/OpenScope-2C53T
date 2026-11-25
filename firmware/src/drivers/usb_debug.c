@@ -58,7 +58,8 @@
 #include "../ui/scope_record.h"
 #include "../ui/meter_voltage_wave.h"
 
-#include "fpga_cal_table.h"
+/* stage-177: no fpga_cal_table.h here (a second 115,638-byte copy). The
+ * payload and its name come from fpga.c: fpga_h2_table(), fpga_bitstream_name(). */
 #include "fault.h"
 #include "watchdog.h"
 #include "FreeRTOS.h"
@@ -841,10 +842,13 @@ static void cmd_version(void)
         "OpenScope 2C53T\r\n"
         "Build: " __DATE__ " " __TIME__ ", gcc " __VERSION__ "\r\n"
 #ifdef FPGA_ALT_BITSTREAM
-        "FPGA payload: " FPGA_BITSTREAM_NAME " (ALT — not the stock scope design)\r\n"
+        "FPGA payload: %s (ALT — not the stock scope design)\r\n"
 #endif
         "MCU: AT32F403A @ %uMHz\r\n"
         "SRAM: 224KB (EOPB0=0xFE)\r\n",
+#ifdef FPGA_ALT_BITSTREAM
+        fpga_bitstream_name(),   /* stage-177: from fpga.c, no table include here */
+#endif
         system_core_clock / 1000000
     );
 }
@@ -6489,9 +6493,12 @@ static void cmd_spi3_h2txdiag(void)
     resp_start[0] = spi3_raw_xfer(0x3B);
     resp_start[1] = spi3_raw_xfer(0x00);
 
-    /* Stream entire table, sampling at key points */
-    for (uint32_t i = 0; i < FPGA_H2_CAL_TABLE_SIZE; i++) {
-        uint8_t rx = spi3_raw_xfer(fpga_h2_cal_table[i]);
+    /* Stream entire table, sampling at key points. stage-177: the table is
+     * read through fpga.c (one copy in the image). */
+    uint32_t h2_len = 0;
+    const uint8_t *h2 = fpga_h2_table(&h2_len);
+    for (uint32_t i = 0; i < h2_len; i++) {
+        uint8_t rx = spi3_raw_xfer(h2[i]);
 
         if (rx != 0xFF && rx != 0xEE) total_nonff++;
 
@@ -6501,7 +6508,7 @@ static void cmd_spi3_h2txdiag(void)
         if (i >= 160 && i < 164) resp_blk1[i - 160] = rx;
         if (i >= 320 && i < 324) resp_blk2[i - 320] = rx;
         if (i >= 87040 && i < 87044) resp_regB[i - 87040] = rx;
-        if (i >= FPGA_H2_CAL_TABLE_SIZE - 16) resp_last16[i - (FPGA_H2_CAL_TABLE_SIZE - 16)] = rx;
+        if (i >= h2_len - 16) resp_last16[i - (h2_len - 16)] = rx;
     }
 
     /* End opcode */

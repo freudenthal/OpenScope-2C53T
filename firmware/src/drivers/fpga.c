@@ -7035,3 +7035,23 @@ void fpga_send_raw_frame(const uint8_t *frame)
     fpga_record_tx_frame(frame);
     usart2_send_frame(frame);
 }
+
+/* stage-177 (O-6): fpga_cal_table.h defines the payload as a static const
+ * array, so each file that included it got its own 115,638-byte copy in the
+ * image. This file is now the only includer; other files read the payload
+ * through these two functions. The header shape (fs2header.py,
+ * -DFPGA_ALT_BITSTREAM=1) is unchanged. */
+const uint8_t *fpga_h2_table(uint32_t *len)
+{
+    if (len) *len = FPGA_H2_CAL_TABLE_SIZE;
+    return fpga_h2_cal_table;
+}
+
+const char *fpga_bitstream_name(void)
+{
+#ifdef FPGA_BITSTREAM_NAME
+    return FPGA_BITSTREAM_NAME;
+#else
+    return "stock V1.2.0";
+#endif
+}

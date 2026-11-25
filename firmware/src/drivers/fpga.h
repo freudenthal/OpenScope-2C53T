@@ -1206,4 +1206,11 @@ uint8_t fpga_trigger_reconcile_code(void);
 void    fpga_acq_rate_idx_set(uint8_t v);
 uint8_t fpga_acq_rate_idx_get(void);
 
+/* The FPGA configuration payload (one copy in the image, in fpga.c) and its
+ * length in bytes. */
+const uint8_t *fpga_h2_table(uint32_t *len);
+/* The payload label: FPGA_BITSTREAM_NAME of an alternate header
+ * (-DFPGA_ALT_BITSTREAM=1), else "stock V1.2.0". */
+const char    *fpga_bitstream_name(void);
+
 #endif /* FPGA_H */

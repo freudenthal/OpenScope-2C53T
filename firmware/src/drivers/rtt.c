@@ -31,6 +31,36 @@
 
 #include <string.h>
 
+#if defined(OPENSCOPE_NO_RTT) && OPENSCOPE_NO_RTT
+/* stage-177 (O-8): RTT compiled out (guest-coldtrace). RDP is set on the unit,
+ * so a debugger attach stops the CPU and RTT can never be read. These stubs
+ * keep the API: nothing is written, nothing is read, no host is attached. The
+ * callers (usb_send_bytes, the shell loop, main) then use USB CDC only. The
+ * ring buffers and _rtt_cb are not in the image (1,224 B of RAM). */
+void rtt_init(void) { }
+
+size_t rtt_write(const void *data, size_t len)
+{
+    (void)data; (void)len;
+    return 0;
+}
+
+size_t rtt_puts(const char *s)
+{
+    (void)s;
+    return 0;
+}
+
+size_t rtt_read(void *data, size_t len)
+{
+    (void)data; (void)len;
+    return 0;
+}
+
+bool rtt_host_attached(void) { return false; }
+
+#else /* RTT on */
+
 /* Kept modest on purpose: __bss_end already sits ~3.5 KB below _estack on the
  * guest link, and the main stack has to live in that gap. Nothing is lost by
  * being small — when a host is attached, a full buffer makes the writer wait
@@ -220,3 +250,5 @@ size_t rtt_read(void *data, size_t len)
     }
     return n;
 }
+
+#endif /* OPENSCOPE_NO_RTT */

@@ -391,6 +391,76 @@ def _screenshot(dev: Device, a) -> int:
     return EXIT_OK
 
 
+def backup_lines(folder) -> List[str]:
+    """What `openscope backup` prints for the folder it made."""
+    from . import calbackup as cb
+    info = cb.read_info(folder)
+    cal, fw, unit = info["cal"], info["firmware"], info["unit"]
+    page = info["files"][cb.CAL_FILE]
+    status = cal.get("cal_status_crc32")
+    lines = [f"backup    {folder}",
+             f"unit ID   {unit['uid']} on {unit['port']}",
+             f"firmware  git {fw.get('git_rev') or 'not reported'}, binary protocol "
+             f"{'yes' if fw.get('binary_protocol') else 'no (shell only)'}",
+             f"cal page  {page['size']} B, CRC32 {page['crc32']}, two reads equal, "
+             + ("equal to the `cal status` live CRC" if status else "no `cal status` CRC on this image"),
+             f"cal block {cal['block']} CRC32 {cal['block_crc32']}"
+             + ("  WARNING: blank (all 0xFF), this is not a calibration" if cal.get("block_blank") else "")]
+    region = info.get("w25q")
+    if region:
+        w = info["files"][cb.W25Q_FILE]
+        lines.append(f"W25Q      {region['start']} + {w['size']} B, CRC32 {w['crc32']}, each chunk read "
+                     f"two times, {region['seconds']} s, {region['retries']} chunk(s) read again")
+    lines.append("verified  the saved files read back equal to backup.json")
+    return lines
+
+
+def _backup_progress(stage: str, done: int, total: int) -> None:
+    if stage == "w25q" and (done == total or done % (256 * 1024) == 0):
+        print(f"W25Q {done // 1024} of {total // 1024} KiB", file=sys.stderr, flush=True)
+
+
+def _backup(a) -> int:
+    """`backup`, `backup verify DIR`, `backup compare DIR (DIR2 | --live)`.
+    Only reads the unit; verify and compare DIR DIR2 open no port."""
+    from . import calbackup as cb
+    if a.backup_cmd == "verify":
+        r = cb.verify_backup(a.dir)
+        for line in r.notes:
+            print(line)
+        for line in r.problems:
+            print(f"error: {line}", file=sys.stderr)
+        if r.ok:
+            print(f"verified  {a.dir}")
+        return EXIT_OK if r.ok else EXIT_DEVICE_ERROR
+    if a.backup_cmd == "compare":
+        if (a.dir2 is None) != a.live:
+            print("usage: openscope backup compare DIR (DIR2 | --live)", file=sys.stderr)
+            return EXIT_USAGE
+        other, name = a.dir2, a.dir2
+        first = cb.load_page(a.dir)             # a bad DIR fails before a port is opened
+        if a.live:
+            dev = cb.open_for_backup(a.port)
+            try:
+                other, name = cb.read_cal_page(dev), f"the live unit on {dev.link.port}"
+            finally:
+                dev.close()
+        c = cb.compare_cal(first, other)
+        print(f"compare   {a.dir}")
+        print(f"with      {name}")
+        for line in c.lines():
+            print(line)
+        return EXIT_OK if c.ok else EXIT_DEVICE_ERROR
+    dev = cb.open_for_backup(a.port)
+    try:
+        folder = cb.make_backup(dev, root=a.out, w25q=a.w25q, progress=_backup_progress)
+    finally:
+        dev.close()
+    for line in backup_lines(folder):
+        print(line)
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="openscope", description="Drive an OpenScope 2C53T over USB.")
     ap.add_argument("--port", help="serial port (default: auto-detect by USB VID:PID)")
@@ -422,6 +492,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("screenshot", help="save the device screen as PNG")
     p.add_argument("out")
     p.add_argument("--scale", type=int, default=2)
+    p = sub.add_parser("backup", help="save a checked copy of the calibration page (read only); "
+                                      "also: backup verify DIR, backup compare DIR (DIR2 | --live)")
+    p.add_argument("--out", metavar="DIR", help="backup root (default: %%LOCALAPPDATA%%\\OpenScope\\backups); "
+                                                "the backup goes to DIR/<unit ID>/<date_time>/")
+    p.add_argument("--w25q", action="store_true",
+                   help="also save the W25Q regions that OpenScope writes (3 MiB, about 3 minutes)")
+    bsub = p.add_subparsers(dest="backup_cmd")
+    v = bsub.add_parser("verify", help="check the files of a backup folder against its backup.json")
+    v.add_argument("dir", metavar="DIR")
+    c = bsub.add_parser("compare", help="compare the cal block of a backup with a second backup "
+                                        "(folder or .bin file) or with the live unit")
+    c.add_argument("dir", metavar="DIR")
+    c.add_argument("dir2", metavar="DIR2", nargs="?")
+    c.add_argument("--live", action="store_true", help="compare with the unit that is connected")
     return ap
 
 
@@ -441,6 +525,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "describe": _describe}
     dev = None
     try:
+        if a.cmd == "backup":               # opens the port itself, and only when it reads the unit
+            return _backup(a)
         dev = Device.open(a.port)           # also checks the protocol major (§3.7)
         return handlers[a.cmd](dev, a)
     except NoDevice as e:                   # none found, busy, or did not come back

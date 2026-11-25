@@ -16,6 +16,7 @@ python3 -m openscope set timebase 0x10  # also: set vdiv 1 6 | set trigger norma
                                         #       set run | set stop | set mode meter | set probe 1 10
 python3 -m openscope shell usbstat      # run one ASCII debug-shell command
 python3 -m openscope screenshot s.png   # device framebuffer, CRC-checked
+python3 -m openscope backup             # checked copy of the calibration page (read only)
 ```
 
 Exit codes: 0 ok, 1 no device (one-line message, no traceback), 2 device refused or error,
@@ -43,6 +44,41 @@ saying how far to trust them; there is no per-unit calibration and no measured z
 counts give amplitudes (Vpp), not absolute volts. `NO_CAPTURE_DATA` means the scope has no real
 capture — it never sends its demo trace. `scope --frames N` counts only new captures (new
 `frame_id`) and gives up, keeping what it got, when acquisition is stopped or held.
+
+## Calibration backup (`openscope backup`)
+The MCU flash page `0x08006000` (4096 bytes) holds the calibration of the unit. If it is lost,
+it cannot be made again. Make a backup before each firmware update.
+
+```bash
+python3 -m openscope backup                    # cal page -> <root>/<unit ID>/<date_time>/
+python3 -m openscope backup --out D:\scope     # a different root
+python3 -m openscope backup --w25q             # also the W25Q regions OpenScope writes (3 MiB)
+python3 -m openscope backup verify DIR         # the files of DIR against its backup.json
+python3 -m openscope backup compare DIR DIR2   # cal block of two backups (DIR2: folder or .bin)
+python3 -m openscope backup compare DIR --live # cal block of a backup and of the connected unit
+```
+
+* The default root is `%LOCALAPPDATA%\OpenScope\backups` (`~/.local/share/OpenScope/backups`
+  on other systems). The folder name is the 96-bit MCU ID of the unit and the time.
+* `backup` reads the page two times and the two reads must be equal. The CRC32 must be equal to
+  the CRC that `cal status` prints. It writes `cal_0x08006000.bin` and `backup.json` (unit ID,
+  USB serial, port, firmware version, time, size, CRC32 and SHA-256 of each file, CRC32 of the
+  cal block). It never writes on top of a file or a folder that is there.
+* `--w25q` saves `0xD00000`–`0xFFFFFF` as `w25q_0xD00000.bin`. Each 4096-byte chunk is read two
+  times; a chunk with no reply is read again (3 times at most). If the port is lost, the cal
+  page stays saved and the message gives the last good address.
+* `compare` compares the cal block (offsets `0x025`–`0x12E`) byte for byte. The other bytes of
+  the page are stock settings that change with each flash: "block equal, other ranges changed"
+  is the usual result after an update and exits 0. A different or blank cal block exits 2.
+* It only reads. The commands it sends are `version`, `mem read`, `flash dump` and
+  `cal status`; a guard refuses each other line before it is sent. It uses the ASCII shell, so
+  it also works on an image that has no binary protocol (release v0.4.1). It cannot read a
+  unit that runs the stock firmware (stock has no serial port).
+* Exit codes: 0 done and checked, 1 no device, 2 a device error or a check that failed.
+
+From Python: `openscope.calbackup` (`open_for_backup`, `make_backup`, `verify_backup`,
+`compare_cal`; the module text gives the arguments and the results). `Device.flash_dump(addr,
+length)` reads up to 4096 raw bytes of the W25Q. Library version 0.4.0 adds these.
 
 ## GUI (`openscope-gui`)
 The desktop window moved to its own repository,

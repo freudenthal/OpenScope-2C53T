@@ -63,6 +63,9 @@ READ_ONLY_SHELL = ("version", "status", "uptime", "usbstat", "fwstat", "help")
 SCREEN_HDR = re.compile(
     rb"SCREENBIN x=(\d+) y=(\d+) w=(\d+) h=(\d+) format=indexed4 len=(\d+) crc32=([0-9A-F]{8})\r\n")
 SCREEN_END = re.compile(rb"SCREENBIN END(?: crc32=([0-9A-F]{8}))?\r\n")
+FLASH_HDR = re.compile(rb"FLASHDUMP (\d+)\r\n")
+FLASH_DUMP_MAX = 4096       # firmware: `flash dump` len must be 1..4096
+W25Q_SIZE = 0x1000000       # W25Q128: 16 MiB
 PROMPT = b"> "
 RX_GAP_S = 0.06    # > ESP_RX_GAP_MS (firmware/src/drivers/esp_comm.h)
 
@@ -401,9 +404,57 @@ class Device:
             text = text[:text.rfind(">")].rstrip("\r\n ")
         return text
 
+    def flash_dump(self, addr: int, length: int, timeout: float = 5.0,
+                   header_timeout: float = 2.0) -> bytes:
+        """`length` (1..4096) bytes of the W25Q flash at `addr`, with one
+        `flash dump` command. Read only.
+
+        The reply is `FLASHDUMP <n>` and then n raw bytes (they can be 0xAA
+        or shell text), so it is read directly, never through the frame
+        decoder or shell(). No header within `header_timeout` s, or fewer
+        than n bytes within `timeout` s, raises Timeout: the caller reads the
+        chunk again. The command only reads, so after a replug it is sent
+        again one time (the rule of screenshot())."""
+        if not 1 <= length <= FLASH_DUMP_MAX:
+            raise ValueError(f"flash dump length {length}: must be 1..{FLASH_DUMP_MAX}")
+        if addr < 0 or addr + length > W25Q_SIZE:
+            raise ValueError(f"flash dump 0x{addr:X} + {length}: outside the 16 MiB chip")
+        self._ensure_verified()
+        return self._with_reopen(lambda: self._flash_dump_once(addr, length, timeout, header_timeout))
+
+    def _flash_dump_once(self, addr: int, length: int, timeout: float, header_timeout: float) -> bytes:
+        cmd = "flash dump 0x%06X %d" % (addr, length)
+        self.link.discard_input()       # an old prompt or a late reply
+        self._write(cmd.encode("ascii") + b"\r")
+        buf = bytearray()
+        t0 = time.monotonic()
+        m = None
+        while not m and time.monotonic() - t0 < min(timeout, header_timeout):
+            buf += self.link.read()
+            m = FLASH_HDR.search(buf)
+            if not m and b"Usage: flash dump" in buf:
+                self._settle()
+                raise DeviceError(f"the unit refused '{cmd}'")
+        if not m:
+            self._settle()
+            raise Timeout(f"{cmd}: no FLASHDUMP header within {min(timeout, header_timeout):.1f} s "
+                          f"(got {bytes(buf[-40:])!r})")
+        n = int(m.group(1))
+        rest = bytearray(buf[m.end():])
+        while len(rest) < n and time.monotonic() - t0 < timeout:
+            rest += self.link.read(n - len(rest))
+        if n != length or len(rest) < n:
+            self._settle()
+            raise Timeout(f"{cmd}: got {min(len(rest), n)} of {length} B within {timeout:.1f} s")
+        tail = bytearray(rest[n:])      # then the shell prompt: take it, so the next
+        t1 = time.monotonic()           # command starts on a quiet link
+        while not tail.endswith(PROMPT) and time.monotonic() - t1 < 0.5:
+            tail += self.link.read()
+        return bytes(rest[:n])
+
     def _with_reopen(self, fn, cancel=None):
-        """For screenshot() only: `screen dumpbin` is read-only, so it may be
-        re-run after a replug."""
+        """For screenshot() and flash_dump() only: `screen dumpbin` and
+        `flash dump` are read-only, so they may be re-run after a replug."""
         try:
             return fn()
         except (OSError, _WriteFailed) as e:

@@ -651,6 +651,9 @@ def parse_scope_state(payload: bytes) -> ScopeState:
 # later firmware can append sections without a version change.
 DESCRIPTION_VERSION = 1
 DESC_SEC_TIMEBASE, DESC_SEC_RANGES, DESC_SEC_TRIGGER, DESC_SEC_PROBE = 1, 2, 3, 4
+DESC_SEC_IDENTITY = 7       # stage-190; 5 and 6 are kept for the meter and the generator
+DESC_UID_LEN = 12
+DESC_TEXT_MAX = 31          # target and git revision bytes, as the firmware cuts them
 _DESC_ENTRY = struct.Struct("<IB")          # u32 value, u8 tier
 _DESC_TRIGGER = struct.Struct("<hhBHHBBb")  # 12 bytes
 
@@ -684,6 +687,33 @@ class TriggerScale:
 
 
 @dataclass(frozen=True)
+class Identity:
+    """DESCRIPTION section 7 (stage-190): which unit and which build."""
+    uid: bytes                      # 12 B: the words at 0x1FFFF7E8/EC/F0, each little-endian
+    api_level: int                  # remote_protocol.md §9.2: raised when the GUI gets new link features
+    target: str                     # make goal, e.g. "guest-coldtrace"
+    git_rev: str                    # e.g. "0a1af35", "0a1af35-dirty", "unknown"
+
+    @property
+    def uid_words(self) -> Tuple[int, int, int]:
+        return struct.unpack("<3I", self.uid)
+
+    @property
+    def uid_hex(self) -> str:
+        """24 hex digits, the three words as `mem read 0x1FFFF7E8 3` prints
+        them, no spaces (a folder name: stage 195)."""
+        return "".join(f"{w:08X}" for w in self.uid_words)
+
+    @property
+    def usb_serial(self) -> str:
+        """The USB serial the vendor CDC code makes from this ID
+        (cdc_desc.c get_serial_num()): hex8 of (ID1 + ID3) mod 2^32, then hex4
+        of ID2 >> 16."""
+        w1, w2, w3 = self.uid_words
+        return f"{(w1 + w3) & 0xFFFFFFFF:08X}{w2 >> 16:04X}"
+
+
+@dataclass(frozen=True)
 class Description:
     """The unit's fixed tables, in one request. Volts are at the BNC: the
     probe factor is a separate field and is applied by volts_per_div()."""
@@ -695,6 +725,12 @@ class Description:
     trigger: Optional[TriggerScale] = None
     probe: Optional[Tuple[int, ...]] = None          # per channel, factor 1|10
     skipped: Tuple[int, ...] = ()                    # section ids this tool does not know
+    identity: Optional[Identity] = None              # section 7; None = firmware before stage-190
+
+    @property
+    def api_level(self) -> int:
+        """0 for firmware without section 7 (remote_protocol.md §9.2)."""
+        return self.identity.api_level if self.identity else 0
 
     def sample_rate(self, code: int) -> Optional[int]:
         if 0 <= code < len(self.rates) and self.rates[code][0]:
@@ -762,6 +798,24 @@ def _entries(data: bytes, ofs: int, n: int, what: str):
     return tuple(out)
 
 
+def _parse_identity(data: bytes) -> Identity:
+    def text(pos: int, what: str):
+        if pos >= len(data):
+            raise ProtocolError(f"DESCRIPTION identity section: no {what} length")
+        n = data[pos]
+        raw = data[pos + 1:pos + 1 + n]
+        if len(raw) != n:
+            raise ProtocolError(f"DESCRIPTION identity section: {what} of {n} B does not fit")
+        return raw.decode("ascii", "replace"), pos + 1 + n
+
+    if len(data) < DESC_UID_LEN + 2:
+        raise ProtocolError("DESCRIPTION identity section too short")
+    level = struct.unpack_from("<H", data, DESC_UID_LEN)[0]
+    target, pos = text(DESC_UID_LEN + 2, "target")
+    rev, _ = text(pos, "git revision")
+    return Identity(bytes(data[:DESC_UID_LEN]), level, target, rev)
+
+
 def parse_description(payload: bytes) -> Description:
     if not payload:
         raise ProtocolError("DESCRIPTION is empty")
@@ -804,6 +858,8 @@ def parse_description(payload: bytes) -> Description:
             f["trigger"] = t
         elif sid == DESC_SEC_PROBE:
             f["probe"] = tuple(data)
+        elif sid == DESC_SEC_IDENTITY:
+            f["identity"] = _parse_identity(data)
         else:
             skipped.append(sid)
     f["skipped"] = tuple(skipped)
@@ -833,6 +889,14 @@ def encode_description(d: Description) -> bytes:
                                                      t.record_offset))
     if d.probe is not None:
         section(DESC_SEC_PROBE, bytes(d.probe))
+    if d.identity is not None:
+        i = d.identity
+        if len(i.uid) != DESC_UID_LEN:
+            raise ValueError(f"identity uid must be {DESC_UID_LEN} bytes")
+        tgt = i.target.encode("ascii")[:DESC_TEXT_MAX]
+        rev = i.git_rev.encode("ascii")[:DESC_TEXT_MAX]
+        section(DESC_SEC_IDENTITY, bytes(i.uid) + struct.pack("<H", i.api_level)
+                + bytes([len(tgt)]) + tgt + bytes([len(rev)]) + rev)
     return bytes(out)
 
 

@@ -214,6 +214,15 @@ C_DEFS  = -DAT32F403AVGT7
 C_DEFS += $(FFT_DEFS)
 C_INCLUDES += $(FFT_INCLUDES)
 
+# Build identity (stage-190): the `version` shell text, STATUS fw_version and
+# DESCRIPTION section 7 carry them. --exclude='*' gives the bare hash (the repo
+# has v0.x tags; without it describe prints v0.4.1-NN-g<sha>). The -c flags
+# match the Windows checkout (core.autocrlf=true): without them git in WSL sees
+# every file as modified and --dirty is always set. "unknown" outside git.
+GIT_REV := $(shell git -c core.autocrlf=true -c core.filemode=false describe --always --dirty --abbrev=7 --exclude='*' 2>/dev/null || echo unknown)
+BUILD_TARGET := $(if $(MAKECMDGOALS),$(firstword $(MAKECMDGOALS)),all)
+C_DEFS += -DOPENSCOPE_GIT_REV='"$(GIT_REV)"' -DOPENSCOPE_BUILD_TARGET='"$(BUILD_TARGET)"'
+
 # Compiler flags
 CFLAGS  = $(MCU) $(C_DEFS) $(C_INCLUDES)
 CFLAGS += -Wall -Wextra -Wno-unused-parameter

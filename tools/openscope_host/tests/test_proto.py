@@ -370,6 +370,44 @@ class TestDescription(unittest.TestCase):
         self.assertEqual(proto.format_volts(1.00006), "1 V")
         self.assertEqual(proto.format_volts(0.0429), "42.9 mV")
 
+    # ── stage-190: section 7 identity ──
+    UID = bytes.fromhex("0E927403" "0080006E" "2094CC07")   # words 0374920E 6E008000 07CC9420 (unit #1)
+
+    def test_identity_round_trip(self):
+        ident = proto.Identity(self.UID, 1, "guest-coldtrace", "0a1af35-dirty")
+        d = sample_description(identity=ident)
+        p = proto.encode_description(d)
+        self.assertEqual(len(p), 239 + 3 + 12 + 2 + 16 + 14)    # what the firmware sends
+        back = proto.parse_description(p)
+        self.assertEqual(back, d)
+        self.assertEqual(back.api_level, 1)
+        self.assertEqual(back.skipped, ())
+        self.assertEqual(back.identity.uid_words, (0x0374920E, 0x6E008000, 0x07CC9420))
+        self.assertEqual(back.identity.uid_hex, "0374920E6E00800007CC9420")
+        self.assertEqual(back.identity.usb_serial, "0B41262E6E00")   # the unit's Windows serial
+
+    def test_old_description_is_api_level_0(self):
+        d = proto.parse_description(proto.encode_description(sample_description()))
+        self.assertIsNone(d.identity)
+        self.assertEqual(d.api_level, 0)
+
+    def test_identity_texts_cut_and_empty(self):
+        ident = proto.Identity(self.UID, 7, "t" * 40, "")
+        back = proto.parse_description(proto.encode_description(sample_description(identity=ident)))
+        self.assertEqual(back.identity.target, "t" * 31)
+        self.assertEqual(back.identity.git_rev, "")
+        self.assertEqual(back.api_level, 7)
+
+    def test_identity_appended_field_ignored_and_malformed_refused(self):
+        sec = self.UID + struct.pack("<H", 2) + b"\x01x\x02ab" + b"\x99\x99"   # a later field
+        p = bytes([1]) + struct.pack("<BH", 7, len(sec)) + sec
+        i = proto.parse_description(p).identity
+        self.assertEqual((i.api_level, i.target, i.git_rev), (2, "x", "ab"))
+        for bad in (self.UID, self.UID + b"\x01\x00", self.UID + b"\x01\x00\x05ab",
+                    self.UID + b"\x01\x00\x01x"):                     # short, no target, cut, no rev
+            with self.assertRaises(proto.ProtocolError, msg=bad.hex()):
+                proto.parse_description(bytes([1]) + struct.pack("<BH", 7, len(bad)) + bad)
+
     def test_trigger_scale_matches_the_firmware_formula(self):
         t = sample_description().trigger
         # fpga_trigger_code_from_level(): C division truncates toward zero

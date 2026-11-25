@@ -688,11 +688,27 @@ static uint8_t *put_section(uint8_t *p, uint8_t id, uint16_t len)
     return p + 3;
 }
 
+/* u8 len, then the text without its NUL, cut to ESP_DESC_TEXT_MAX. */
+static uint8_t *put_text(uint8_t *p, const char *s)
+{
+    uint8_t n = 0;
+    if (s)
+        while (n < ESP_DESC_TEXT_MAX && s[n] != '\0')
+            n++;
+    *p++ = n;
+    if (n)
+        memcpy(p, s, n);
+    return p + n;
+}
+
 static void handle_get_description(const esp_packet_t *pkt)
 {
     esp_description_t d;
-    uint8_t out[ESP_DESCRIPTION_LEN];
+    /* static: 320 B off the usb_dbg task stack; only that task dispatches
+     * frames, and the reply is sent before the next one is parsed. */
+    static uint8_t out[ESP_DESCRIPTION_LEN];
     uint8_t *p = out;
+    uint8_t *ident;
     unsigned i, c;
 
     if (!ctrl_len_ok(pkt, 0, control_ops && control_ops->get_description))
@@ -729,6 +745,15 @@ static void handle_get_description(const esp_packet_t *pkt)
     p = put_section(p, ESP_DESC_SEC_PROBE, ESP_DESC_PROBE_LEN);
     *p++ = wire_probe(d.probe[0]);
     *p++ = wire_probe(d.probe[1]);
+
+    /* stage-190: identity. The length goes in after the texts are cut. */
+    ident = p;
+    p = put_section(p, ESP_DESC_SEC_IDENTITY, 0);
+    memcpy(p, d.uid, ESP_DESC_UID_LEN); p += ESP_DESC_UID_LEN;
+    put_u16(p, ESP_API_LEVEL); p += 2;
+    p = put_text(p, d.build_target);
+    p = put_text(p, d.git_rev);
+    put_u16(&ident[1], (uint16_t)(p - ident - 3));
 
     esp_comm_send_response(ESP_RSP_DESCRIPTION, out, (uint16_t)(p - out));
 }

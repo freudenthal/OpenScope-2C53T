@@ -170,6 +170,10 @@ static void desc_defaults(void)
     fake_desc.trig_code_min = 1; fake_desc.trig_code_max = 254;
     fake_desc.trig_record_offset = -28;
     fake_desc.probe[0] = 10; fake_desc.probe[1] = 7;        /* 7: not a probe setting */
+    for (int i = 0; i < (int)ESP_DESC_UID_LEN; i++)
+        fake_desc.uid[i] = (uint8_t)(0xA0 + i);
+    fake_desc.build_target = "guest-coldtrace";
+    fake_desc.git_rev = "0a1af35-dirty";
     memset(&fake_state, 0, sizeof(fake_state));
     fake_state.ch[0].probe = 10;
     fake_state.ch[1].probe = 1;
@@ -763,7 +767,9 @@ static void test_description_layout(void)
     reset();
     esp_comm_set_control_provider(&ctl_ops);
     CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n) == ESP_RSP_DESCRIPTION, "DESCRIPTION reply");
-    CHECK(n == ESP_DESCRIPTION_LEN && n == 239, "239 bytes");
+    /* 239 B of sections 1-4, + 3 + 12 + 2 + (1 + 15) + (1 + 13) of section 7 */
+    CHECK(n == 239 + 3 + 12 + 2 + 16 + 14, "286 bytes");
+    CHECK(ESP_DESCRIPTION_LEN == 320, "the largest reply is 320 bytes");
     CHECK(pl[0] == ESP_DESCRIPTION_VERSION, "version byte");
 
     /* walk the sections the way a host does */
@@ -800,11 +806,44 @@ static void test_description_layout(void)
         } else if (id == ESP_DESC_SEC_PROBE) {
             seen |= 8;
             CHECK(len == 2 && d[0] == 10 && d[1] == 1, "probe 10 / unknown 7 sent as 1");
+        } else if (id == ESP_DESC_SEC_IDENTITY) {
+            seen |= 16;
+            CHECK(len == 12 + 2 + 16 + 14, "identity len = bytes written");
+            CHECK(d[0] == 0xA0 && d[11] == 0xAB, "uid bytes in order");
+            CHECK(rd_u16(d + 12) == ESP_API_LEVEL && ESP_API_LEVEL == 1, "api level 1");
+            CHECK(d[14] == 15 && memcmp(d + 15, "guest-coldtrace", 15) == 0, "target");
+            CHECK(d[30] == 13 && memcmp(d + 31, "0a1af35-dirty", 13) == 0, "git rev");
         }
         p = d + len;
     }
     CHECK(p == end, "sections end exactly at the payload end");
-    CHECK(seen == 15, "all four sections");
+    CHECK(seen == 31, "all five sections");
+}
+
+/* stage-190: section 7 texts are cut to ESP_DESC_TEXT_MAX; NULL is empty. */
+static void test_description_identity_texts(void)
+{
+    static const char long_target[] = "guest-coldtrace-hwspi-usbtask-and-more-40-chars";
+    uint8_t pl[512]; uint16_t n = 0;
+    reset();
+    esp_comm_set_control_provider(&ctl_ops);
+    fake_desc.build_target = long_target;
+    fake_desc.git_rev = 0;
+    CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n) == ESP_RSP_DESCRIPTION, "DESCRIPTION reply");
+    const uint8_t *d = pl + 239;                         /* section 7 header */
+    CHECK(d[0] == ESP_DESC_SEC_IDENTITY, "section 7 after the probe section");
+    CHECK(rd_u16(d + 1) == 12 + 2 + 1 + 31 + 1, "len: target cut to 31, empty rev");
+    CHECK(d[3 + 14] == 31 && memcmp(d + 3 + 15, long_target, 31) == 0, "target cut to 31");
+    CHECK(d[3 + 46] == 0, "NULL rev sent empty");
+    CHECK(n == 239 + 3 + 47, "reply ends after the empty rev");
+
+    fake_desc.build_target = "x";
+    fake_desc.git_rev = "0123456789abcdef0123456789abcdef0123";   /* 36 */
+    CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n) == ESP_RSP_DESCRIPTION, "DESCRIPTION reply 2");
+    CHECK(d[3 + 14] == 1 && d[3 + 15] == 'x', "short target");
+    CHECK(d[3 + 16] == 31 && memcmp(d + 3 + 17, fake_desc.git_rev, 31) == 0, "rev cut to 31");
+    CHECK(n == 239 + 3 + 12 + 2 + 2 + 32, "reply length");
+    desc_defaults();
 }
 
 static void test_description_refusals(void)
@@ -1007,6 +1046,7 @@ int main(void)
     test_waveform_flags_are_derived();
     test_waveform_byte_writer_agrees();
     test_description_layout();
+    test_description_identity_texts();
     test_description_refusals();
     test_set_probe();
     test_scope_state_probe_append();

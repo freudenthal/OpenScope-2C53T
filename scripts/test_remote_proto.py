@@ -276,6 +276,22 @@ MUTATIONS: tuple[Mutation, ...] = (
             "    *p++ = wire_probe(d.probe[0]);\n    *p++ = wire_probe(d.probe[1]);\n",
         new="",
     ),
+    # ── stage-190: DESCRIPTION section 7 (identity) ──
+    Mutation(
+        name="identity: text not cut to ESP_DESC_TEXT_MAX",
+        old="        while (n < ESP_DESC_TEXT_MAX && s[n] != '\\0')",
+        new="        while (s[n] != '\\0')",
+    ),
+    Mutation(
+        name="identity: section length left at 0",
+        old="    put_u16(&ident[1], (uint16_t)(p - ident - 3));\n",
+        new="",
+    ),
+    Mutation(
+        name="identity: api level not sent",
+        old="    put_u16(p, ESP_API_LEVEL); p += 2;\n",
+        new="    put_u16(p, 0); p += 2;\n",
+    ),
     Mutation(
         name="SET_PROBE: factor other than 1/10 accepted",
         old="        (pkt->payload[1] != 1 && pkt->payload[1] != 10)) {",

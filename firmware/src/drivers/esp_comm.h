@@ -368,6 +368,13 @@ typedef struct {
  *               (fpga_trigger_code_from_level()); the capture fires where the
  *               record crosses code + record_offset (EXP-56: -28)
  *   4 probe     per channel (CH1 first): u8 factor (1 or 10)
+ *   7 identity  (stage-190) u8 uid[12] (MCU unique ID: the three words at
+ *               0x1FFFF7E8 / EC / F0, each little-endian, as `mem read`
+ *               shows them), u16 api_level (ESP_API_LEVEL), u8 target_len,
+ *               char target[target_len], u8 rev_len, char rev[rev_len]
+ *               (no NUL; each text cut to ESP_DESC_TEXT_MAX). Fields added
+ *               later go at the end. Ids 5 and 6 are kept for the meter and
+ *               the generator (stages 272, 282).
  * The encoder zeroes a value whose tier is NONE and sends tier NONE for a
  * zero value, as everywhere else on this link. */
 #define ESP_DESCRIPTION_VERSION 1
@@ -379,9 +386,20 @@ typedef struct {
 #define ESP_DESC_RANGES_LEN     (4u + 2u * ESP_VDIV_RANGES * 5u)        /* 104 */
 #define ESP_DESC_TRIGGER_LEN    12u
 #define ESP_DESC_PROBE_LEN      2u
-/* version + 4 section headers + the sections = 239 */
-#define ESP_DESCRIPTION_LEN     (1u + 4u * 3u + ESP_DESC_TB_LEN + ESP_DESC_RANGES_LEN + \
-                                 ESP_DESC_TRIGGER_LEN + ESP_DESC_PROBE_LEN)
+#define ESP_DESC_SEC_IDENTITY   7
+#define ESP_DESC_TEXT_MAX       31u     /* target and rev bytes on the wire */
+#define ESP_DESC_UID_LEN        12u
+#define ESP_DESC_IDENTITY_MAX   (ESP_DESC_UID_LEN + 2u + 1u + ESP_DESC_TEXT_MAX + 1u + ESP_DESC_TEXT_MAX) /* 78 */
+/* The largest reply: version + 5 section headers + the sections = 320. The
+ * identity section is shorter when the texts are: the reply length is the
+ * bytes written. Sections 1-4 alone are 239 B (stage-086). */
+#define ESP_DESCRIPTION_LEN     (1u + 5u * 3u + ESP_DESC_TB_LEN + ESP_DESC_RANGES_LEN + \
+                                 ESP_DESC_TRIGGER_LEN + ESP_DESC_PROBE_LEN + ESP_DESC_IDENTITY_MAX)
+
+/* Link API level (stage-190, remote_protocol.md §9.2). A host reads "no
+ * section 7" as level 0. Raise it by 1 when the link gets a command, a section
+ * or a field that the GUI uses. Never lower it. */
+#define ESP_API_LEVEL           1
 
 typedef struct {
     uint16_t samples_per_div;
@@ -396,6 +414,10 @@ typedef struct {
     uint8_t  trig_code_min, trig_code_max;
     int8_t   trig_record_offset;
     uint8_t  probe[2];          /* 1 or 10 */
+    /* stage-190: section 7. NULL texts are sent empty. */
+    uint8_t     uid[ESP_DESC_UID_LEN];
+    const char *build_target;   /* NUL-terminated make goal, e.g. "guest-coldtrace" */
+    const char *git_rev;        /* NUL-terminated, e.g. "0a1af35" or "0a1af35-dirty" */
 } esp_description_t;
 
 typedef enum {

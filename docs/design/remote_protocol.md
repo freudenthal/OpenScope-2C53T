@@ -599,3 +599,43 @@ waveform header uses the same number.
 ago (`esp_comm_host_active()`, `ESP_HOST_ACTIVE_MS`). Shell text and corrupt frames do not
 count. The display loop repaints the badge when that state changes; the 1 s status-bar tick
 also draws it.
+
+### 9.2 Unit identity and API level (stage-190)
+
+**DESCRIPTION section 7 "identity".** Appended after section 4 (ids 5 and 6 are kept for the
+meter and the generator). A host from before this stage skips it by the rule of §9.1.
+
+```
+u8[12] uid           MCU unique ID: the words at 0x1FFFF7E8, 0x1FFFF7EC, 0x1FFFF7F0,
+                     each little-endian (as `mem read 0x1FFFF7E8 3` shows them)
+u16    api_level     see below
+u8     target_len    then char target[target_len]: the make goal, e.g. "guest-coldtrace"
+u8     rev_len       then char rev[rev_len]: git revision, e.g. "0a1af35", "0a1af35-dirty",
+                     "unknown" (a build outside git)
+```
+
+The texts have no NUL and are cut to 31 bytes. Fields added later go at the end; a host reads
+the fields it knows and ignores the rest. The reply is 280 bytes for "guest-coldtrace" and a
+7-digit revision (286 with "-dirty"), 320 bytes at most. The USB serial number that Windows shows is made from the
+same ID by the vendor CDC code (`cdc_desc.c` `get_serial_num()`): 8 hex digits of
+`(ID1 + ID3) mod 2^32`, then 4 hex digits of `ID2 >> 16`. It is a hash: the ID cannot be
+calculated from it.
+
+**`api_level`.** One number that says which link features the firmware has. Rules:
+
+* A host reads "no section 7" (or no `GET_DESCRIPTION`) as level 0.
+* Level 1 = this stage: sections 1-4 and 7, `SET_PROBE`, every command before them.
+* Raise the level by 1 in the change that adds a command, a section or a field that the GUI
+  uses. Never lower it. A fix that does not change the link does not raise it.
+* The GUI states the lowest level that it needs. Below that level it asks for a firmware
+  update. Programs compare `api_level`; people and bench records use the git revision.
+
+**Build identity elsewhere.** The `version` shell command keeps its `Build:` line as before
+(scripts parse it) and adds `Git: <rev>  Target: <target>  API: <level>` and
+`UID: <word1> <word2> <word3>`. The `PING` reply and STATUS `fw_version` are
+`OpenScope <date> <time> <rev>` (44 bytes at most with "-dirty"; the field is cut at 48). The
+`Makefile` sets the revision with `git describe --always --dirty --abbrev=7 --exclude='*'`
+(the bare hash, not the `v0.x-N-g<sha>` form) and `-c core.autocrlf=true -c
+core.filemode=false`, so a WSL build of a Windows checkout is not always "dirty". A
+non-`clean` incremental `make all` keeps the revision of its last full compile of
+`usb_debug.c`; every guest target cleans first.

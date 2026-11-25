@@ -70,6 +70,15 @@
 #include <stdarg.h>
 #include <stdlib.h>
 
+/* stage-190: build identity, set by the Makefile (git revision, make goal).
+ * A build without them says "unknown". */
+#ifndef OPENSCOPE_GIT_REV
+#define OPENSCOPE_GIT_REV "unknown"
+#endif
+#ifndef OPENSCOPE_BUILD_TARGET
+#define OPENSCOPE_BUILD_TARGET "unknown"
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════
  * USB Device Instance
  * ═══════════════════════════════════════════════════════════════════ */
@@ -835,17 +844,25 @@ static uint16_t count_post_h2_non_ff_snapshot(
 
 static void cmd_version(void)
 {
+    uint8_t uid[CAL_UID_LEN];
+    cal_backup_read_uid(uid);
     /* The compiler rides on the Build line: whether the RAM installer called
      * flash-resident memset (issue #42) depended on the toolchain, and every
-     * bench script already logs the line that starts with "Build:". */
+     * bench script already logs the line that starts with "Build:". Keep that
+     * line as it is; stage-190 adds the Git and UID lines after it. */
     usb_debug_printf(
         "OpenScope 2C53T\r\n"
         "Build: " __DATE__ " " __TIME__ ", gcc " __VERSION__ "\r\n"
+        "Git: " OPENSCOPE_GIT_REV "  Target: " OPENSCOPE_BUILD_TARGET "  API: %u\r\n"
+        "UID: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\r\n"
 #ifdef FPGA_ALT_BITSTREAM
         "FPGA payload: %s (ALT — not the stock scope design)\r\n"
 #endif
         "MCU: AT32F403A @ %uMHz\r\n"
         "SRAM: 224KB (EOPB0=0xFE)\r\n",
+        (unsigned)ESP_API_LEVEL,
+        uid[3], uid[2], uid[1], uid[0], uid[7], uid[6], uid[5], uid[4],
+        uid[11], uid[10], uid[9], uid[8],
 #ifdef FPGA_ALT_BITSTREAM
         fpga_bitstream_name(),   /* stage-177: from fpga.c, no table include here */
 #endif
@@ -8816,9 +8833,13 @@ static const char shell_banner[] =
  * The binary protocol shares the CDC OUT endpoint with this shell: every
  * received chunk goes through esp_comm_route(), which takes frames starting
  * at 0xAA and hands everything else to shell_feed() unchanged (§3.2). */
-/* 30 chars ("OpenScope Oct  1 2026 04:59:12"): fits the protocol's version field
- * whole, so two builds a minute apart stay distinguishable. */
-static const char s_fw_version[] = "OpenScope " __DATE__ " " __TIME__;
+/* "OpenScope Oct  1 2026 04:59:12 0a1af35" (38 chars; 44 with "-dirty"):
+ * the build time keeps two builds a minute apart distinguishable, the git
+ * revision (stage-190) names the source. It must fit the protocol's version
+ * field whole: STATUS cuts at ESP_FW_VERSION_MAX. */
+static const char s_fw_version[] = "OpenScope " __DATE__ " " __TIME__ " " OPENSCOPE_GIT_REV;
+_Static_assert(sizeof(s_fw_version) - 1u <= ESP_FW_VERSION_MAX,
+               "fw_version is cut on the wire: shorten OPENSCOPE_GIT_REV");
 
 static void remote_status(esp_status_snapshot_t *st)
 {
@@ -9136,6 +9157,11 @@ static void remote_description(esp_description_t *o)
     o->trig_record_offset = (int8_t)FPGA_ADC_OFFSET;
     o->probe[0] = remote_probe_factor(1);
     o->probe[1] = remote_probe_factor(2);
+    /* stage-190: section 7 (esp_comm adds ESP_API_LEVEL) */
+    _Static_assert(CAL_UID_LEN == ESP_DESC_UID_LEN, "one UID layout");
+    cal_backup_read_uid(o->uid);
+    o->build_target = OPENSCOPE_BUILD_TARGET;
+    o->git_rev      = OPENSCOPE_GIT_REV;
 }
 
 /* The same write the probe menu rows and the PRM-key cycle make: the field in

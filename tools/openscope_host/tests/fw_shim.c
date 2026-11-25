@@ -77,6 +77,15 @@ static const esp_control_ops_t ctrl_ops = { c_get, c_mode, c_tb, c_vdiv, c_trig,
 void shim_set_desc_rate(int code, uint32_t rate, int tier) { ds.tb_rate_hz[code] = rate; ds.tb_tier[code] = (uint8_t)tier; }
 void shim_set_desc_range(int ch, int r, uint32_t uv, int tier) { ds.uv_per_div_bnc[ch ? 1 : 0][r] = uv; ds.vdiv_tier[ch ? 1 : 0][r] = (uint8_t)tier; }
 void shim_set_scope_probe(int ch, int f) { cs.ch[ch ? 1 : 0].probe = (uint8_t)f; }
+/* stage-190: section 7. The texts are copied (ctypes strings do not live on);
+ * NULL leaves the pointer NULL, which the encoder sends as an empty text. */
+static char id_target[64], id_rev[64];
+void shim_set_desc_identity(const uint8_t *uid, const char *target, const char *rev)
+{
+    memcpy(ds.uid, uid, sizeof ds.uid);
+    if (target) { strncpy(id_target, target, sizeof id_target - 1); ds.build_target = id_target; } else ds.build_target = 0;
+    if (rev) { strncpy(id_rev, rev, sizeof id_rev - 1); ds.git_rev = id_rev; } else ds.git_rev = 0;
+}
 static void desc_init(void)
 {
     memset(&ds, 0, sizeof ds);

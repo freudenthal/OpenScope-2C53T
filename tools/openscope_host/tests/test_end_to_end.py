@@ -66,6 +66,7 @@ def lib():
         L.shim_set_desc_rate.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_int]
         L.shim_set_desc_range.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_int]
         L.shim_set_scope_probe.argtypes = [ctypes.c_int, ctypes.c_int]
+        L.shim_set_desc_identity.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
         _LIB = L
     return _LIB
 
@@ -960,17 +961,22 @@ def desc_device():
     L.shim_set_desc_range(1, 8, 27905, 1)
     L.shim_set_desc_range(0, 2, 5555, 0)                # tier NONE: no volts meaning
     L.shim_set_scope_probe(0, 10)
+    L.shim_set_desc_identity(UNIT1_UID, b"guest-coldtrace", b"0a1af35-dirty")
     return dev
 
 
-def stage085_proto():
-    """The stage-085 library's proto.py, from git: what an old host runs."""
-    src = subprocess.run(["git", "-C", ROOT, "show", "adca54a:tools/openscope_host/openscope/proto.py"],
+UNIT1_UID = bytes.fromhex("0E927403" "0080006E" "2094CC07")   # words 0374920E 6E008000 07CC9420
+
+
+def old_proto(rev: str = "adca54a"):
+    """An older library's proto.py, from git: what an old host runs
+    (adca54a = stage-085, 0a1af35 = stage-086 description parser)."""
+    src = subprocess.run(["git", "-C", ROOT, "show", f"{rev}:tools/openscope_host/openscope/proto.py"],
                          capture_output=True, text=True, check=True).stdout
-    mod = type(sys)("proto_stage085")
+    mod = type(sys)(f"proto_{rev}")
     sys.modules[mod.__name__] = mod             # dataclasses look the module up
     try:
-        exec(compile(src, "proto_stage085.py", "exec"), mod.__dict__)
+        exec(compile(src, f"proto_{rev}.py", "exec"), mod.__dict__)
     finally:
         del sys.modules[mod.__name__]
     return mod
@@ -993,6 +999,40 @@ class TestDescription(unittest.TestCase):
         self.assertAlmostEqual(d.volts_per_div(1, 6), 13.42188)
         self.assertEqual((d.trigger.code(0), d.trigger.code(-100), d.trigger.record_offset), (128, 4, -28))
         self.assertEqual(d.skipped, ())
+        # stage-190: section 7 through the firmware encoder
+        self.assertEqual(d.identity, proto.Identity(UNIT1_UID, 1, "guest-coldtrace", "0a1af35-dirty"))
+        self.assertEqual(d.api_level, 1)
+        self.assertEqual(d.identity.usb_serial, "0B41262E6E00")
+
+    def test_identity_texts_cut_and_null_through_the_firmware_encoder(self):
+        dev = desc_device()
+        dev.link.L.shim_set_desc_identity(UNIT1_UID, b"g" * 40, None)
+        i = dev.description(refresh=True).identity
+        self.assertEqual((i.target, i.git_rev, i.api_level), ("g" * 31, "", 1))
+
+    def test_stage086_host_skips_section_7(self):
+        old = old_proto("0a1af35")
+        raw = desc_device().request(proto.CMD_GET_DESCRIPTION, expect=(proto.RSP_DESCRIPTION,)).payload
+        d = old.parse_description(raw)
+        self.assertEqual(d.skipped, (7,))
+        self.assertEqual(d.sample_rate(0x10), 12490)
+        self.assertEqual(d.probe, (10, 1))
+
+    def test_cli_info_and_describe_print_the_identity(self):
+        for argv in (["info"], ["describe"]):
+            rc, out, _ = run_cli(desc_device(), argv)
+            self.assertEqual(rc, 0, argv)
+            self.assertIn("unit ID   0374920E 6E008000 07CC9420 (USB serial 0B41262E6E00)", out)
+            self.assertIn("build     guest-coldtrace at git 0a1af35-dirty", out)
+            self.assertIn("API level 1", out)
+
+    def test_cli_info_on_firmware_without_description(self):
+        dev = desc_device()
+        dev.link.L.shim_set_ctrl_bound(0)                # GET_DESCRIPTION -> UNSUPPORTED
+        rc, out, _ = run_cli(dev, ["info"])
+        self.assertEqual(rc, 0)
+        self.assertIn("unit ID   not reported", out)
+        self.assertIn("API level 0", out)
 
     def test_description_is_cached_per_connection(self):
         dev = desc_device()
@@ -1030,7 +1070,7 @@ class TestDescription(unittest.TestCase):
         self.assertEqual(dev.link.L.shim_ctrl_calls(), 0)
 
     def test_old_host_still_parses_the_new_scope_state(self):
-        old = stage085_proto()
+        old = old_proto()
         dev = desc_device()
         raw = dev.request(proto.CMD_GET_SCOPE_STATE, expect=(proto.RSP_SCOPE_STATE,)).payload
         self.assertEqual(len(raw), 38)

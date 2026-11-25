@@ -36,7 +36,29 @@ def _info(dev: Device, _a) -> int:
     print(f"capture   {'real samples' if st.capture_ready else 'no capture data yet'}")
     print(f"uptime    {st.uptime_ms / 1000:.1f} s")
     print(f"usb       {st.usb_tx_stalls} TX stalls, {st.usb_heals} self-heals")
+    for line in identity_lines(_identity_of(dev)):
+        print(line)
     return EXIT_OK
+
+
+def _identity_of(dev: Device) -> Optional[proto.Identity]:
+    """Section 7, or None: firmware before stage-190 has no section 7, and
+    firmware before stage-086 has no GET_DESCRIPTION (UNSUPPORTED)."""
+    try:
+        return dev.description().identity
+    except Nak:
+        return None
+
+
+def identity_lines(ident: Optional[proto.Identity]) -> List[str]:
+    """`openscope info` / `describe`: which unit, which build, which API level."""
+    if ident is None:
+        return ["unit ID   not reported (firmware before stage-190)",
+                "API level 0"]
+    return [f"unit ID   {ident.uid_hex[:8]} {ident.uid_hex[8:16]} {ident.uid_hex[16:]}"
+            f" (USB serial {ident.usb_serial})",
+            f"build     {ident.target} at git {ident.git_rev}",
+            f"API level {ident.api_level}"]
 
 
 def _press(dev: Device, a) -> int:
@@ -283,6 +305,7 @@ def describe_lines(d: proto.Description) -> List[str]:
                      f"{t.counts_per_level:.3f} ADC counts per level step")
     if d.probe:
         lines.append("probe     " + ", ".join(f"CH{i + 1} x{f}" for i, f in enumerate(d.probe)))
+    lines.extend(identity_lines(d.identity))
     if d.skipped:
         lines.append("sections this tool does not read: " + ", ".join(str(s) for s in d.skipped))
     return lines

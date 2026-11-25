@@ -109,7 +109,17 @@ static uint32_t startup_settings_checksum(uint32_t mode)
     return STARTUP_SETTINGS_MAGIC ^ STARTUP_SETTINGS_VERSION ^ mode ^ 0x5A5AA5A5u;
 }
 
-static void startup_mode_load(void)
+/* The OLD home of the startup mode: a 16-byte record in MCU flash at
+ * 0x080FF800, written by a sector erase + program on every change of the
+ * Settings row or `mode startup` (stage-170, review F-3: MCU flash wear).
+ * The startup mode is now a field of the settings record on the W25Q
+ * (settings_store.c), and NOTHING writes or erases 0x080FF800 any more.
+ *
+ * Read-only, once, as a migration: only when no settings record loaded (first
+ * boot of this firmware on a unit that never saved settings), so a choice made
+ * on an older image is not lost. The next settings save stores it in the
+ * record. When a settings record loads, it wins and this is not read. */
+static void startup_mode_migrate_legacy(void)
 {
 #ifndef EMULATOR_BUILD
     const startup_settings_record_t *rec =
@@ -121,29 +131,6 @@ static void startup_mode_load(void)
         rec->checksum == startup_settings_checksum(rec->mode)) {
         startup_mode = (startup_mode_t)rec->mode;
     }
-#endif
-}
-
-static void startup_mode_save(void)
-{
-#ifndef EMULATOR_BUILD
-    startup_settings_record_t rec;
-    rec.magic = STARTUP_SETTINGS_MAGIC;
-    rec.version = STARTUP_SETTINGS_VERSION;
-    rec.mode = (uint32_t)startup_mode;
-    rec.checksum = startup_settings_checksum(rec.mode);
-
-    flash_unlock();
-    if (flash_sector_erase(STARTUP_SETTINGS_ADDR) == FLASH_OPERATE_DONE) {
-        const uint32_t *words = (const uint32_t *)&rec;
-        uint32_t addr = STARTUP_SETTINGS_ADDR;
-        for (uint32_t i = 0; i < sizeof(rec) / sizeof(uint32_t); i++, addr += 4) {
-            if (flash_word_program(addr, words[i]) != FLASH_OPERATE_DONE) {
-                break;
-            }
-        }
-    }
-    flash_lock();
 #endif
 }
 
@@ -159,8 +146,9 @@ const char *startup_mode_name(startup_mode_t mode)
 void startup_mode_set(startup_mode_t mode)
 {
     if (mode >= STARTUP_COUNT || startup_mode == mode) return;
+    /* RAM only. The settings store saves it with the other settings on the
+     * next button press, MENU, or POWER countdown (settings_store.h). */
     startup_mode = mode;
-    startup_mode_save();
 }
 
 void startup_mode_adjust(int dir)
@@ -1136,12 +1124,9 @@ int main(void)
     /* Initialize meter data parser */
     meter_data_init();
     meter_voltage_wave_init();
-    startup_mode_load();
-#if FPGA_WARM_HANDOFF_TEST
-    current_mode = MODE_OSCILLOSCOPE;
-#else
-    current_mode = startup_target_mode();
-#endif
+    /* current_mode is chosen after settings_store_init() below: the startup
+     * mode now comes from the settings record (stage-170, F-3). Nothing in
+     * fpga_init() reads current_mode. */
 
     /* Factory calibration boundary: initialize the W25Q wrapper, then
      * leave the calibration mirror unloaded. Stock evidence has not
@@ -1185,6 +1170,18 @@ int main(void)
      * And BEFORE the fpga_set_meter_mode(meter_submode) call below, which
      * consumes the restored meter submode, and before the display task exists. */
     settings_store_init();
+
+    /* Startup mode (stage-170, F-3): restored from the settings record by
+     * settings_store_init(). With no record, read the old MCU-flash record
+     * once (read-only migration), then pick the boot mode. */
+    if (settings_store_get_status()->load_result != CONFIG_LOAD_OK) {
+        startup_mode_migrate_legacy();
+    }
+#if FPGA_WARM_HANDOFF_TEST
+    current_mode = MODE_OSCILLOSCOPE;
+#else
+    current_mode = startup_target_mode();
+#endif
 
 #if defined(CAL_BACKUP_AUTO_RESTORE) && CAL_BACKUP_AUTO_RESTORE
     /* OFF by default. Manual `cal restore` is the primary path. Even when built

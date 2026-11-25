@@ -61,7 +61,7 @@
 
 /* ═══════════════════════════════════════════════════════════════════
  * Globals that live in main.c on the device. settings_store.c reads and
- * writes exactly these four; anything else it touched would fail to link,
+ * writes exactly these five; anything else it touched would fail to link,
  * which is itself a useful constraint on what counts as a "setting".
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -69,6 +69,7 @@ volatile bool     math_enabled  = false;
 volatile uint8_t  math_op       = 0;
 volatile uint8_t  meter_submode = 0;
 volatile uint8_t  meter_layout  = 0;
+volatile startup_mode_t startup_mode = STARTUP_METER;   /* stage-170, F-3 */
 
 /* ═══════════════════════════════════════════════════════════════════
  * Test harness
@@ -432,6 +433,7 @@ static void power_cycle(void)
     math_op = 0;
     meter_submode = 0;
     meter_layout = 0;
+    startup_mode = STARTUP_METER;
     if (flash_regions_bind_w25q() != FLASH_REGION_OK) {
         printf("FATAL: rebind failed\n");
         exit(2);
@@ -1185,15 +1187,20 @@ static void test_capture_apply_round_trip_is_symmetric(void)
     math_op = MATH_SUB;
     meter_submode = 7;
     meter_layout = METER_LAYOUT_FUSE;
+    startup_mode = STARTUP_SCOPE;
 
     device_config_t cfg;
     config_init_defaults(&cfg);
     settings_store_capture(&cfg);
+    CHECK(cfg.startup_mode == CONFIG_MODE_OSCILLOSCOPE,
+          "startup mode Scope captured as %u, expected CONFIG_MODE_OSCILLOSCOPE",
+          cfg.startup_mode);
 
     /* Wipe live state, then put it back from the captured config only. */
     scope_state_init(scope_state_get());
     theme_init(THEME_DARK_BLUE);
     math_enabled = false; math_op = 0; meter_submode = 0; meter_layout = 0;
+    startup_mode = STARTUP_METER;
 
     settings_store_apply(&cfg);
 
@@ -1212,6 +1219,7 @@ static void test_capture_apply_round_trip_is_symmetric(void)
     CHECK(math_enabled && math_op == MATH_SUB, "math settings lost");
     CHECK(meter_submode == 7, "meter submode lost");
     CHECK(meter_layout == METER_LAYOUT_FUSE, "meter layout lost");
+    CHECK(startup_mode == STARTUP_SCOPE, "startup mode lost");
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2180,6 +2188,126 @@ static void test_a_compaction_cut_mid_erase_never_resurrects_old_settings(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ * 10. A WINDOW WE DID NOT WRITE (stage-170, review F-1)
+ *
+ * The settings window is free space inside stock FAT volume "2:"
+ * (flash_regions.c). On another unit stock may have put a screenshot there.
+ * Before the ownership check, config_save() reset (erased) the whole 64 KB
+ * window on ERR_LOG_DAMAGED — which is exactly what a window full of somebody
+ * else's bytes returns. The reset is now allowed only when the window holds a
+ * record of ours, or at most one torn record of ours past the scan end.
+ *
+ * Foreign content here is pseudo-random bytes (screenshot-like data), with no
+ * record magic on the 4-byte grid, so no row can pass or fail by a chance
+ * header.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Fill [offset, offset + len) of the settings window with foreign bytes. */
+static void fill_foreign(uint32_t offset, uint32_t len)
+{
+    uint32_t x = 0x2C53A170u ^ offset;
+    uint8_t *p = model.mem + settings_start() + offset;
+    for (uint32_t i = 0; i < len; i++) {
+        x = x * 1664525u + 1013904223u;
+        p[i] = (uint8_t)(x >> 24);
+    }
+    /* No accidental REC_MAGIC on the 4-byte grid the resync search walks. */
+    for (uint32_t i = (4u - (offset & 3u)) & 3u; i + 1u < len; i += 4u) {
+        if (p[i] == (REC_MAGIC & 0xFFu) && p[i + 1u] == (REC_MAGIC >> 8)) {
+            p[i + 1u] ^= 0x01u;
+        }
+    }
+}
+
+/* Boot on the window as it is, change one setting, commit, and require: the
+ * save refused, zero erases, zero programs, the chip byte-identical, the
+ * refusal counted as foreign, and the change still live in RAM. Twice, since a
+ * NEW change clears the store's write block and tries again. */
+static void check_foreign_window_refused(const char *what)
+{
+    uint8_t *snap = snapshot();
+
+    boot();
+    CHECK(unchanged_since(snap), "%s: booting modified the chip", what);
+
+    for (uint8_t k = 0; k < 2u; k++) {
+        model_counters_reset();
+        scope_state_get()->ch1.vdiv_idx = (uint8_t)(MARK_C + k);
+        bool saved = settings_store_flush(1000u + k);
+        CHECK(!saved, "%s, change %u: the save reported success", what, k);
+        CHECK(model.erases == 0u, "%s, change %u: %u sector erase(s) on a foreign window",
+              what, k, model.erases);
+        CHECK(model.programs == 0u, "%s, change %u: %u program(s) on a foreign window",
+              what, k, model.programs);
+        CHECK(unchanged_since(snap), "%s, change %u: the chip changed", what, k);
+        CHECK(scope_state_get()->ch1.vdiv_idx == MARK_C + k,
+              "%s, change %u: the setting did not stay in RAM", what, k);
+        CHECK(config_persist_stats()->saves_refused_foreign == k + 1u,
+              "%s, change %u: saves_refused_foreign = %u, expected %u", what, k,
+              config_persist_stats()->saves_refused_foreign, k + 1u);
+        CHECK(config_persist_stats()->saves_failed == 0u,
+              "%s, change %u: a foreign refusal was counted as a failed save", what, k);
+    }
+    free(snap);
+}
+
+/* F-1 test (1): the whole window is non-record data from offset 0. */
+static void test_a_foreign_window_is_never_erased(void)
+{
+    fresh_device();
+    fill_foreign(0, flash_region_get(FLASH_REGION_SETTINGS)->length);
+    check_foreign_window_refused("whole window foreign");
+}
+
+/* F-1 test (2): 8 KB of non-record data from offset 0, then blank. */
+static void test_a_partly_foreign_window_is_never_erased(void)
+{
+    fresh_device();
+    fill_foreign(0, 8192u);
+    check_foreign_window_refused("8 KB foreign, then blank");
+}
+
+/* The rule's edge: foreign bytes that reach ONE byte past the room of one
+ * torn config record at the scan end are not a torn record. */
+static void test_foreign_bytes_one_past_a_torn_record_are_refused(void)
+{
+    fresh_device();
+    fill_foreign(0, REC_SLOT + 1u);
+    check_foreign_window_refused("foreign bytes = one record slot + 1");
+}
+
+/* Rule (c), positive: a torn first record (the #57 header cut) on a window that
+ * holds no other record still compacts — the only non-blank bytes fit in one
+ * record slot at the scan end. */
+static void test_a_torn_first_record_alone_still_compacts(void)
+{
+    fresh_device();
+    boot();
+    scope_state_get()->ch1.vdiv_idx = MARK_B;
+    model_cut_power_after(2u, UINT32_MAX);        /* 2 bytes of the magic land */
+    CHECK(!settings_store_flush(1000), "the cut save reported success");
+    CHECK(!slot_is_blank(0), "the cut did not tear the first record");
+
+    boot();
+    check_later_saves_survive("torn first record, nothing else");
+}
+
+/* Rule (b), positive: the log STARTS at a damaged header (the scan finds no
+ * record) but a good record of ours sits after it. The resync search finds it
+ * and the window compacts, though the damaged bytes run far past one slot. */
+static void test_a_damaged_first_header_before_a_good_record_still_compacts(void)
+{
+    fresh_device();
+    device_config_t c = marked_config(MARK_C);
+    uint32_t off = forge_damaged(0, DMG_MAGIC);
+    fill_foreign(off, 3u * REC_SLOT);             /* damage well past one slot */
+    (void)forge_config(off + 3u * REC_SLOT, &c);
+
+    boot();
+    check_later_saves_survive("damaged first header, good record later");
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -2258,6 +2386,17 @@ int main(void)
             test_a_compaction_cut_inside_the_first_sectors_erase_does_not_stop_later_saves);
         run("a compaction cut mid-erase never resurrects old settings",
             test_a_compaction_cut_mid_erase_never_resurrects_old_settings);
+
+        /* section 10: a window we did not write (stage-170, F-1) */
+        run("a foreign window is never erased", test_a_foreign_window_is_never_erased);
+        run("a partly foreign window is never erased",
+            test_a_partly_foreign_window_is_never_erased);
+        run("foreign bytes one past a torn record are refused",
+            test_foreign_bytes_one_past_a_torn_record_are_refused);
+        run("a torn first record alone still compacts",
+            test_a_torn_first_record_alone_still_compacts);
+        run("a damaged first header before a good record still compacts",
+            test_a_damaged_first_header_before_a_good_record_still_compacts);
     }
 
     if (BUILD_MODE == MODE_NEGATIVE_CONTROL) {

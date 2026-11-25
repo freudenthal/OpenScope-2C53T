@@ -217,6 +217,31 @@ flash_region_status_t flash_region_log_info(flash_region_id_t id,
                                             uint32_t *bytes_free,
                                             uint32_t *valid_records);
 
+/* Who wrote an append region (stage-170, review F-1). READ-ONLY: it never
+ * programs or erases. A caller about to flash_region_reset() a log that takes
+ * no more records asks this first, because the settings window is free space
+ * inside a stock FAT volume and can hold somebody else's data.
+ *
+ * The region is OURS when any of these is true, tested in this order:
+ *   RECORDS    the scan finds at least one CRC-valid record;
+ *   RESYNC     past the scan end, some 4-byte-aligned offset holds REC_MAGIC,
+ *              a length that fits, and a payload whose CRC32 matches;
+ *   TORN_TAIL  every non-0xFF byte past the scan end lies inside one record of
+ *              torn_payload_max payload bytes that starts at the scan end (a
+ *              header torn by a power cut, issue #57), or there is none.
+ * Otherwise it is FOREIGN and must not be erased. */
+typedef enum {
+    FLASH_REGION_OWNER_FOREIGN = 0,
+    FLASH_REGION_OWNER_RECORDS,
+    FLASH_REGION_OWNER_RESYNC,
+    FLASH_REGION_OWNER_TORN_TAIL,
+} flash_region_owner_t;
+
+flash_region_status_t flash_region_log_owner(flash_region_id_t id,
+                                             uint32_t torn_payload_max,
+                                             flash_region_owner_t *out);
+const char *flash_region_owner_name(flash_region_owner_t owner);
+
 /* ── Counters ────────────────────────────────────────────────────────
  * Cheap and worth having: "refused" climbing is how a caller with a bad address
  * gets noticed, and "elided" is how the no-op path is shown to be working. */

@@ -202,7 +202,8 @@ bool config_save(const device_config_t *cfg)
         return false;
     }
 #if !SETTINGS_PERSIST_WRITES
-    /* Writes disabled at build time (the default — see config.h). Bail before
+    /* Writes disabled at build time (not the default since 2026-08-20 — see
+     * config.h). Bail before
      * touching the region layer at all, so a disabled build issues no erase,
      * no program, and no CS assert on SPI2. Counted separately from failures:
      * this is a choice, not a fault. */
@@ -244,7 +245,27 @@ bool config_save(const device_config_t *cfg)
          * defaults, or on an older record if the erase was cut part-way — which
          * is why compaction is driven by "takes no more" and not by a
          * heuristic. buf is the newest setting, so nothing after the damage
-         * that the save would keep is lost. */
+         * that the save would keep is lost.
+         *
+         * OWNERSHIP FIRST (stage-170, review F-1). The window is free space
+         * inside stock FAT volume "2:", and ERR_LOG_DAMAGED is also what a
+         * window full of somebody else's bytes returns. Erase only when the
+         * window holds a record of ours, or nothing but one torn record of
+         * ours past the scan end (flash_regions.h, flash_region_log_owner()).
+         * Otherwise refuse: no erase, the settings stay in RAM. */
+        flash_region_owner_t owner = FLASH_REGION_OWNER_FOREIGN;
+        flash_region_status_t ost =
+            flash_region_log_owner(CONFIG_REGION, (uint32_t)sizeof(buf), &owner);
+        if (ost != FLASH_REGION_OK) {
+            g_stats.saves_failed++;
+            g_stats.last_save_status = (int32_t)ost;
+            return false;
+        }
+        if (owner == FLASH_REGION_OWNER_FOREIGN) {
+            g_stats.saves_refused_foreign++;
+            g_stats.last_save_status = (int32_t)st;
+            return false;
+        }
         flash_region_status_t rst = flash_region_reset(CONFIG_REGION);
         if (rst != FLASH_REGION_OK) {
             g_stats.saves_failed++;

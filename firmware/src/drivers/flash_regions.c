@@ -832,6 +832,92 @@ flash_region_status_t flash_region_log_info(flash_region_id_t id, uint32_t *byte
     return FLASH_REGION_OK;
 }
 
+const char *flash_region_owner_name(flash_region_owner_t owner)
+{
+    switch (owner) {
+    case FLASH_REGION_OWNER_FOREIGN:   return "foreign";
+    case FLASH_REGION_OWNER_RECORDS:   return "ours (valid records)";
+    case FLASH_REGION_OWNER_RESYNC:    return "ours (record past the damage)";
+    case FLASH_REGION_OWNER_TORN_TAIL: return "ours (one torn record)";
+    }
+    return "?";
+}
+
+/* See flash_regions.h. One pass over [scan end, region end) in IO_CHUNK reads:
+ * it looks for a resync record on the 4-byte grid and notes the last non-blank
+ * byte. Stack: one IO_CHUNK buffer, plus crc32_of_flash()'s one. */
+flash_region_status_t flash_region_log_owner(flash_region_id_t id, uint32_t torn_payload_max,
+                                             flash_region_owner_t *out)
+{
+    const flash_region_t *r = flash_region_get(id);
+    if (!g_ready) return FLASH_REGION_ERR_NOT_INIT;
+    if (r == NULL || out == NULL || r->kind != FLASH_REGION_KIND_APPEND) {
+        return FLASH_REGION_ERR_BAD_ARG;
+    }
+    *out = FLASH_REGION_OWNER_FOREIGN;
+
+    log_scan_t scan;
+    flash_region_status_t st = log_scan(r, &scan);
+    if (st != FLASH_REGION_OK) {
+        return st;
+    }
+    if (scan.valid_records > 0u) {
+        *out = FLASH_REGION_OWNER_RECORDS;
+        return FLASH_REGION_OK;
+    }
+
+    /* rec_total() keeps every record a multiple of 4, so the scan end is on
+     * the grid and so is every chunk start below. */
+    const uint32_t start = scan.next_offset;
+    bool     any_dirty  = false;
+    uint32_t last_dirty = 0u;
+    uint8_t  buf[IO_CHUNK];
+
+    for (uint32_t off = start; off < r->length; off += IO_CHUNK) {
+        uint32_t n = r->length - off;
+        if (n > IO_CHUNK) n = IO_CHUNK;
+        st = backend_read(r->start + off, buf, n);
+        if (st != FLASH_REGION_OK) {
+            return st;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            if (buf[i] != 0xFFu) {
+                any_dirty  = true;
+                last_dirty = off + i;
+            }
+        }
+        for (uint32_t i = 0; i + 4u <= n; i += 4u) {
+            uint32_t magic = (uint32_t)buf[i] | ((uint32_t)buf[i + 1u] << 8);
+            if (magic != REC_MAGIC) continue;
+            uint32_t len = (uint32_t)buf[i + 2u] | ((uint32_t)buf[i + 3u] << 8);
+            if (len == 0u || len > FLASH_REGION_RECORD_MAX) continue;
+            if (!range_fits(off + i, rec_total(len), r->length)) continue;
+
+            uint8_t hdr[REC_HDR_SIZE];
+            st = backend_read(r->start + off + i, hdr, REC_HDR_SIZE);
+            if (st != FLASH_REGION_OK) {
+                return st;
+            }
+            uint32_t want = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
+                            ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
+            uint32_t got = 0u;
+            st = crc32_of_flash(r->start + off + i + REC_HDR_SIZE, len, &got);
+            if (st != FLASH_REGION_OK) {
+                return st;
+            }
+            if (got == want) {
+                *out = FLASH_REGION_OWNER_RESYNC;
+                return FLASH_REGION_OK;
+            }
+        }
+    }
+
+    if (!any_dirty || last_dirty < start + rec_total(torn_payload_max)) {
+        *out = FLASH_REGION_OWNER_TORN_TAIL;
+    }
+    return FLASH_REGION_OK;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Stats
  * ═══════════════════════════════════════════════════════════════════ */

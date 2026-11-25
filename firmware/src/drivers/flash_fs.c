@@ -16,6 +16,7 @@
 #include "at32f403a_407.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
+#include "task.h"
 
 #include <string.h>
 
@@ -204,19 +205,75 @@ static bool raw_write_enable(void)   /* FUN_0802f344 + WEL confirm */
     return (sr1 != 0xFFu) && (sr1 & W25Q_STATUS_WEL) != 0u;
 }
 
+/* Busy-wait yield (stage-170, review S-5). A 4 KB sector erase keeps the W25Q
+ * busy for tens of ms, and a settings compaction erases up to 16 sectors
+ * (~0.9 s). The old poll spun the whole time with CS low and never yielded, so
+ * on the key task (priority 4) acquisition, USB and display all stopped. Now
+ * one spin lasts at most BUSY_SPIN_LIMIT_US; then, when the scheduler runs, CS
+ * goes high, the task sleeps one tick, and the poll starts again with a new
+ * RDSR. Safe because every SPI2 user goes through a public flash_fs_raw_*
+ * function, and each holds fs_mutex for its whole transaction (the _nolock
+ * cores only run under it): a task that runs during the sleep blocks on the
+ * mutex, it cannot reach the bus. Before the scheduler starts (boot) the poll
+ * spins as before. */
+#define BUSY_SPIN_LIMIT_US  1000u
+
+static uint32_t g_busy_yields;       /* sleeps taken inside raw_wait_busy()    */
+static uint32_t g_busy_max_spin_us;  /* longest one spin with CS low, measured
+                                        only while the scheduler runs          */
+
 static bool raw_wait_busy(void)      /* FUN_0802f11c: poll RDSR until BUSY clears */
 {
-    SPI_FLASH_CS_ASSERT();
-    flash_fs_raw_spi_xfer(W25Q_CMD_RDSR);
+    const bool may_yield = (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING);
+    uint32_t cyc_per_us = system_core_clock / 1000000u;
+    if (cyc_per_us == 0u) {
+        cyc_per_us = 1u;
+    }
+    /* CYCCNT is on from fault_init(); this keeps the measure honest if a build
+     * ever skips that. */
+    if ((DWT->CTRL & 1u) == 0u) {
+        CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+        DWT->CTRL |= 1u;
+    }
+
     /* Bounded poll: flash_fs_raw_spi_xfer returns 0xFF on its OWN timeout, and
      * 0xFF & BUSY == BUSY, so an unbounded loop would spin forever on any SPI
-     * fault and wedge the calling task. Guard covers a 4KB erase (~hundreds of
-     * ms) with huge margin, then bails so the system can never hang here. */
+     * fault and wedge the calling task. The guard counts RDSR reads over all
+     * spins (as before the yield), then bails so the system can never hang
+     * here. */
     uint32_t guard = 20000000u;
-    while ((flash_fs_raw_spi_xfer(0xFF) & W25Q_STATUS_BUSY) && --guard) { }
-    SPI_FLASH_CS_DEASSERT();
-    return guard != 0u;   /* false = still busy at guard expiry: erase/program
-                             did not complete (or the bus is dead) */
+    for (;;) {
+        const uint32_t t0 = DWT->CYCCNT;
+        uint32_t spin_us = 0u;
+        bool busy;
+
+        SPI_FLASH_CS_ASSERT();
+        flash_fs_raw_spi_xfer(W25Q_CMD_RDSR);
+        do {
+            busy = (flash_fs_raw_spi_xfer(0xFF) & W25Q_STATUS_BUSY) != 0u;
+            spin_us = (DWT->CYCCNT - t0) / cyc_per_us;
+        } while (busy && --guard != 0u && (!may_yield || spin_us < BUSY_SPIN_LIMIT_US));
+        SPI_FLASH_CS_DEASSERT();
+
+        if (may_yield && spin_us > g_busy_max_spin_us) {
+            g_busy_max_spin_us = spin_us;
+        }
+        if (!busy) {
+            return true;
+        }
+        if (guard == 0u) {
+            return false;   /* still busy at guard expiry: erase/program did not
+                               complete (or the bus is dead) */
+        }
+        g_busy_yields++;
+        vTaskDelay(1);
+    }
+}
+
+void flash_fs_busy_stats(uint32_t *yields, uint32_t *max_spin_us)
+{
+    if (yields)      *yields      = g_busy_yields;
+    if (max_spin_us) *max_spin_us = g_busy_max_spin_us;
 }
 
 static bool raw_sector_erase_nolock(uint32_t addr)   /* FUN_0802ee9c */

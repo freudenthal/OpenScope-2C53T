@@ -59,7 +59,8 @@
 /* All user-configurable settings.
  *
  * WHICH FIELDS ARE LIVE: settings_store.c captures and re-applies the scope
- * block, the theme, the math block and the meter block. The FFT, signal
+ * block, the theme, the math block, the meter block and (from stage-170)
+ * startup_mode, which replaced the MCU-flash record at 0x080FF800. The FFT, signal
  * generator, brightness, language, auto-shutdown and sound fields are stored
  * and round-tripped but NOT yet applied at boot — nothing in the firmware
  * currently owns them (there is no backlight PWM, and siggen is initialised
@@ -224,6 +225,11 @@ typedef struct {
                                 * of these stats never has to guess which build
                                 * produced them. */
     uint32_t compactions;      /* log full -> region reset -> re-append */
+    uint32_t saves_refused_foreign; /* the log took no more records and the
+                                * window does not hold our records
+                                * (flash_region_log_owner()): no erase, the
+                                * settings stay in RAM. Stage-170, F-1. Not
+                                * counted as saves_failed: a refusal we chose. */
     uint32_t loads_ok;
     uint32_t loads_defaulted;
     int32_t  last_save_status; /* flash_region_status_t of the last append */

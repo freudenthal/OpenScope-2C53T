@@ -77,6 +77,11 @@ flash_fs_error_t flash_fs_raw_write_block(uint32_t addr, const void *data, uint3
  * (bit1 = WEL should read 1). Reveals block-protect bits + whether write-enable latches. */
 flash_fs_error_t flash_fs_raw_status_diag(uint8_t out[4]);
 
+/* Busy-wait counters (stage-170, S-5): sleeps taken while the W25Q was busy,
+ * and the longest single spin with CS low (µs, scheduler running only).
+ * Either pointer may be NULL. Printed by `flash diag`. */
+void flash_fs_busy_stats(uint32_t *yields, uint32_t *max_spin_us);
+
 /* ═══════════════════════════════════════════════════════════════════
  * Factory calibration
  *

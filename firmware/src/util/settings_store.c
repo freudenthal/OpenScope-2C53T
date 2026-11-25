@@ -95,6 +95,12 @@ void settings_store_capture(device_config_t *cfg)
     cfg->meter_submode = meter_submode;
     cfg->meter_layout  = meter_layout;
 
+    /* Stage-170 (F-3): the startup mode lives in this record. Before, it had
+     * its own 16-byte record in MCU flash at 0x080FF800, and each change of
+     * the Settings row erased that sector. */
+    cfg->startup_mode = (startup_mode == STARTUP_SCOPE) ? CONFIG_MODE_OSCILLOSCOPE
+                                                        : CONFIG_MODE_MULTIMETER;
+
     stamp(cfg);
 }
 
@@ -131,6 +137,11 @@ void settings_store_apply(const device_config_t *cfg)
 
     meter_submode = clamp_idx(cfg->meter_submode, METER_SUBMODE_COUNT, 0);
     meter_layout  = clamp_idx(cfg->meter_layout, METER_LAYOUT_COUNT, METER_LAYOUT_FULL);
+
+    /* Only Scope and Meter are startup choices; anything else (signal gen,
+     * settings, a bad byte) is the default, Meter. */
+    startup_mode = (cfg->startup_mode == CONFIG_MODE_OSCILLOSCOPE) ? STARTUP_SCOPE
+                                                                   : STARTUP_METER;
 
     /* Deliberately NOT restored: ss->running (a scope always boots running),
      * the cursor state, and channel position — session state, not settings.

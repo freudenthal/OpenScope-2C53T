@@ -222,6 +222,53 @@ MUTATIONS: tuple[Mutation, ...] = (
         new="    (void)0;  /* mutant: meter_layout not restored */\n",
         expect_fail=("changes survive power cycles across compaction",),
     ),
+    Mutation(
+        # Stage-170 (F-3): the startup mode moved into the settings record.
+        name="startup_mode restore in settings_store_apply()",
+        file="src/util/settings_store.c",
+        old="    startup_mode = (cfg->startup_mode == CONFIG_MODE_OSCILLOSCOPE) ? STARTUP_SCOPE\n",
+        new="    (void)0; /* mutant */ startup_mode = (0) ? STARTUP_SCOPE\n",
+        expect_fail=("capture/apply round trip is symmetric",),
+    ),
+    # ── stage-170 (F-1): the ownership check before a reset ─────────────
+    Mutation(
+        # The F-1 defect itself: reset whatever the window holds.
+        name="foreign-window refusal in config_save()",
+        file="src/util/config.c",
+        old="        if (owner == FLASH_REGION_OWNER_FOREIGN) {\n",
+        new="        if (0) {  /* mutant: erase a foreign window */\n",
+        expect_fail=(
+            "a foreign window is never erased",
+            "a partly foreign window is never erased",
+            "foreign bytes one past a torn record are refused",
+        ),
+    ),
+    Mutation(
+        # Without the resync search, a log that starts at a damaged header
+        # can never compact again, though our record sits right after it.
+        name="resync search in flash_region_log_owner()",
+        file="src/drivers/flash_regions.c",
+        old="            if (got == want) {\n",
+        new="            if (0) { (void)got; (void)want;  /* mutant */\n",
+        expect_fail=("a damaged first header before a good record still compacts",),
+    ),
+    Mutation(
+        # Without the torn-tail rule, a header torn on an otherwise empty log
+        # (#57 on the first save) stops every later save.
+        name="torn-tail rule in flash_region_log_owner()",
+        file="src/drivers/flash_regions.c",
+        old="    if (!any_dirty || last_dirty < start + rec_total(torn_payload_max)) {\n",
+        new="    if (!any_dirty) {  /* mutant */ (void)last_dirty; (void)torn_payload_max;\n",
+        expect_fail=("a torn first record alone still compacts",),
+    ),
+    Mutation(
+        # Off by one at the edge of the torn-tail room.
+        name="torn-tail bound in flash_region_log_owner()",
+        file="src/drivers/flash_regions.c",
+        old="    if (!any_dirty || last_dirty < start + rec_total(torn_payload_max)) {\n",
+        new="    if (!any_dirty || last_dirty <= start + rec_total(torn_payload_max)) {  /* mutant */\n",
+        expect_fail=("foreign bytes one past a torn record are refused",),
+    ),
     # ── the test's own fault injection ──────────────────────────────────
     Mutation(
         # The cut "inside" an erase degrades to the old atomic model: the

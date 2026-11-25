@@ -2067,6 +2067,10 @@ static void cmd_flash_dump(const char *args)
 static void cmd_flash_diag(void)
 {
     uint8_t sr[4] = {0};
+    uint32_t busy_yields = 0, busy_max_spin_us = 0;
+    flash_fs_busy_stats(&busy_yields, &busy_max_spin_us);
+    usb_debug_printf("busy_yields=%lu busy_max_spin_us=%lu\r\n",
+                     (unsigned long)busy_yields, (unsigned long)busy_max_spin_us);
     if (flash_fs_raw_status_diag(sr) != FLASH_FS_OK) { usb_send_str("ERR: status diag\r\n"); return; }
     usb_debug_printf("SR1=0x%02X SR2=0x%02X SR3=0x%02X | SR1-after-WREN=0x%02X\r\n",
                      sr[0], sr[1], sr[2], sr[3]);
@@ -3367,6 +3371,12 @@ static void cmd_settings(void)
                      (unsigned long)cs->saves_failed,
                      (unsigned long)cs->saves_disabled,
                      (long)cs->last_save_status);
+    usb_debug_printf("saves_refused_foreign: %lu%s\r\n",
+                     (unsigned long)cs->saves_refused_foreign,
+                     cs->saves_refused_foreign
+                         ? "  (settings window holds data we did not write: not erased, "
+                           "settings kept in RAM only)"
+                         : "");
     usb_send_str("(a change carries only if a later button press or an "
                  "orderly power-off follows it - see settings_store.h)\r\n");
 }

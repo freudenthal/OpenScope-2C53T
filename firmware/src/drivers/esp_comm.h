@@ -183,14 +183,15 @@ typedef esp_meter_result_t (*esp_meter_fn)(esp_meter_snapshot_t *out);
  *   [4]      u8   channel         0 = CH1, 1 = CH2
  *   [5]      u8   flags           ESP_WAVE_FLAG_* below — derived HERE from the
  *                                 provider's facts, never copied from it
- *   [6]      u8   timebase_idx    reg 0x01 code IN FORCE in the FPGA (what the
- *                                 samples were taken at, not the display's) when
- *                                 the frame was requested: a record HELD across a
- *                                 timebase change (STOP, SINGLE, NORMAL with no
- *                                 crossing) is labelled with the new code, as on
- *                                 the LCD — the code is not yet published with
- *                                 the record
- *   [7]      u8   vdiv_idx        frontend range index of this channel
+ *   [6]      u8   timebase_idx    reg 0x01 code of THIS RECORD: the code in
+ *                                 force over its whole capture window, published
+ *                                 with the record (C-90, stage-240). A record held
+ *                                 across a timebase change (STOP, SINGLE, NORMAL
+ *                                 with no crossing) keeps the code it was taken
+ *                                 at; a read the change overlapped is never
+ *                                 published (src/dsp/acq_cfg.h)
+ *   [7]      u8   vdiv_idx        relay range index of this channel for THIS
+ *                                 record, published with it (stage-240)
  *   [8..9]   u16  sample_count    1024 today
  *   [10..11] u16  header_len      offset of samples[0] (§3.5's "reserved"):
  *                                 a host skips to it, so fields can be appended

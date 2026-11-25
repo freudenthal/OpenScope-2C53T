@@ -384,8 +384,9 @@ typedef struct {
     volatile uint32_t acq_edge_kept;       /* edge filter: strobed records of the chosen edge */
     volatile uint32_t acq_edge_dropped;    /* edge filter: strobed records of the other edge */
     volatile uint32_t acq_edge_unknown;    /* edge filter: not classifiable -> committed unfiltered */
-    volatile uint32_t acq_stop_stale_dropped; /* stage-082: records held across STOP, dropped on RUN */
-    volatile uint32_t acq_reprime_stale_dropped; /* stage-091: records held across a reg write, dropped */
+    volatile uint32_t acq_stop_stale_dropped; /* stage-082; stage-240: strobed reads dropped in a RUN window */
+    volatile uint32_t acq_reprime_stale_dropped; /* stage-091; stage-240: strobed reads dropped in a change window */
+    volatile uint32_t acq_window_roll_dropped; /* stage-240: AUTO roll reads dropped in a change window (A-1) */
     volatile uint32_t pc0_edges;           /* PC0 (data-ready) falling edges via EXINT0.
                                             * One per fresh ready event — the instrument
                                             * for engine cycle rate per trigger regime,
@@ -1167,6 +1168,9 @@ bool     fpga_acq_record_time_ordered(void);
  * stopped they can differ from the settings in force. */
 uint8_t  fpga_acq_record_rate_idx(void);
 uint8_t  fpga_acq_record_vdiv(uint8_t ch);
+/* stage-240: is a record-validity window open now (src/dsp/acq_cfg.h)? While
+ * it is, the acquisition task publishes no record. */
+bool     fpga_acq_window_open(void);
 /* true when this build creates the meter-waveform sampler task ("mtr_wave").
  * The coldtrace family does not, so its meter screen must not wait for
  * samples that never come (2026-09-30). */

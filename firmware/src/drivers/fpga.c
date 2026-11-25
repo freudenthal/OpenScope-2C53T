@@ -28,6 +28,7 @@
 #include "meter_data.h"
 #include "scope_trigger.h"
 #include "../dsp/trig_edge.h"
+#include "../dsp/acq_cfg.h"
 #include "../ui/ui.h"
 #include "../ui/scope_state.h"
 #include "../ui/scope_timebase.h"
@@ -1732,12 +1733,21 @@ static const uint8_t fpga_relay_tbl[10] = {
 #define FPGA_PB11_AS_CH2_RELAY 1
 #endif
 
+/* stage-240: the relay range in force per channel (0 = CH1), set only by the
+ * two writers below. A published record is labelled with it, not with the UI
+ * value, and a change of it opens a record-validity window (acq_cfg.h).
+ * ACQ_CFG_UNKNOWN until the first write, or after another path moved the
+ * relays (signal generator routing). */
+static volatile uint8_t acq_relay_range[2] = { ACQ_CFG_UNKNOWN, ACQ_CFG_UNKNOWN };
+static uint8_t fpga_acq_cfg_report(uint8_t forced, uint32_t extra_fill_ms);   /* below */
+
 static void fpga_set_ch1_frontend_range(uint8_t range_idx)
 {
     uint8_t b;
 
     if (range_idx >= 10) range_idx = 9;
     b = fpga_relay_tbl[range_idx];
+    acq_relay_range[0] = range_idx;
 
     if (b & 0x01) GPIOC->scr = (1U << 12); else GPIOC->clr = (1U << 12); /* PC12 */
     if (b & 0x02) GPIOE->scr = (1U << 4);  else GPIOE->clr = (1U << 4);  /* PE4  */
@@ -1751,6 +1761,7 @@ static void fpga_set_ch2_frontend_range(uint8_t range_idx)
 
     if (range_idx >= 10) range_idx = 9;
     b = fpga_relay_tbl[range_idx];
+    acq_relay_range[1] = range_idx;
 
     if (b & 0x01) GPIOA->scr = (1U << 15); else GPIOA->clr = (1U << 15); /* PA15 */
 #if FPGA_PB11_AS_CH2_RELAY
@@ -1791,6 +1802,9 @@ static void fpga_set_scope_frontend_ranges(const scope_state_t *ss)
     fpga_set_ch1_frontend_range(r1);
     fpga_set_ch2_frontend_range(r2);
     fpga_scope_frontend_enables();
+    /* stage-240: the mask may have moved and the relays may have been moved
+     * by another mode since the last write: a change whatever the ranges. */
+    (void)fpga_acq_cfg_report(ACQ_CHG_FRONTEND, 0u);
 }
 
 /* Bench-cal hook: apply one range index to a channel (ch 0 = CH1, 1 = CH2,
@@ -1812,6 +1826,7 @@ void fpga_scope_set_range_diag_ch(uint8_t ch, uint8_t range_idx)
                       fpga_set_ch2_frontend_range(range_idx); }
 
     fpga_scope_frontend_enables();
+    (void)fpga_acq_cfg_report(0u, 0u);       /* stage-240 (A-4): a range change opens a window */
 }
 
 void fpga_scope_set_range_diag(uint8_t range_idx)
@@ -3074,21 +3089,33 @@ static volatile uint8_t acq_rate_idx;              /* defined with its value bel
 static volatile uint8_t acq_pub_rate_idx = 0x08;
 static volatile uint8_t acq_pub_vdiv[2] = { 0, 0 };
 
-static void fpga_acq_frames_commit(void)
+/* stage-240 (A-1, A-4): the labels are the configuration noted BEFORE the
+ * read (rate code and relay ranges), not what is set at commit time; the
+ * acquisition task drops a read during which the configuration changed, so
+ * the labels describe the whole record. A vdiv of ACQ_CFG_UNKNOWN falls back
+ * to the UI value (the relays were never written by a scope path). */
+static void fpga_acq_frames_commit_as(uint8_t rate_idx, uint8_t vdiv1, uint8_t vdiv2)
 {
     if (acq_stage_ch1 == NULL || acq_stage_ch2 == NULL)
         return;   /* in-place fallback: nothing to copy */
     const scope_state_t *ss = scope_state_get();
+    if (ss != NULL) {
+        if (vdiv1 == ACQ_CFG_UNKNOWN) vdiv1 = ss->ch1.vdiv_idx;
+        if (vdiv2 == ACQ_CFG_UNKNOWN) vdiv2 = ss->ch2.vdiv_idx;
+    }
     acq_frame_gen++;                                   /* odd: committing */
     memcpy((void *)fpga.ch1_buf, acq_stage_ch1, FPGA_ADC_BUF_SIZE);
     memcpy((void *)fpga.ch2_buf, acq_stage_ch2, FPGA_ADC_BUF_SIZE);
     acq_pub_ordered = acq_stage_ordered;
-    acq_pub_rate_idx = acq_rate_idx;
-    if (ss != NULL) {
-        acq_pub_vdiv[0] = ss->ch1.vdiv_idx;
-        acq_pub_vdiv[1] = ss->ch2.vdiv_idx;
-    }
+    acq_pub_rate_idx = rate_idx;
+    if (vdiv1 != ACQ_CFG_UNKNOWN) acq_pub_vdiv[0] = vdiv1;
+    if (vdiv2 != ACQ_CFG_UNKNOWN) acq_pub_vdiv[1] = vdiv2;
     acq_frame_gen++;                                   /* even: stable */
+}
+
+static void fpga_acq_frames_commit(void)
+{
+    fpga_acq_frames_commit_as(acq_rate_idx, acq_relay_range[0], acq_relay_range[1]);
 }
 
 /* Publish (or refuse) one completed acquisition frame. `hw_to_before` is the
@@ -3530,6 +3557,12 @@ static volatile uint8_t acq_trig_src = 0;
  * stayed frozen after level +100 -> 0). The apply entry points raise this;
  * the acq task clears capture_in_flight on it and re-primes. */
 static volatile bool acq_reprime_req = false;
+/* stage-240 (A-1, A-4, A-6, P-15): the record-validity window. Writers report
+ * the configuration in force after each change (fpga_acq_cfg_report); the
+ * acquisition task asks acq_win_publish() before each commit. Shared between
+ * the writers (key, USB, shell tasks) and the acquisition task: every access
+ * is inside a critical section once the scheduler runs. */
+static acq_win_t acq_win;
 /* EXP-45 (2026-09-14): gap between the 0x04 and 0x05 reads of a pair. Shell
  * reads 50 ms apart each produce a PC0 edge; the task's back-to-back pair
  * (~140 us apart at /2) produces none, which is why NORMAL could not sustain
@@ -3599,6 +3632,70 @@ static volatile uint32_t acq_gate_skips = 0;   /* reads the gate prevented */
  * would have printed a confident, wrong s/div. fpga_apply_timebase() below
  * is now the single entry point, and the button calls it. */
 static volatile uint8_t acq_rate_idx     = 0x08;
+
+/* ── stage-240: report a configuration change to the record-validity window ── */
+static bool fpga_acq_sched_running(void)
+{
+    return xTaskGetSchedulerState() == taskSCHEDULER_RUNNING;
+}
+
+/* Coupling relay in force: PD12 (CH1) / PD13 (CH2) HIGH = DC; UNKNOWN when
+ * the pin is not a push-pull GPIO output (see fpga_apply_coupling). */
+static uint8_t fpga_acq_coupling_now(uint8_t ch)
+{
+    const uint32_t pin = ch ? 13u : 12u;
+    const uint32_t mode = (GPIOD->cfghr >> ((pin - 8u) * 4u)) & 0xFu;
+    if (mode != 0x1u && mode != 0x2u && mode != 0x3u)
+        return ACQ_CFG_UNKNOWN;
+    return ((GPIOD->odt >> pin) & 1u) ? (uint8_t)COUPLING_DC : (uint8_t)COUPLING_AC;
+}
+
+static void fpga_acq_cfg_now(acq_cfg_t *c)
+{
+    c->rate_idx    = acq_rate_idx;
+    c->vdiv[0]     = acq_relay_range[0];
+    c->vdiv[1]     = acq_relay_range[1];
+    c->coupling[0] = fpga_acq_coupling_now(0);
+    c->coupling[1] = fpga_acq_coupling_now(1);
+    c->trig_code   = acq_trig_code;
+    c->trig_src    = acq_trig_src;
+    c->fill_ms     = acq_cfg_fill_ms(scope_timebase_sample_rate(acq_rate_idx));
+}
+
+/* Report the configuration now in force (call it AFTER the hardware write).
+ * forced: kinds a comparison cannot see (RUN, REARM, a relay re-apply);
+ * extra_fill_ms: widen the window to this fill (RUN: the published record's).
+ * Any change asks for a re-prime, so the next read comes at once and is
+ * judged against the new window. Returns the kinds that changed. */
+static uint8_t fpga_acq_cfg_report(uint8_t forced, uint32_t extra_fill_ms)
+{
+    acq_cfg_t now;
+    fpga_acq_cfg_now(&now);
+    const uint32_t poll = acq_poll_gap_ms;
+    uint8_t k;
+    if (fpga_acq_sched_running()) {
+        taskENTER_CRITICAL();
+        k = acq_win_change(&acq_win, &now, forced, xTaskGetTickCount(), extra_fill_ms, poll);
+        taskEXIT_CRITICAL();
+    } else {
+        /* before the scheduler: a critical section would leave interrupts
+         * masked until it starts (FreeRTOS nesting count) */
+        k = acq_win_change(&acq_win, &now, forced, xTaskGetTickCount(), extra_fill_ms, poll);
+    }
+    if (k != 0u)
+        acq_reprime_req = true;
+    return k;
+}
+
+bool fpga_acq_window_open(void)
+{
+    bool open;
+    if (!fpga_acq_sched_running()) return acq_win_full_open(&acq_win, xTaskGetTickCount());
+    taskENTER_CRITICAL();
+    open = acq_win_full_open(&acq_win, xTaskGetTickCount());
+    taskEXIT_CRITICAL();
+    return open;
+}
 
 /* ── USART2 late bring-up (2026-08-17) ───────────────────────────────────
  *
@@ -3687,22 +3784,9 @@ uint16_t fpga_acq_post_edge_get(void)
     return (uint16_t)ms;
 }
 bool fpga_acq_post_edge_is_override(void) { return acq_post_edge_ms != 0; }
-/* stage-091: how long after a reg 0x01/0x06/0x08 write the first handover
- * can still come from the cycle that was armed before the write: one FPGA
- * cycle (EXP-72: fill + ~202 ms hold), plus one poll and a margin, so
- * 1024 samples + 250 ms + poll. Unmeasured rates: 1000 ms. (After a timebase
- * write the old rate decides; the new rate is used here.) Its only caller is
- * the warm-handoff acquisition task. */
-#if FPGA_WARM_HANDOFF_TEST
-static uint16_t fpga_acq_reprime_window_ms(void)
-{
-    float fs = scope_timebase_sample_rate(acq_rate_idx);
-    if (fs <= 0.0f) return 1000u;
-    float ms = 1024.0f / fs * 1000.0f + 250.0f + (float)acq_poll_gap_ms;
-    if (ms > 5000.0f) ms = 5000.0f;
-    return (uint16_t)ms;
-}
-#endif
+/* (stage-091's fpga_acq_reprime_window_ms() was here: 1024 samples + 250 ms
+ * + poll after a register write, first strobed record only. stage-240 moved
+ * the rule to src/dsp/acq_cfg.c, for every change and every read.) */
 /* EXP-48/49 (2026-09-14): from the edge until the bracket ends the FPGA holds
  * the completed record and ignores reads as arms, so the record can be read
  * (and committed) at edge + fill + margin instead of at the bracket's end;
@@ -3833,11 +3917,13 @@ static void fpga_scope_write_reg(uint8_t reg, uint8_t val)
 
 bool fpga_apply_timebase(uint8_t code)
 {
+    if (code == acq_rate_idx)
+        return true;            /* stage-240: no change, no write, no window */
     if (!fpga_acq_pause())
         return false;
     fpga_scope_write_reg(0x01, code);
     acq_rate_idx = code;
-    acq_reprime_req = true;
+    (void)fpga_acq_cfg_report(0u, 0u);       /* window at the slower rate; re-prime */
     fpga_acq_resume();
     return true;
 }
@@ -3862,6 +3948,11 @@ bool fpga_apply_trigger(int level, uint8_t src)
     if (src > 1u)
         return false;
     uint8_t code = fpga_trigger_code_from_level(level);
+    /* stage-240 (A-6): the same code and source is no change: no park, no
+     * write, no window (stage-230 A-8 did this for the host path only; the
+     * key path at a level limit wrote the same code on every repeat). */
+    if (code == acq_trig_code && src == acq_trig_src)
+        return true;
     if (!fpga_acq_pause())
         return false;
     if (src != acq_trig_src) {
@@ -3870,7 +3961,9 @@ bool fpga_apply_trigger(int level, uint8_t src)
     }
     fpga_scope_write_reg(0x08, code);
     acq_trig_code = code;
-    acq_reprime_req = true;
+    /* Source: a full window; level only: a level window that a held key
+     * does not keep open (acq_cfg.h). */
+    (void)fpga_acq_cfg_report(0u, 0u);
     fpga_acq_resume();
     return true;
 }
@@ -4003,9 +4096,6 @@ static void fpga_warmtest_acq_task(void *pv)
     uint32_t polls_since_handover = 0;
     trigger_mode_t last_mode = TRIG_AUTO;
     bool stopped = false;              /* stage-082: STOP holds the record */
-    bool after_stop = false;           /* first read after RUN: drop a held record */
-    bool after_reprime = false;        /* stage-091: inside the window after a register write */
-    uint32_t reprime_tick = 0;
     for (;;) {
         if (!fpga.initialized || fpga.bus_released) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -4046,9 +4136,14 @@ static void fpga_warmtest_acq_task(void *pv)
                 continue;
             }
             if (stopped) {
+                /* stage-240: RUN opens a full window (acq_cfg.h) at the
+                 * slower of the rate now and the published record's rate:
+                 * the FPGA may hold a record from before the STOP, or be
+                 * in a cycle armed before a change made while stopped. */
                 stopped = false;
-                after_stop = true;
                 capture_in_flight = false;
+                (void)fpga_acq_cfg_report(ACQ_CHG_RUN,
+                                          acq_cfg_fill_ms(scope_timebase_sample_rate(acq_pub_rate_idx)));
             }
         }
 
@@ -4096,11 +4191,9 @@ static void fpga_warmtest_acq_task(void *pv)
             single_done = false;
             last_mode = mode_now;
         }
-        if (acq_reprime_req) {                 /* a register write dropped the capture */
+        if (acq_reprime_req) {                 /* a change: read at once, judge by the window */
             acq_reprime_req = false;
             capture_in_flight = false;
-            after_reprime = true;
-            reprime_tick = xTaskGetTickCount();
         }
         if (mode_now == TRIG_SINGLE && single_done) {
             vTaskDelay(pdMS_TO_TICKS(10));     /* hold the one record */
@@ -4159,6 +4252,16 @@ static void fpga_warmtest_acq_task(void *pv)
          * one is committed atomically in fpga_acq_frames_commit(). */
         volatile uint8_t *w1 = acq_write_ch1();
         volatile uint8_t *w2 = acq_write_ch2();
+        /* stage-240: note the window generation and the labels BEFORE the
+         * read; a change during the read moves gen and the read is dropped. */
+        uint32_t gen_at_read;
+        uint8_t rec_rate, rec_vdiv1, rec_vdiv2;
+        taskENTER_CRITICAL();
+        gen_at_read = acq_win.gen;
+        rec_rate  = acq_win.primed ? acq_win.cfg.rate_idx : acq_rate_idx;
+        rec_vdiv1 = acq_win.primed ? acq_win.cfg.vdiv[0] : ACQ_CFG_UNKNOWN;
+        rec_vdiv2 = acq_win.primed ? acq_win.cfg.vdiv[1] : ACQ_CFG_UNKNOWN;
+        taskEXIT_CRITICAL();
         fpga.arm_read_cyc = DWT->CYCCNT;
         uint8_t s1 = fpga_warmtest_read_channel(0x04, w1);
         if (acq_pair_gap_ms) vTaskDelay(pdMS_TO_TICKS(acq_pair_gap_ms));
@@ -4197,32 +4300,6 @@ static void fpga_warmtest_acq_task(void *pv)
             polls_since_handover++;
             fpga.acq_poll_reads++;
         }
-        if (after_stop) {                      /* stage-082: first read after RUN */
-            after_stop = false;
-            if (triggered) {
-                fpga.acq_stop_stale_dropped++; /* the record held across STOP */
-                continue;
-            }
-        }
-        /* stage-091: the FPGA applies a reg 0x06 write from its NEXT cycle:
-         * the first handover after the write still comes from the cycle that
-         * was armed before it. Bench at 0x12, Normal, source CH2 -> CH1 with
-         * the level kept: 4/4 times one record with its crossing on CH2 came
-         * 560-590 ms after the write (one cycle = fill 410 ms + ~202 ms hold);
-         * a 512-sample window (089f2c2) and "first read only" (b28d078)
-         * missed it. Drop the first strobed record inside one cycle of the
-         * write, and only that one, as the record held across STOP is
-         * dropped. If the FPGA was in its hold at the write, this drops one
-         * good record. */
-        if (after_reprime) {
-            if ((int32_t)(last_read_tick - reprime_tick) >= (int32_t)fpga_acq_reprime_window_ms()) {
-                after_reprime = false;
-            } else if (triggered) {
-                after_reprime = false;
-                fpga.acq_reprime_stale_dropped++;
-                continue;
-            }
-        }
         if (!triggered) {
             if (auto_mode && acq_gate_enable) {
                 acq_gate_skips++;                /* GATE ON: never show the roll */
@@ -4238,6 +4315,27 @@ static void fpga_warmtest_acq_task(void *pv)
             }
             /* AUTO fallback: no handover for a whole budget — show the
              * free-running buffer so a quiet or off-level input still moves. */
+        }
+        /* stage-240 (A-1, A-4, A-6; replaces the stage-082 after_stop and
+         * stage-091 after_reprime drops). A read that would be committed is
+         * published only if the configuration was stable over its window
+         * (src/dsp/acq_cfg.h): inside a full window (timebase, range,
+         * coupling, source, RUN, re-arm) nothing is published, strobed or
+         * not -- before, the first read after a re-prime was committed in
+         * AUTO even when it was the rolling buffer from before the change. */
+        {
+            acq_pub_t pub;
+            bool run_window;
+            taskENTER_CRITICAL();
+            pub = acq_win_publish(&acq_win, gen_at_read, last_read_tick, triggered);
+            run_window = (acq_win.kinds & ACQ_CHG_RUN) != 0u;
+            taskEXIT_CRITICAL();
+            if (pub != ACQ_PUB_OK) {
+                if (!triggered)       fpga.acq_window_roll_dropped++;
+                else if (run_window)  fpga.acq_stop_stale_dropped++;
+                else                  fpga.acq_reprime_stale_dropped++;
+                continue;
+            }
         }
         /* Edge filter (2026-09-22). A strobed record whose trigger crossing
          * runs the wrong way is handled exactly like a read that found the
@@ -4286,7 +4384,7 @@ static void fpga_warmtest_acq_task(void *pv)
         if ((marker || varies) && fpga.spi3_hw_timeouts == hw_to_before) {
             fpga.acq_last_rot = fpga_acq_unrotate_staging(triggered);   /* dev plan 2.3: seam-based */
             acq_stage_ordered = acq_unrotate && fpga.acq_last_rot >= 0;
-            fpga_acq_frames_commit();
+            fpga_acq_frames_commit_as(rec_rate, rec_vdiv1, rec_vdiv2);
             /* Judge (or teach from) the record just committed: exactly once,
              * from the published buffers, in the only task that writes them. */
             scope_mask_on_commit(fpga.ch1_buf, fpga.ch2_buf, triggered,
@@ -4904,6 +5002,11 @@ uint8_t fpga_bitbang_config_sequence(void)
         SPI3_CS_DEASSERT();
     }
     fpga_reconcile_timebase_after_arm();
+    /* stage-240 (A-9): the arm burst writes 06 00 and 08 AD; hand both back
+     * to the UI source and level, as the boot does (main.c), and open a
+     * window: the acq task is suspended here, so bare writes are correct. */
+    fpga_reconcile_trigger_after_arm();
+    (void)fpga_acq_cfg_report(ACQ_CHG_REARM, 0u);
     spi3_set_br(0);                      /* restore /2 for normal acquisition */
 #endif
 
@@ -4979,6 +5082,7 @@ void fpga_reconcile_timebase_after_arm(void)
         acq_rate_idx     = 0x08;
         fpga_tb_reconcile_action = 2u;
     }
+    (void)fpga_acq_cfg_report(0u, 0u);       /* stage-240 */
 }
 
 /* Trigger sibling of the reconcile above (EXP-41): the arm burst leaves reg
@@ -5005,6 +5109,7 @@ void fpga_reconcile_trigger_after_arm(void)
     spi3_xfer(src);
     SPI3_CS_DEASSERT();
     acq_trig_src = src;
+    (void)fpga_acq_cfg_report(0u, 0u);       /* stage-240 */
 }
 
 /* Vertical sibling of the reconcile above: fpga_init() applies the frontend
@@ -5051,6 +5156,7 @@ bool fpga_apply_coupling(uint8_t ch, uint8_t coupling)
     if (c == COUPLING_DC) GPIOD->scr = (1u << pin);
     else                  GPIOD->clr = (1u << pin);
     const bool high = (GPIOD->odt >> pin) & 1u;
+    (void)fpga_acq_cfg_report(0u, 0u);       /* stage-240 (A-4): a coupling change opens a window */
     return high == (c == COUPLING_DC);
 }
 
@@ -5466,6 +5572,8 @@ uint8_t fpga_spi3_config_sequence(const fpga_cfg_seq_opts_t *opt)
     SPI3_CS_DEASSERT();
 
     fpga_reconcile_timebase_after_arm();
+    fpga_reconcile_trigger_after_arm();      /* stage-240 (A-9), as in the bit-bang sequence */
+    (void)fpga_acq_cfg_report(ACQ_CHG_REARM, 0u);
 
     spi3_set_br(0);                      /* restore /2 (60MHz) for normal acq */
 
@@ -6850,6 +6958,7 @@ void fpga_enter_siggen_mode(void)
     GPIOE->clr = (1U << 4);   /* PE4 LOW — clear range select */
     GPIOE->clr = (1U << 5);   /* PE5 LOW */
     GPIOE->clr = (1U << 6);   /* PE6 LOW */
+    acq_relay_range[0] = ACQ_CFG_UNKNOWN;    /* stage-240: CH1 relays no longer a scope range */
 }
 
 /*

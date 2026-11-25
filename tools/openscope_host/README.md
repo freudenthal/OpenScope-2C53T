@@ -97,8 +97,11 @@ python3 -m openscope update check --manifest FILE                # does the unit
    manifest the image is refused, unless you give `--allow-unlisted`.
 2. **backup**: the unit must be on USB power (STATUS charging flag, or battery at least 30 %).
    The tool makes a backup (as `openscope backup`), verifies it, and checks that its unit ID is
-   the unit ID that the firmware reports. The unit must run an image with a unit identity
-   (API level 1 or higher).
+   the unit ID that the firmware reports. An older image with no unit identity (API level 0, or
+   an image with the shell only, such as release v0.4.1) has no second source of the ID: there
+   the USB serial of the port must be the serial made from the ID that `mem read` gives. On a
+   shell-only image the tool sends no binary request after the first probe, and it cannot read
+   the battery (the CDC port shows that USB is connected).
 3. **enter upgrade mode** (you): keep USB connected, hold MENU and tap Power, keep MENU held
    until the upgrade screen shows. If it does not show (an image with no input task), hold MENU,
    press the pinhole reset and keep MENU held 3–5 s. The tool waits for the `IAP` drive. Press
@@ -114,7 +117,8 @@ python3 -m openscope update check --manifest FILE                # does the unit
 6. **wait**: the drive must go (the unit restarts) and the port must come back within 60 s. If
    the drive stays, the copy did not complete: enter upgrade mode again and run the update again.
 7. **verify**: the firmware text, build target, git revision and API level must be the
-   manifest's. A second backup goes into the same unit folder; the cal block (`0x025`–`0x12E`)
+   manifest's (an image with the shell only: the `version` Build time, and API level 0 in the
+   manifest). A second backup goes into the same unit folder; the cal block (`0x025`–`0x12E`)
    must be equal to the first backup.
 8. **log**: `update_<date_time>.json` in the backup folder (each step with its time, the
    manifest, the results).
@@ -123,10 +127,44 @@ A unit that is already in upgrade mode and has no port (recovery) also gets the 
 looks for a verified backup on disk with the drive's USB serial. With no such backup it stops,
 unless you give `--no-backup-ack "I HAVE NO BACKUP"`.
 
+### The start states
+
+| The unit runs | Command | Backup |
+|---|---|---|
+| OpenScope with the binary protocol | `openscope update --manifest FILE` | before the copy, over the shell; unit ID from section 7 |
+| An old OpenScope image with the shell only (v0.4.1) | the same command | before the copy, over the shell; unit ID from `mem read`, checked against the USB serial |
+| The stock FNIRSI firmware (first install) | `openscope update --first-install --manifest FILE` | right after the first OpenScope boot, before any key press |
+| OpenScope, and you want the stock firmware back | `openscope update --stock-image FILE` | before the copy |
+
+**First install from stock.** The stock firmware has no command channel, so the tool cannot read
+the calibration before OpenScope boots. Before you start, copy the stock files that you want
+to keep (screenshots, saved waveforms) from the stock USB Sharing drive to your computer: the
+first OpenScope save can need the W25Q area `0xD00000`–`0xFFFFFF`. The tool asks you to confirm
+the model (2C53T only) and to type `INSTALL` (or give `--model 2C53T --install-ack INSTALL`).
+Then put the unit in upgrade mode (hold MENU, tap Power). After the copy OpenScope starts:
+**do not press a key and do not turn the unit off until the tool says that the backup is
+done.** OpenScope writes the cal page only in `cal restore`, and it writes the W25Q only after
+a key press. The tool backs up the cal page and the W25Q area `0xD00000`–`0xFFFFFF` (about two
+minutes), checks that the USB serial of the unit is the serial of the IAP drive, and keeps this
+backup as the first reference of the unit. Then it asks you to restart the unit one time (the
+pinhole reset, or off and on), backs up the cal page again and compares the cal block. If a
+backup of this unit is already on disk, the first backup is compared with it too.
+
+**Back to stock.** Give your own copy of the FNIRSI file (this tool does not include it). Its
+SHA-256 must be on the stock allow-list (`openscope.firmware.STOCK_ALLOW`; now V1.2.0,
+`APP_2C53T_V1.2.0_251015.bin`, `a17c5c35…0c760`). The size and vector checks stay; only the
+stock refusals of the normal path are left out. The tool backs up the unit first, as for an
+update, and copies the file. No port comes back after the copy: the tool asks you to look at the
+unit (the stock screen, Settings > About 1.2.0). The stock firmware rewrites the header and the
+tail of the cal page after it boots; the cal block (`0x025`–`0x12E`) does not change, so a later
+compare checks only the cal block. The W25Q backup of a first install is not written back: put
+your stock files back through USB Sharing.
+
 Exit codes: 0 updated and verified; 1 no unit found; 2 refused (nothing written), a failure, or
-verify found differences. From Python: `openscope.update.run_update()`, `openscope.firmware`
-(`Manifest`, `make_manifest`, `check_image`, `check_running`) and `openscope.iapdrive`
-(`find_iap_drive`, `copy_image`). Library version 0.5.0 adds these. The drive search works on
+verify found differences. From Python: `openscope.update.run_update()`, `run_first_install()`,
+`run_stock_install()`, `probe_firmware()`, `openscope.firmware` (`Manifest`, `make_manifest`,
+`check_image`, `check_running`, `check_running_shell`, `check_stock_image`) and `openscope.iapdrive`
+(`find_iap_drive`, `copy_image`). Library version 0.5.0 adds these; 0.6.0 adds the stage-205 paths. The drive search works on
 Windows only.
 
 ## GUI (`openscope-gui`)

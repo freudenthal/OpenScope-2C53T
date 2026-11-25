@@ -18,6 +18,11 @@ Stable API (the update flow and the GUI call these):
         Empty list = the image may go to the unit.
     check_running(manifest, fw_version, identity) -> [difference, ...]
         Empty list = the unit runs the build of the manifest.
+    check_running_shell(manifest, version_text) -> [difference, ...]
+        The same for an image with the shell only (API level 0): the shell
+        `version` Build text against the manifest build time.
+    check_stock_image(data, allowed=None) -> [refusal, ...]
+        The return-to-stock path: SHA-256 on STOCK_ALLOW, size and vectors.
 
 Builds are not reproducible (the image holds __DATE__ __TIME__): a rebuild
 of the same commit has a new SHA-256 and a new build time.
@@ -45,6 +50,12 @@ KNOWN_STOCK = {
     "a17c5c35c97bb898f15672a1747bc1041d8ed507c16999ddba0d1e4e2ec0c760":
         "FNIRSI stock firmware V1.2.0 (APP_2C53T_V1.2.0_251015.bin)",
 }
+
+# Stock images that the return-to-stock path (update.run_stock_install())
+# accepts. The file is FNIRSI's: the user supplies it, this tool never ships it.
+# Add an entry only for a file whose SHA-256 is checked against FNIRSI's own
+# download. check_stock_image() also takes another table (`allowed`).
+STOCK_ALLOW = dict(KNOWN_STOCK)
 
 TARGET_RE = re.compile(r"^guest(?:-[a-z0-9]+)*$")
 TEST_ONLY_TARGETS = ("faulttest", "caldump")   # never leave a unit on these (testing.md C-180)
@@ -218,6 +229,16 @@ def check_image(data: bytes, manifest: Optional[Manifest], allow_unlisted: bool 
             out.append(f"manifest target {manifest.target!r} is not a 2C53T guest target")
         elif any(t in manifest.target.split("-") for t in TEST_ONLY_TARGETS):
             out.append(f"manifest target {manifest.target} is a test image, not for a user unit")
+    out += _size_and_vectors(data)
+    if len(data) < 8:
+        return out
+    return _check_text(data, manifest, out)
+
+
+def _size_and_vectors(data: bytes) -> List[str]:
+    """The size ceiling and the I-10 vector checks (initial SP in SRAM, a
+    Thumb reset vector inside the image, at or above the guest base)."""
+    out: List[str] = []
     if len(data) > MAX_SIZE:
         out.append(f"size {len(data):,} B is more than {MAX_SIZE:,} B "
                    f"(0x{GUEST_BASE:08X}..0x{FLASH_CEILING:08X})")
@@ -235,6 +256,10 @@ def check_image(data: bytes, manifest: Optional[Manifest], allow_unlisted: bool 
     elif entry >= GUEST_BASE + len(data):
         out.append(f"reset vector 0x{rv:08X} is past the end of the image "
                    f"(0x{GUEST_BASE + len(data):08X})")
+    return out
+
+
+def _check_text(data: bytes, manifest: Optional[Manifest], out: List[str]) -> List[str]:
     info = read_build_info(data)
     if not info.openscope_text:
         out.append("the image holds no 'OpenScope' text: not an OpenScope application")
@@ -246,6 +271,21 @@ def check_image(data: bytes, manifest: Optional[Manifest], allow_unlisted: bool 
     if manifest is not None and info.targets and manifest.target not in info.targets:
         out.append(f"the image says it is {', '.join(info.targets)}, the manifest says {manifest.target}")
     return out
+
+
+def check_stock_image(data: bytes, allowed: Optional[dict] = None) -> List[str]:
+    """Every reason not to copy this file on the return-to-stock path. The
+    SHA-256 must be on `allowed` (default STOCK_ALLOW). Only the stock-hash
+    and the OpenScope-text refusals of check_image() are left out: the size
+    and the vector checks stay. [] = may copy."""
+    allowed = STOCK_ALLOW if allowed is None else allowed
+    out: List[str] = []
+    sha = hashlib.sha256(data).hexdigest()
+    if sha not in allowed:
+        known = ", ".join(allowed.values()) or "empty"
+        out.append(f"SHA-256 {sha} is not on the stock allow-list ({known}): the return to stock "
+                   "takes only a known FNIRSI stock file")
+    return out + _size_and_vectors(data)
 
 
 def check_running(manifest: Manifest, fw_version: Optional[str], identity) -> List[str]:
@@ -269,4 +309,22 @@ def check_running(manifest: Manifest, fw_version: Optional[str], identity) -> Li
         out.append(f"git revision {identity.git_rev!r} is not {manifest.git_rev!r}")
     if identity.api_level != manifest.api_level:
         out.append(f"API level {identity.api_level} is not {manifest.api_level}")
+    return out
+
+
+def check_running_shell(manifest: Manifest, version_text: str) -> List[str]:
+    """Differences between the manifest and an image that answers on the
+    shell only (no binary protocol, no section 7): the shell `version`
+    "Build: <date> <time>, gcc" text against the manifest build time.
+    [] = the unit runs this build."""
+    out: List[str] = []
+    b = _BUILD_LINE.search((version_text or "").encode("utf-8", "replace"))
+    got = f"{b.group(1).decode()} {b.group(2).decode()}" if b else None
+    if manifest.build_time is None:
+        out.append("the manifest has no build time: cannot compare")
+    elif got != manifest.build_time:
+        out.append(f"shell Build time {got!r} is not {manifest.build_time!r}")
+    if manifest.api_level > 0:
+        out.append(f"the unit answers on the shell only (no binary protocol); the manifest says "
+                   f"API level {manifest.api_level}")
     return out

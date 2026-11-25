@@ -536,20 +536,28 @@ class TestFlow(unittest.TestCase):
         self.unit.flags, self.unit.pct = 0, 95                   # full battery: accepted
         self.assertTrue(self.run_update().ok)
 
-    def test_api_level_0_refused(self):
+    def test_api_level_0_uses_the_mem_read_uid(self):
+        """No section 7 (an image before stage-190): the unit ID comes from
+        `mem read`, tied to the unit by the port's USB serial (stage-205)."""
         self.unit.ident = None
 
         def no_ident(cmd, _orig=self.unit._answer_frame):
-            if cmd == proto.CMD_GET_DESCRIPTION:
+            if cmd == proto.CMD_GET_DESCRIPTION and self.unit.ident is None:   # until the flash
                 self.unit.frames.append(cmd)
                 self.unit.rx += proto.encode(proto.RSP_DESCRIPTION,
                                              proto.encode_description(proto.Description(version=1)))
                 return
             _orig(cmd)
         self.unit._answer_frame = no_ident
-        with self.assertRaisesRegex(up.Refused, "no unit identity"):
+        r = self.run_update()
+        self.assertTrue(r.ok, r.problems)
+        log = json.loads(r.log.read_text())
+        self.assertEqual(log["before"]["api_level"], 0)
+        self.assertTrue(any("from `mem read`" in d for s in log["steps"] for d in s["detail"]))
+        self.unit.ident = None
+        self.bench.ports = lambda: [("FAKE7", "FFFF00000000")] if self.bench.state == "app" else []
+        with self.assertRaisesRegex(up.Refused, "serial made from the unit ID"):
             self.run_update()
-        self.assert_nothing_copied()
 
     def test_drive_serial_mismatch_refused(self):
         self.bench.probe = lambda: [drive(self.bench.drive_dir, usb_serial="FFFF00000000")] \

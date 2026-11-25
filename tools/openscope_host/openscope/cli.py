@@ -533,11 +533,18 @@ def _update(a) -> int:
             print(f"differs   {d}")
         print("result    " + ("the unit runs this build" if not diffs else "NOT this build"))
         return EXIT_OK if not diffs else EXIT_DEVICE_ERROR
-    data, m, name = _load_update_files(a)
+    if a.first_install and a.stock_image:
+        raise ValueError("give --first-install or --stock-image, not both")
     try:
-        r = up.run_update(data, m, name, port=a.port, drive=a.drive, backup_root=a.backup_root,
-                          allow_unlisted=a.allow_unlisted, no_backup_ack=a.no_backup_ack,
-                          report=_update_event)
+        if a.stock_image:
+            r = _update_stock(a, up)
+        elif a.first_install:
+            r = _update_first_install(a, up)
+        else:
+            data, m, name = _load_update_files(a)
+            r = up.run_update(data, m, name, port=a.port, drive=a.drive, backup_root=a.backup_root,
+                              allow_unlisted=a.allow_unlisted, no_backup_ack=a.no_backup_ack,
+                              report=_update_event)
     except up.Refused as e:
         print(f"refused: {e} (nothing was written to the unit)", file=sys.stderr)
         if e.log:
@@ -560,12 +567,49 @@ def _update(a) -> int:
         print(f"          {line}")
     for p in r.problems:
         print(f"differs   {p}", file=sys.stderr)
-    print(f"backup    before {r.before_backup or 'none'}, after {r.after_backup}")
+    print(f"backup    before {r.before_backup or 'none'}, after {r.after_backup or 'none'}")
     print(f"log       {r.log}")
     print(f"time      {r.seconds:.0f} s ({r.seconds - r.user_wait_seconds:.0f} s without user waits)")
-    print("result    " + ("updated and verified" if r.ok
+    done = {"S": "stock image installed, the user confirmed the stock screen",
+            "F": "first install done: backup made before any key press, verified after a restart"}
+    print("result    " + (done.get(r.path, "updated and verified") if r.ok
                           else "the image was copied, but verify found differences"))
     return EXIT_OK if r.ok else EXIT_DEVICE_ERROR
+
+
+def _ask(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        return ""
+
+
+def _update_first_install(a, up):
+    """`openscope update --first-install`: the unit runs the stock firmware."""
+    data, m, name = _load_update_files(a)
+    print("First install of OpenScope on a unit that runs the stock FNIRSI firmware.")
+    print(f"* {up.STOCK_FILES_TEXT}")
+    print(f"* {up.NO_KEYS_TEXT}")
+    print(f"* This image is for the FNIRSI {up.MODEL} only.", flush=True)
+    model = a.model if a.model is not None else _ask(
+        f"Type the model on the label of the unit ({up.MODEL}): ")
+    ack = a.install_ack if a.install_ack is not None else _ask(
+        f"Type {up.FIRST_INSTALL_ACK} to install OpenScope: ")
+    return up.run_first_install(data, m, name, model=model, install_ack=ack, drive=a.drive,
+                                backup_root=a.backup_root, allow_unlisted=a.allow_unlisted,
+                                report=_update_event)
+
+
+def _update_stock(a, up):
+    """`openscope update --stock-image FILE`: back to the stock firmware."""
+    from pathlib import Path
+    image = Path(a.stock_image)
+
+    def confirm(text: str) -> bool:
+        answer = _ask("Does the unit show the stock screen and stock version? [y/N] ")
+        return answer.strip().lower() in ("y", "yes")
+    return up.run_stock_install(image.read_bytes(), image.name, port=a.port, drive=a.drive,
+                                backup_root=a.backup_root, confirm=confirm, report=_update_event)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -615,6 +659,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--live", action="store_true", help="compare with the unit that is connected")
     p = sub.add_parser("update", help="install a firmware image through the factory IAP drive "
                                       "(backup first, then the user enters upgrade mode); "
+                                      "--first-install from stock, --stock-image back to stock; "
                                       "also: update check --manifest FILE")
     p.add_argument("--manifest", metavar="FILE", help="image manifest (<image>.manifest.json)")
     p.add_argument("--image", metavar="FILE", help="image file (its manifest is read from "
@@ -627,6 +672,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-backup-ack", metavar="TEXT",
                    help="unit already in upgrade mode with no backup on disk: give the exact text "
                         "'I HAVE NO BACKUP' to go on")
+    p.add_argument("--first-install", action="store_true",
+                   help="the unit runs the stock FNIRSI firmware: install OpenScope, back up at "
+                        "once after the first boot (cal page and W25Q), verify after a restart")
+    p.add_argument("--model", help="--first-install: the model on the unit's label (2C53T); "
+                                   "asked when not given")
+    p.add_argument("--install-ack", metavar="TEXT",
+                   help="--first-install: the text INSTALL; asked when not given")
+    p.add_argument("--stock-image", metavar="FILE",
+                   help="go back to the stock firmware with your own FNIRSI file (its SHA-256 must "
+                        "be a known stock version); the backup comes first")
     usub = p.add_subparsers(dest="update_cmd")
     c = usub.add_parser("check", help="compare the running firmware with a manifest")
     c.add_argument("--manifest", dest="check_manifest", metavar="FILE", required=True)

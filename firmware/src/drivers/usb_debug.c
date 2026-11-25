@@ -2155,12 +2155,26 @@ restore:
 }
 
 /*
- * Factory-cal self-protection (src/util/cal_backup.c).
- *   cal status              report the MCU cal page and the W25Q backup
- *   cal backup              copy the MCU cal page to the W25Q (safe: W25Q only)
- *   cal restore [force] CONFIRM   write the W25Q backup back to MCU flash
- * Restore refuses to overwrite a programmed (precious) page unless `force`.
+ * Factory-cal self-protection (src/util/cal_backup.c), two W25Q slots
+ * (stage-175): A = first valid backup (never erased by `cal backup` once
+ * valid), B = later copies.
+ *   cal status                    report the MCU cal page, the UID, both slots
+ *   cal backup                    copy the MCU cal page to the slot the core
+ *                                 picks (A when empty, else B; refuses a page
+ *                                 whose cal block differs from slot A)
+ *   cal backup force              as above, but a different cal block goes to B
+ *   cal restore [a|b] [force] CONFIRM   write a slot back to MCU flash
+ * Restore refuses another unit's backup, a blank backup cal block, and a
+ * programmed (precious) live page unless `force`.
  */
+static void cal_print_uid(const char *prefix, const uint8_t *u)
+{
+    usb_debug_printf("%s%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X",
+                     prefix,
+                     u[3], u[2], u[1], u[0], u[7], u[6], u[5], u[4],
+                     u[11], u[10], u[9], u[8]);
+}
+
 static void cmd_cal_status(void)
 {
     cal_backup_report_t r;
@@ -2168,32 +2182,84 @@ static void cmd_cal_status(void)
         usb_send_str("cal status: read failed\r\n");
         return;
     }
-    usb_debug_printf("live  @0x%08lX  %-14s crc=0x%08lX\r\n",
+    usb_debug_printf("live   @0x%08lX  %s  crc=0x%08lX  block 0x025-0x12E %s crc=0x%08lX\r\n",
                      (unsigned long)CAL_BACKUP_SRC_ADDR,
-                     cal_page_class_str(r.live_class),
-                     (unsigned long)r.live_crc);
-    if (!r.backup_present) {
-        usb_send_str("backup: region unreadable\r\n");
-    } else if (r.backup_status != CAL_REC_OK) {
-        usb_debug_printf("backup: %s (no valid record)\r\n",
-                         cal_rec_status_str(r.backup_status));
-    } else {
-        usb_debug_printf("backup: valid v%u  payload_crc=0x%08lX  src=0x%08lX\r\n",
-                         (unsigned)r.backup_version,
-                         (unsigned long)r.backup_payload_crc,
-                         (unsigned long)r.backup_src_addr);
-        usb_debug_printf("match : %s\r\n", r.match ? "yes (live == backup)"
-                                                   : "NO (live differs from backup)");
+                     cal_page_class_str(r.live.page_class),
+                     (unsigned long)r.live.payload_crc,
+                     cal_page_class_str(r.live.block_class),
+                     (unsigned long)r.live.block_crc);
+    cal_print_uid("uid    ", r.uid);
+    usb_send_str("\r\n");
+
+    for (uint32_t i = 0; i < CAL_SLOT_COUNT; i++) {
+        const cal_slot_info_t *s = &r.slot[i];
+        usb_debug_printf("slot %s @0x%06lX: ", cal_slot_name((cal_slot_id_t)i),
+                         (unsigned long)cal_slot_addr((cal_slot_id_t)i));
+        if (!r.slot_read_ok[i]) {
+            usb_send_str("region unreadable\r\n");
+            continue;
+        }
+        if (s->state == CAL_SLOT_EMPTY) {
+            usb_send_str("empty\r\n");
+            continue;
+        }
+        if (s->state != CAL_SLOT_VALID) {
+            usb_debug_printf("damaged (%s)\r\n", cal_rec_status_str(s->rec_status));
+            continue;
+        }
+        usb_debug_printf("valid v%u  ", (unsigned)s->hdr.version);
+        if (s->hdr.uid_known) {
+            cal_print_uid("uid ", s->hdr.uid);
+            usb_send_str(memcmp(s->hdr.uid, r.uid, CAL_UID_LEN) == 0 ? " (this unit)"
+                                                                     : " (OTHER UNIT)");
+        } else {
+            usb_send_str("uid unknown");
+        }
+        usb_debug_printf("\r\n         payload_crc=0x%08lX  block_crc=0x%08lX  block==live: %s  page==live: %s\r\n",
+                         (unsigned long)s->hdr.payload_crc,
+                         (unsigned long)s->block_crc,
+                         s->block_equal_live ? "yes" : "NO",
+                         s->page_equal_live ? "yes" : "no");
+    }
+    const cal_slot_info_t *a = &r.slot[CAL_SLOT_A];
+    if (r.slot_read_ok[CAL_SLOT_A] && a->state == CAL_SLOT_VALID &&
+        a->block_equal_live && !a->page_equal_live) {
+        usb_send_str("note: live page differs from slot A outside the cal block only\r\n"
+                     "      (the stock settings bytes; normal after a flash)\r\n");
+    }
+}
+
+static void cal_backup_run(bool force)
+{
+    cal_plan_t p;
+    cal_bk_status_t st = cal_backup_store(force, &p);
+    const char *cmd = force ? "cal backup force" : "cal backup";
+    switch (st) {
+    case CAL_BK_OK:
+        usb_debug_printf("%s: wrote slot %s (v%u)\r\n", cmd,
+                         p.action == CAL_PLAN_WRITE_A ? "A" : "B",
+                         (unsigned)CAL_BACKUP_VERSION);
+        break;
+    case CAL_BK_EQUAL:
+        usb_debug_printf("%s: equal, no write (slot B already holds this page)\r\n", cmd);
+        break;
+    case CAL_BK_REFUSED:
+        usb_debug_printf("%s: refused: %s\r\n", cmd, cal_plan_why_str(p.why));
+        break;
+    default:
+        usb_debug_printf("%s: %s\r\n", cmd, cal_bk_status_str(st));
+        break;
     }
 }
 
 static void cmd_cal_backup(void)
 {
-    cal_bk_status_t st = cal_backup_store();
-    usb_debug_printf("cal backup: %s\r\n", cal_bk_status_str(st));
-    if (st == CAL_BK_ERR_LIVE_BLANK) {
-        usb_send_str("  (MCU page is blank/zeroed — nothing to preserve, existing backup kept)\r\n");
-    }
+    cal_backup_run(false);
+}
+
+static void cmd_cal_backup_force(void)
+{
+    cal_backup_run(true);
 }
 
 static void cmd_cal_restore(const char *args)
@@ -2201,31 +2267,36 @@ static void cmd_cal_restore(const char *args)
     char abuf[40];
     char *saveptr = NULL;
     bool force = false;
-    const char *confirm = NULL;
+    bool confirm = false;
+    bool bad = false;
+    cal_slot_id_t src = CAL_SLOT_A;
 
     if (strlen(args) >= sizeof(abuf)) {
-        usb_send_str("Usage: cal restore [force] CONFIRM\r\n"); return;
+        usb_send_str("Usage: cal restore [a|b] [force] CONFIRM\r\n"); return;
     }
     strcpy(abuf, args);
-    char *t1 = strtok_r(abuf, " \t", &saveptr);
-    char *t2 = strtok_r(NULL, " \t", &saveptr);
-    if (t1 != NULL && strcmp(t1, "force") == 0) {
-        force = true;
-        confirm = t2;
-    } else {
-        confirm = t1;
+    for (char *t = strtok_r(abuf, " \t", &saveptr); t != NULL;
+         t = strtok_r(NULL, " \t", &saveptr)) {
+        if (strcmp(t, "force") == 0)        { force = true; }
+        else if (strcmp(t, "a") == 0)       { src = CAL_SLOT_A; }
+        else if (strcmp(t, "b") == 0)       { src = CAL_SLOT_B; }
+        else if (strcmp(t, "CONFIRM") == 0) { confirm = true; }
+        else                                { bad = true; }
     }
-    if (confirm == NULL || strcmp(confirm, "CONFIRM") != 0) {
+    if (bad || !confirm) {
         usb_send_str("Refused: append CONFIRM. This WRITES MCU flash 0x08006000.\r\n"
-                     "  cal restore CONFIRM        (refuses over a programmed page)\r\n"
-                     "  cal restore force CONFIRM  (overwrites a programmed page)\r\n");
+                     "  cal restore [a|b] CONFIRM        (slot A by default; refuses over a programmed page)\r\n"
+                     "  cal restore [a|b] force CONFIRM  (overwrites a programmed page)\r\n");
         return;
     }
-    cal_bk_status_t st = cal_backup_restore(force);
-    usb_debug_printf("cal restore%s: %s\r\n", force ? " force" : "", cal_bk_status_str(st));
-    if (st == CAL_BK_ERR_LIVE_PRECIOUS) {
-        usb_send_str("  live page holds data — use 'cal restore force CONFIRM' only if you are sure\r\n");
+    cal_restore_plan_t p;
+    cal_bk_status_t st = cal_backup_restore(src, force, &p);
+    usb_debug_printf("cal restore %s%s: %s", cal_slot_name(src), force ? " force" : "",
+                     cal_bk_status_str(st));
+    if (st == CAL_BK_REFUSED) {
+        usb_debug_printf(": %s", cal_plan_why_str(p.why));
     }
+    usb_send_str("\r\n");
 }
 
 /*
@@ -8394,11 +8465,13 @@ static const shell_cmd_t shell_cmds[] = {
     CMD_V("flash diag", cmd_flash_diag, SC_EXACT,
           "flash diag                      W25Q SR1/SR2/SR3 + WEL-latch check\r\n"),
     CMD_V("cal status", cmd_cal_status, SC_EXACT,
-          "cal status                      Factory-cal page + W25Q backup state\r\n"),
+          "cal status                      Factory-cal page, UID, both W25Q slots\r\n"),
     CMD_V("cal backup", cmd_cal_backup, SC_EXACT,
-          "cal backup                      Copy MCU factory-cal page to W25Q (safe)\r\n"),
+          "cal backup                      Copy MCU cal page to W25Q slot A (empty) or B\r\n"),
+    CMD_V("cal backup force", cmd_cal_backup_force, SC_EXACT,
+          "cal backup force                Same; a changed cal block goes to slot B\r\n"),
     CMD_A("cal restore", cmd_cal_restore, SC_NEEDARGS,
-          "cal restore [force] CONFIRM     Write W25Q backup back to MCU flash 0x08006000\r\n"),
+          "cal restore [a|b] [force] CONFIRM  Write a W25Q slot back to MCU 0x08006000\r\n"),
     CMD_A("screen dump", cmd_screen_dump, 0,
           "screen dump [shadow] [x y w h]  Dump text indexed4 LCD shadow\r\n"),
     CMD_A("screen dumpbin", cmd_screen_dumpbin, 0,

@@ -81,13 +81,19 @@ const flash_region_t flash_region_table[FLASH_REGION_COUNT] = {
     [FLASH_REGION_USER_CAL] = { "usercal",  0xF00000u, 0x010000u, FLASH_REGION_KIND_APPEND   },
     [FLASH_REGION_SETTINGS] = { "settings", 0xF10000u, 0x010000u, FLASH_REGION_KIND_APPEND   },
     [FLASH_REGION_MODULES]  = { "modules",  0xF20000u, 0x080000u, FLASH_REGION_KIND_RW       },
-    /* scratch loses its top 8 KB to the cal-backup region below (0x05F000 ->
-     * 0x05D000). 8 KB out of ~380 KB of general scratch is negligible; the
-     * factory-cal mirror needs its own default-deny region so a screenshot
-     * stream can never reach it. */
-    [FLASH_REGION_SCRATCH]  = { "scratch",  0xFA0000u, 0x05D000u, FLASH_REGION_KIND_RW       },
-    /* Factory-cal backup — a 4 KB record (header + the MCU 0x08006000 page) in
-     * 2 dedicated sectors abutting the RO tail. See src/util/cal_backup.c. */
+    /* scratch loses its top 16 KB to the two cal-backup slots below (0x05F000
+     * -> 0x05B000). 16 KB out of ~380 KB of general scratch is negligible; the
+     * factory-cal mirror needs its own default-deny regions so a screenshot
+     * stream can never reach them. */
+    [FLASH_REGION_SCRATCH]  = { "scratch",  0xFA0000u, 0x05B000u, FLASH_REGION_KIND_RW       },
+    /* Factory-cal backup slot B (stage-175, review F-2): later copies. One v2
+     * record (36 B header + the 4 KB page) needs both sectors, so slot B is a
+     * region of its own, not a second record inside slot A. */
+    [FLASH_REGION_FACTORY_CAL_BACKUP_B] = { "calbackup_b", 0xFFB000u, 0x002000u, FLASH_REGION_KIND_RW },
+    /* Factory-cal backup slot A — the first valid record (header + the MCU
+     * 0x08006000 page) in 2 dedicated sectors abutting the RO tail. Kept at
+     * 0xFFD000 so the records already on units stay where they are; once valid,
+     * `cal backup` never erases it. See src/util/cal_backup.c. */
     [FLASH_REGION_FACTORY_CAL_BACKUP] = { "calbackup", 0xFFD000u, 0x002000u, FLASH_REGION_KIND_RW },
     [FLASH_REGION_TAIL]     = { "tail",     0xFFF000u, 0x001000u, FLASH_REGION_KIND_READONLY },
 };

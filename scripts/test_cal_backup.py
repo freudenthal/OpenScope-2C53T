@@ -49,34 +49,139 @@ class Mutation:
 
 MUTATIONS: tuple[Mutation, ...] = (
     Mutation(
-        name="magic check dropped -> blank/foreign region misread as a record",
-        old="if (h.magic != CAL_BACKUP_MAGIC) {\n        return CAL_REC_ERR_MAGIC;\n    }",
-        new="if (0) {\n        return CAL_REC_ERR_MAGIC;\n    }",
+        name='magic check dropped -> blank/foreign region misread as a record',
+        old='if (h.magic != CAL_BACKUP_MAGIC) {\n        return CAL_REC_ERR_MAGIC;\n    }',
+        new='if (0) {\n        return CAL_REC_ERR_MAGIC;\n    }',
     ),
     Mutation(
-        name="header CRC check dropped -> corrupt header trusted",
-        old="if (cal_backup_crc32(rec, 16u) != h.header_crc) {\n        return CAL_REC_ERR_HEADER_CRC;\n    }",
-        new="if (0) {\n        return CAL_REC_ERR_HEADER_CRC;\n    }",
+        name='header CRC check dropped -> corrupt header trusted',
+        old='if (header_crc_of(rec, h.version) != h.header_crc) {\n        return CAL_REC_ERR_HEADER_CRC;\n    }',
+        new='if (0) {\n        return CAL_REC_ERR_HEADER_CRC;\n    }',
     ),
     Mutation(
-        name="payload CRC check dropped -> corrupt payload restored",
-        old="if (cal_backup_crc32(rec + CAL_BACKUP_HEADER_LEN, h.payload_len) != h.payload_crc) {\n        return CAL_REC_ERR_PAYLOAD_CRC;\n    }",
-        new="if (0) {\n        return CAL_REC_ERR_PAYLOAD_CRC;\n    }",
+        name='v2 header CRC does not cover the UID and block CRC',
+        old='c = cal_backup_crc32_update(c, h + 20, CAL_BACKUP_HEADER_LEN_V2 - 20u);',
+        new='(void)h;',
     ),
     Mutation(
-        name="version check dropped -> unknown future record misread",
-        old="if (h.version != CAL_BACKUP_VERSION) {\n        return CAL_REC_ERR_VERSION;\n    }",
-        new="if (0) {\n        return CAL_REC_ERR_VERSION;\n    }",
+        name='v2 header length check dropped -> a cut header is read past its end',
+        old='if (rec_len < h.header_len) {\n        return CAL_REC_ERR_TRUNCATED;',
+        new='if (0) {\n        return CAL_REC_ERR_TRUNCATED;',
     ),
     Mutation(
-        name="auto-restore no longer refuses a programmed page",
-        old="return live == CAL_PAGE_BLANK || live == CAL_PAGE_ZEROED;",
-        new="return true;",
+        name='payload CRC check dropped -> corrupt payload restored',
+        old='if (cal_backup_crc32(payload, h.payload_len) != h.payload_crc) {\n        return CAL_REC_ERR_PAYLOAD_CRC;\n    }',
+        new='if (0) {\n        return CAL_REC_ERR_PAYLOAD_CRC;\n    }',
     ),
     Mutation(
-        name="page classification collapses PROGRAMMED into BLANK",
-        old="if (page[i] != 0xFFu) { all_ff = false; }",
-        new="if (0) { all_ff = false; }",
+        name='parse: v2 block CRC check dropped',
+        old='cal_backup_crc32(payload + CAL_BLOCK_OFF, CAL_BLOCK_LEN) != h.block_crc',
+        new='0',
+    ),
+    Mutation(
+        name='version check dropped -> unknown future record misread',
+        old='if (h.header_len == 0u) {\n        return CAL_REC_ERR_VERSION;\n    }',
+        new='if (0) {\n        return CAL_REC_ERR_VERSION;\n    }',
+    ),
+    Mutation(
+        name='auto-restore no longer refuses a programmed page',
+        old='return live == CAL_PAGE_BLANK || live == CAL_PAGE_ZEROED;',
+        new='return true;',
+    ),
+    Mutation(
+        name='page classification collapses PROGRAMMED into BLANK',
+        old='if (page[i] != 0xFFu) { all_ff = false; }',
+        new='if (0) { all_ff = false; }',
+    ),
+    Mutation(
+        name='live cal-block class taken from the whole page',
+        old='out->block_class = cal_backup_classify_page(page + CAL_BLOCK_OFF, CAL_BLOCK_LEN);',
+        new='out->block_class = out->page_class;',
+    ),
+    Mutation(
+        name='scan: a torn header (magic blank, rest programmed) counts as an empty slot',
+        old='all_bytes(head, n, 0xFFu)',
+        new='all_bytes(head, 4u, 0xFFu)',
+    ),
+    Mutation(
+        name='scan: payload length other than 4 KB accepted',
+        old='if (s->info.hdr.payload_len != CAL_BACKUP_PAYLOAD_LEN) {',
+        new='if (0) {',
+    ),
+    Mutation(
+        name='scan: payload CRC check dropped',
+        old='} else if (crc != s->info.hdr.payload_crc) {',
+        new='} else if (0) {',
+    ),
+    Mutation(
+        name='scan: v2 block CRC check dropped',
+        old='} else if (s->info.hdr.version == CAL_BACKUP_VERSION_2 &&\n                   bcrc != s->info.hdr.block_crc) {',
+        new='} else if (0) {',
+    ),
+    Mutation(
+        name='scan: cal-block byte compare dropped -> a changed cal block reads equal',
+        old='if (s->live != NULL && memcmp(b, s->live + lo, bn) != 0) {\n            s->block_eq = false;',
+        new='if (0) {\n            s->block_eq = false;',
+    ),
+    Mutation(
+        name='store: blank/zeroed live page backed up',
+        old='if (live->page_class != CAL_PAGE_PROGRAMMED) {\n        return plan(CAL_PLAN_REFUSE, CAL_WHY_LIVE_BLANK);',
+        new='if (0) {\n        return plan(CAL_PLAN_REFUSE, CAL_WHY_LIVE_BLANK);',
+    ),
+    Mutation(
+        name='store: blank/zeroed live cal block backed up',
+        old='if (live->block_class != CAL_PAGE_PROGRAMMED) {\n        return plan(CAL_PLAN_REFUSE, CAL_WHY_LIVE_BLOCK_BLANK);',
+        new='if (0) {\n        return plan(CAL_PLAN_REFUSE, CAL_WHY_LIVE_BLOCK_BLANK);',
+    ),
+    Mutation(
+        name='store: slot A written when it is not empty',
+        old='if (a->state == CAL_SLOT_EMPTY) {',
+        new='if (a->state != CAL_SLOT_VALID || force) {',
+    ),
+    Mutation(
+        name='store: damaged slot A not refused',
+        old='if (a->state != CAL_SLOT_VALID) {\n        return plan(CAL_PLAN_REFUSE, CAL_WHY_A_DAMAGED);',
+        new='if (0) {\n        return plan(CAL_PLAN_REFUSE, CAL_WHY_A_DAMAGED);',
+    ),
+    Mutation(
+        name="store: another unit's slot A not refused",
+        old='if (uid_mismatch(&a->hdr, uid)) {\n        return plan(CAL_PLAN_REFUSE, CAL_WHY_UID_MISMATCH);',
+        new='if (0) {\n        return plan(CAL_PLAN_REFUSE, CAL_WHY_UID_MISMATCH);',
+    ),
+    Mutation(
+        name='store: a different cal block not refused',
+        old='if (!a->block_equal_live && !force) {',
+        new='if (0) {',
+    ),
+    Mutation(
+        name='store: force ignored',
+        old='if (!a->block_equal_live && !force) {',
+        new='if (!a->block_equal_live) {',
+    ),
+    Mutation(
+        name='store: slot B rewritten when it already holds this page',
+        old='if (b->state == CAL_SLOT_VALID && b->page_equal_live && !uid_mismatch(&b->hdr, uid)) {',
+        new='if (0) {',
+    ),
+    Mutation(
+        name='restore: no valid source not refused',
+        old='if (src->state != CAL_SLOT_VALID) {',
+        new='if (0) {',
+    ),
+    Mutation(
+        name="restore: another unit's backup not refused",
+        old='if (uid_mismatch(&src->hdr, uid)) {',
+        new='if (0) {',
+    ),
+    Mutation(
+        name='restore: blank/zeroed backup cal block not refused',
+        old='if (src->block_class != CAL_PAGE_PROGRAMMED) {',
+        new='if (0) {',
+    ),
+    Mutation(
+        name='restore: programmed live page overwritten without force',
+        old='if (live->page_class == CAL_PAGE_PROGRAMMED && !force) {',
+        new='if (0) {',
     ),
 )
 

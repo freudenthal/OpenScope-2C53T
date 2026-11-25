@@ -1,16 +1,17 @@
 /*
  * cal_backup.c — device glue for factory-cal self-protection. See cal_backup.h.
  *
- * All record/decision logic is in cal_backup_core.c (host-tested). This file is
- * only the three things the core cannot do: read the live MCU page, move the
- * record to/from the dedicated W25Q region, and — on restore only — erase and
- * program MCU-internal flash.
+ * All record/decision logic is in cal_backup_core.c (host-tested): the slot
+ * scan, the store plan (which slot, or refuse) and the restore plan. This file
+ * only does what the core cannot: read the live MCU page and the UID, move
+ * bytes to/from the two W25Q slot regions, and — on restore only — erase and
+ * program MCU-internal flash. It never erases a slot that the plan did not
+ * pick, and it erases slot A only when the plan says WRITE_A (slot A empty).
  *
- * MEMORY: RAM is nearly full (the image already sits within ~1 KB of the 224 KB
- * ceiling), so this holds NO 4 KB buffer. The 4 KB page is always streamed in
- * 256-byte chunks — CRC'd incrementally, copied chunk-at-a-time — so the only
- * working storage is one 256-byte stack buffer, safe even on the 2 KB usb_dbg
- * shell task. Every entry point runs on that single shell/boot thread.
+ * MEMORY: RAM is nearly full and the shell task stack is 3 KB, so this holds
+ * NO 4 KB buffer. The live page is read in place (memory-mapped flash); the
+ * W25Q slots are streamed in CAL_BK_CHUNK-byte pieces through one small stack
+ * buffer. Every entry point runs on the single shell/boot thread.
  */
 
 #include "cal_backup.h"
@@ -23,132 +24,151 @@
 #include "at32f403a_407.h"
 #endif
 
-#define CAL_BK_REGION   FLASH_REGION_FACTORY_CAL_BACKUP
-#define CAL_BK_CHUNK    256u
-#define CAL_BK_PAYLOAD_OFF  CAL_BACKUP_HEADER_LEN   /* payload follows the header */
+#define CAL_BK_CHUNK    64u
 
-/* ── live MCU page (read-only, streamed) ────────────────────────────── */
+static flash_region_id_t slot_region(cal_slot_id_t s)
+{
+    return (s == CAL_SLOT_B) ? FLASH_REGION_FACTORY_CAL_BACKUP_B
+                             : FLASH_REGION_FACTORY_CAL_BACKUP;
+}
 
-static void read_live_chunk(uint32_t off, uint8_t *dst, uint32_t n)
+const char *cal_slot_name(cal_slot_id_t s)
+{
+    return (s == CAL_SLOT_B) ? "B" : "A";
+}
+
+uint32_t cal_slot_addr(cal_slot_id_t s)
+{
+    const flash_region_t *r = flash_region_get(slot_region(s));
+    return r != NULL ? r->start : 0u;
+}
+
+/* ── live MCU page and UID (read-only) ──────────────────────────────── */
+
+/* The live page, read in place. The emulator has no cal page: NULL reads as a
+ * blank page in the core, so the store plan refuses and nothing is written. */
+static const uint8_t *live_page(void)
 {
 #ifndef EMULATOR_BUILD
-    const volatile uint8_t *src = (const volatile uint8_t *)(CAL_BACKUP_SRC_ADDR + off);
-    for (uint32_t i = 0; i < n; i++) {
-        dst[i] = src[i];
-    }
+    return (const uint8_t *)CAL_BACKUP_SRC_ADDR;
 #else
-    (void)off;
-    memset(dst, 0xFF, n);
+    return NULL;
 #endif
 }
 
-/* One pass over the live page: its CRC32 and its class (blank/zeroed/programmed).
- * Classification combines per-chunk verdicts — any disagreement between chunks,
- * or any programmed chunk, makes the whole page programmed. */
-static void live_scan(uint32_t *crc_out, cal_page_class_t *class_out)
+void cal_backup_read_uid(uint8_t uid[CAL_UID_LEN])
 {
-    uint8_t buf[CAL_BK_CHUNK];
-    uint32_t crc = CAL_BACKUP_CRC32_INIT;
-    cal_page_class_t cls = CAL_PAGE_BLANK;
-    bool first = true;
-
-    for (uint32_t off = 0; off < CAL_BACKUP_PAYLOAD_LEN; off += CAL_BK_CHUNK) {
-        read_live_chunk(off, buf, CAL_BK_CHUNK);
-        crc = cal_backup_crc32_update(crc, buf, CAL_BK_CHUNK);
-        cal_page_class_t c = cal_backup_classify_page(buf, CAL_BK_CHUNK);
-        cls = first ? c : (cls == c ? cls : CAL_PAGE_PROGRAMMED);
-        first = false;
+    for (uint32_t i = 0; i < 3u; i++) {
+#ifndef EMULATOR_BUILD
+        uint32_t w = *(const volatile uint32_t *)(CAL_UID_ADDR + 4u * i);
+#else
+        uint32_t w = 0u;
+#endif
+        uid[4u * i + 0u] = (uint8_t)(w);
+        uid[4u * i + 1u] = (uint8_t)(w >> 8);
+        uid[4u * i + 2u] = (uint8_t)(w >> 16);
+        uid[4u * i + 3u] = (uint8_t)(w >> 24);
     }
-    if (crc_out != NULL)   { *crc_out = cal_backup_crc32_final(crc); }
-    if (class_out != NULL) { *class_out = cls; }
 }
 
-/* ── W25Q backup region (streamed) ──────────────────────────────────── */
+/* ── W25Q slots (streamed) ──────────────────────────────────────────── */
 
-/* CRC32 of the payload as it is currently stored in the W25Q region. Returns
- * false on a region read error. */
-static bool region_payload_crc(uint32_t *crc_out)
+/* Scan one slot through the core. Returns false on a region read error. */
+static bool slot_scan(cal_slot_id_t id, const uint8_t *live, cal_slot_info_t *out)
 {
-    uint8_t buf[CAL_BK_CHUNK];
-    uint32_t crc = CAL_BACKUP_CRC32_INIT;
-    for (uint32_t off = 0; off < CAL_BACKUP_PAYLOAD_LEN; off += CAL_BK_CHUNK) {
-        if (flash_region_read(CAL_BK_REGION, CAL_BK_PAYLOAD_OFF + off,
-                              buf, CAL_BK_CHUNK) != FLASH_REGION_OK) {
-            return false;
+    flash_region_id_t r = slot_region(id);
+    uint8_t head[CAL_BACKUP_HEADER_MAX];
+    if (flash_region_read(r, 0, head, sizeof head) != FLASH_REGION_OK) {
+        return false;
+    }
+    cal_slot_scan_t s;
+    if (cal_slot_scan_begin(&s, head, sizeof head, live)) {
+        uint8_t buf[CAL_BK_CHUNK];
+        uint32_t base = s.info.hdr.header_len;
+        uint32_t len  = s.info.hdr.payload_len;
+        for (uint32_t off = 0; off < len; off += CAL_BK_CHUNK) {
+            uint32_t n = (len - off) < CAL_BK_CHUNK ? (len - off) : CAL_BK_CHUNK;
+            if (flash_region_read(r, base + off, buf, n) != FLASH_REGION_OK) {
+                return false;
+            }
+            cal_slot_scan_feed(&s, buf, n);
         }
-        crc = cal_backup_crc32_update(crc, buf, CAL_BK_CHUNK);
     }
-    *crc_out = cal_backup_crc32_final(crc);
+    cal_slot_scan_end(&s, out);
     return true;
 }
 
-/* Read and fully validate the stored backup: header well-formed AND the stored
- * payload's CRC matches the header. Fills *hdr on success. `present` (may be
- * NULL) reports whether the header bytes could be read at all. */
-static bool backup_is_valid(cal_backup_header_t *hdr, bool *present)
+/* Write a v2 record of the live page into one slot: erase that slot only,
+ * payload first, header last (a torn write leaves the header blank: the slot
+ * then scans EMPTY or BAD, never valid), then verify by a full scan. */
+static cal_bk_status_t slot_write(cal_slot_id_t id, const uint8_t *live,
+                                  const cal_live_info_t *li,
+                                  const uint8_t uid[CAL_UID_LEN])
 {
-    uint8_t hbuf[CAL_BACKUP_HEADER_LEN];
-    if (present != NULL) { *present = false; }
-    if (flash_region_read(CAL_BK_REGION, 0, hbuf, sizeof hbuf) != FLASH_REGION_OK) {
-        return false;
+    flash_region_id_t r = slot_region(id);
+    uint8_t hbuf[CAL_BACKUP_HEADER_LEN_V2];
+    if (live == NULL ||
+        cal_backup_write_header(hbuf, (uint16_t)CAL_BACKUP_VERSION,
+                                (uint16_t)CAL_BACKUP_PAYLOAD_LEN, CAL_BACKUP_SRC_ADDR,
+                                li->payload_crc, uid, li->block_crc) != sizeof hbuf) {
+        return CAL_BK_ERR_ARG;
     }
-    if (present != NULL) { *present = true; }
-
-    cal_backup_header_t h;
-    if (cal_backup_check_header(hbuf, sizeof hbuf, &h) != CAL_REC_OK) {
-        return false;
-    }
-    if (h.payload_len != CAL_BACKUP_PAYLOAD_LEN) {
-        return false;
-    }
-    uint32_t stored_crc = 0;
-    if (!region_payload_crc(&stored_crc) || stored_crc != h.payload_crc) {
-        return false;
-    }
-    if (hdr != NULL) { *hdr = h; }
-    return true;
-}
-
-cal_bk_status_t cal_backup_store(void)
-{
-    uint32_t live_crc = 0;
-    cal_page_class_t live_class = CAL_PAGE_BLANK;
-    live_scan(&live_crc, &live_class);
-
-    /* Never overwrite an existing backup with an empty capture. */
-    if (live_class != CAL_PAGE_PROGRAMMED) {
-        return CAL_BK_ERR_LIVE_BLANK;
-    }
-
-    uint8_t hbuf[CAL_BACKUP_HEADER_LEN];
-    cal_backup_write_header(hbuf, (uint16_t)CAL_BACKUP_VERSION,
-                            (uint16_t)CAL_BACKUP_PAYLOAD_LEN,
-                            CAL_BACKUP_SRC_ADDR, live_crc);
-
-    if (flash_region_reset(CAL_BK_REGION) != FLASH_REGION_OK) {
+    if (flash_region_reset(r) != FLASH_REGION_OK) {
         return CAL_BK_ERR_REGION_IO;
     }
-    /* Payload first, header last: a torn write then leaves the header absent or
-     * mismatched and backup_is_valid() rejects it — never a header that claims a
-     * payload that was not fully written. */
     uint8_t buf[CAL_BK_CHUNK];
     for (uint32_t off = 0; off < CAL_BACKUP_PAYLOAD_LEN; off += CAL_BK_CHUNK) {
-        read_live_chunk(off, buf, CAL_BK_CHUNK);
-        if (flash_region_write(CAL_BK_REGION, CAL_BK_PAYLOAD_OFF + off,
+        memcpy(buf, live + off, CAL_BK_CHUNK);
+        if (flash_region_write(r, CAL_BACKUP_HEADER_LEN_V2 + off,
                                buf, CAL_BK_CHUNK) != FLASH_REGION_OK) {
             return CAL_BK_ERR_REGION_IO;
         }
     }
-    if (flash_region_write(CAL_BK_REGION, 0, hbuf, sizeof hbuf) != FLASH_REGION_OK) {
+    if (flash_region_write(r, 0, hbuf, sizeof hbuf) != FLASH_REGION_OK) {
         return CAL_BK_ERR_REGION_IO;
     }
 
-    /* Verify by re-validating what actually landed. */
-    cal_backup_header_t h;
-    if (!backup_is_valid(&h, NULL) || h.payload_crc != live_crc) {
+    cal_slot_info_t v;
+    if (!slot_scan(id, live, &v) || v.state != CAL_SLOT_VALID ||
+        !v.page_equal_live || v.hdr.payload_crc != li->payload_crc ||
+        !v.hdr.uid_known || memcmp(v.hdr.uid, uid, CAL_UID_LEN) != 0) {
         return CAL_BK_ERR_VERIFY;
     }
     return CAL_BK_OK;
+}
+
+cal_bk_status_t cal_backup_store(bool force, cal_plan_t *plan_out)
+{
+    const uint8_t *live = live_page();
+    cal_live_info_t li;
+    uint8_t uid[CAL_UID_LEN];
+    cal_slot_info_t a, b;
+    cal_plan_t p = { CAL_PLAN_REFUSE, CAL_WHY_BAD_ARG };
+
+    cal_backup_live_info(live, &li);
+    cal_backup_read_uid(uid);
+    if (!slot_scan(CAL_SLOT_A, live, &a) || !slot_scan(CAL_SLOT_B, live, &b)) {
+        if (plan_out != NULL) { *plan_out = p; }
+        return CAL_BK_ERR_REGION_IO;
+    }
+    p = cal_backup_plan(&li, &a, &b, uid, force);
+    if (plan_out != NULL) { *plan_out = p; }
+
+    switch (p.action) {
+    case CAL_PLAN_WRITE_A:
+        /* Second guard on the one rule that must hold: A is written only empty. */
+        if (a.state != CAL_SLOT_EMPTY) {
+            return CAL_BK_ERR_ARG;
+        }
+        return slot_write(CAL_SLOT_A, live, &li, uid);
+    case CAL_PLAN_WRITE_B:
+        return slot_write(CAL_SLOT_B, live, &li, uid);
+    case CAL_PLAN_NONE_EQUAL:
+        return CAL_BK_EQUAL;
+    case CAL_PLAN_REFUSE:
+        break;
+    }
+    return CAL_BK_REFUSED;
 }
 
 cal_bk_status_t cal_backup_status(cal_backup_report_t *r)
@@ -157,36 +177,11 @@ cal_bk_status_t cal_backup_status(cal_backup_report_t *r)
         return CAL_BK_ERR_ARG;
     }
     memset(r, 0, sizeof(*r));
-
-    live_scan(&r->live_crc, &r->live_class);
-
-    /* Read the header for reporting even if the payload is corrupt, so status
-     * can distinguish "no record" from "record present but invalid". */
-    uint8_t hbuf[CAL_BACKUP_HEADER_LEN];
-    bool present = (flash_region_read(CAL_BK_REGION, 0, hbuf, sizeof hbuf) == FLASH_REGION_OK);
-    r->backup_present = present;
-
-    cal_backup_header_t h;
-    if (present) {
-        r->backup_status = cal_backup_check_header(hbuf, sizeof hbuf, &h);
-    } else {
-        r->backup_status = CAL_REC_ERR_TRUNCATED;
-    }
-
-    if (r->backup_status == CAL_REC_OK) {
-        r->backup_version     = h.version;
-        r->backup_payload_crc = h.payload_crc;
-        r->backup_src_addr    = h.src_addr;
-        /* Fully validate (payload CRC) before claiming a match. */
-        uint32_t stored_crc = 0;
-        bool payload_ok = (h.payload_len == CAL_BACKUP_PAYLOAD_LEN) &&
-                          region_payload_crc(&stored_crc) &&
-                          stored_crc == h.payload_crc;
-        if (!payload_ok) {
-            r->backup_status = CAL_REC_ERR_PAYLOAD_CRC;
-        } else {
-            r->match = (h.payload_crc == r->live_crc);
-        }
+    const uint8_t *live = live_page();
+    cal_backup_live_info(live, &r->live);
+    cal_backup_read_uid(r->uid);
+    for (uint32_t i = 0; i < CAL_SLOT_COUNT; i++) {
+        r->slot_read_ok[i] = slot_scan((cal_slot_id_t)i, live, &r->slot[i]);
     }
     return CAL_BK_OK;
 }
@@ -194,11 +189,11 @@ cal_bk_status_t cal_backup_status(cal_backup_report_t *r)
 /* ── restore: W25Q -> MCU flash. The dangerous direction. ───────────── */
 
 #ifndef EMULATOR_BUILD
-/* Erase the sectors covering the cal page, then program it from the W25Q backup
+/* Erase the sectors covering the cal page, then program it from the slot
  * payload, streamed. Erases in 2 KB steps so the 4 KB page is fully cleared
  * whether the part's sector is 2 KB or 4 KB (a repeat erase of one 4 KB sector
  * is a harmless no-op). Returns false on any erase/program/region-read failure. */
-static bool mcu_flash_restore_from_region(void)
+static bool mcu_flash_restore_from_region(flash_region_id_t r, uint32_t payload_off)
 {
     bool ok = true;
     flash_unlock();
@@ -212,8 +207,7 @@ static bool mcu_flash_restore_from_region(void)
     if (ok) {
         uint8_t buf[CAL_BK_CHUNK];
         for (uint32_t off = 0; off < CAL_BACKUP_PAYLOAD_LEN && ok; off += CAL_BK_CHUNK) {
-            if (flash_region_read(CAL_BK_REGION, CAL_BK_PAYLOAD_OFF + off,
-                                  buf, CAL_BK_CHUNK) != FLASH_REGION_OK) {
+            if (flash_region_read(r, payload_off + off, buf, CAL_BK_CHUNK) != FLASH_REGION_OK) {
                 ok = false;
                 break;
             }
@@ -235,36 +229,41 @@ static bool mcu_flash_restore_from_region(void)
 }
 #endif /* !EMULATOR_BUILD */
 
-cal_bk_status_t cal_backup_restore(bool force)
+cal_bk_status_t cal_backup_restore(cal_slot_id_t src, bool force,
+                                   cal_restore_plan_t *plan_out)
 {
-    cal_backup_header_t h;
-    if (!backup_is_valid(&h, NULL)) {
-        return CAL_BK_ERR_NO_BACKUP;
-    }
-    if ((h.payload_len & 3u) != 0u) {   /* must be word-programmable */
-        return CAL_BK_ERR_NO_BACKUP;
-    }
+    const uint8_t *live = live_page();
+    cal_live_info_t li;
+    uint8_t uid[CAL_UID_LEN];
+    cal_slot_info_t s;
+    cal_restore_plan_t p = { CAL_RESTORE_REFUSE, CAL_WHY_BAD_ARG };
 
-    uint32_t live_crc = 0;
-    cal_page_class_t live_class = CAL_PAGE_BLANK;
-    live_scan(&live_crc, &live_class);
-
-    /* Refuse to clobber a live page that still holds real content. */
-    if (live_class == CAL_PAGE_PROGRAMMED && !force) {
-        return CAL_BK_ERR_LIVE_PRECIOUS;
+    if (src != CAL_SLOT_A && src != CAL_SLOT_B) {
+        if (plan_out != NULL) { *plan_out = p; }
+        return CAL_BK_ERR_ARG;
     }
-    /* Already correct — skip a needless MCU-flash P/E cycle. */
-    if (live_crc == h.payload_crc) {
-        return CAL_BK_OK;
+    cal_backup_live_info(live, &li);
+    cal_backup_read_uid(uid);
+    if (!slot_scan(src, live, &s)) {
+        if (plan_out != NULL) { *plan_out = p; }
+        return CAL_BK_ERR_REGION_IO;
+    }
+    p = cal_backup_restore_plan(&li, &s, uid, force);
+    if (plan_out != NULL) { *plan_out = p; }
+    if (p.action == CAL_RESTORE_REFUSE) {
+        return CAL_BK_REFUSED;
+    }
+    if (p.action == CAL_RESTORE_NONE_EQUAL) {
+        return CAL_BK_EQUAL;
     }
 
 #ifndef EMULATOR_BUILD
-    if (!mcu_flash_restore_from_region()) {
+    if (!mcu_flash_restore_from_region(slot_region(src), s.hdr.header_len)) {
         return CAL_BK_ERR_MCU_FLASH;
     }
-    /* Verify the page now matches the backup. */
-    live_scan(&live_crc, NULL);
-    if (live_crc != h.payload_crc) {
+    /* Verify the page now matches the slot, byte for byte. */
+    cal_slot_info_t v;
+    if (!slot_scan(src, live, &v) || v.state != CAL_SLOT_VALID || !v.page_equal_live) {
         return CAL_BK_ERR_MCU_FLASH;
     }
     return CAL_BK_OK;
@@ -275,27 +274,27 @@ cal_bk_status_t cal_backup_restore(bool force)
 
 cal_bk_status_t cal_backup_maybe_auto_restore(void)
 {
-    cal_backup_header_t h;
-    bool backup_valid = backup_is_valid(&h, NULL);
-
-    cal_page_class_t live_class = CAL_PAGE_BLANK;
-    live_scan(NULL, &live_class);
-
-    if (!cal_backup_should_auto_restore(live_class, backup_valid)) {
+    const uint8_t *live = live_page();
+    cal_live_info_t li;
+    cal_slot_info_t a;
+    cal_backup_live_info(live, &li);
+    if (!slot_scan(CAL_SLOT_A, live, &a)) {
+        return CAL_BK_ERR_REGION_IO;
+    }
+    if (!cal_backup_should_auto_restore(li.page_class, a.state == CAL_SLOT_VALID)) {
         return CAL_BK_OK;   /* deliberate no-op */
     }
-    return cal_backup_restore(false);
+    return cal_backup_restore(CAL_SLOT_A, false, NULL);
 }
 
 const char *cal_bk_status_str(cal_bk_status_t s)
 {
     switch (s) {
     case CAL_BK_OK:               return "ok";
-    case CAL_BK_ERR_LIVE_BLANK:   return "live page blank — nothing to back up";
+    case CAL_BK_EQUAL:            return "equal, no write";
+    case CAL_BK_REFUSED:          return "refused";
     case CAL_BK_ERR_REGION_IO:    return "W25Q region io error";
     case CAL_BK_ERR_VERIFY:       return "backup readback/verify failed";
-    case CAL_BK_ERR_NO_BACKUP:    return "no valid backup on W25Q";
-    case CAL_BK_ERR_LIVE_PRECIOUS:return "refused: live page is programmed (use force)";
     case CAL_BK_ERR_MCU_FLASH:    return "MCU flash erase/program/verify failed";
     case CAL_BK_ERR_ARG:          return "bad argument";
     }

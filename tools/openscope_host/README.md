@@ -164,7 +164,7 @@ Exit codes: 0 updated and verified; 1 no unit found; 2 refused (nothing written)
 verify found differences. From Python: `openscope.update.run_update()`, `run_first_install()`,
 `run_stock_install()`, `probe_firmware()`, `openscope.firmware` (`Manifest`, `make_manifest`,
 `check_image`, `check_running`, `check_running_shell`, `check_stock_image`) and `openscope.iapdrive`
-(`find_iap_drive`, `copy_image`). Library version 0.5.0 adds these; 0.6.0 adds the stage-205 paths. The drive search works on
+(`find_iap_drive`, `copy_image`). Library version 0.5.0 adds these; 0.6.0 adds the stage-205 paths; 0.6.1 reports a port lost during a backup as a backup error (G-410). The drive search works on
 Windows only.
 
 ## GUI (`openscope-gui`)

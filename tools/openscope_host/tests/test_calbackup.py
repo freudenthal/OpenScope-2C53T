@@ -204,6 +204,56 @@ class FakeUnit:
         self.closed = True
 
 
+class PySerialOver:
+    """pyserial stand-in over a FakeUnit, so the REAL SerialLink runs (G-410
+    lives in SerialLink: FakeUnit as the link would hide it)."""
+
+    def __init__(self, unit):
+        self.unit = unit
+
+    def _check(self):
+        if self.unit.lost:
+            raise OSError(22, "A device which does not exist was specified")
+
+    def write(self, data):
+        self.unit.write(data)
+        return len(data)
+
+    @property
+    def out_waiting(self):
+        self._check()
+        return 0
+
+    @property
+    def in_waiting(self):
+        self._check()
+        return len(self.unit.rx)
+
+    def read(self, n):
+        return self.unit.read(n)
+
+    def reset_input_buffer(self):
+        self.unit.discard_input()
+
+    def close(self):
+        pass
+
+
+class LosesPortInCalRead(FakeUnit):
+    """The unit goes into upgrade mode while the cal page is read (flash 2 of
+    stage-210): at one `mem read` the port goes away and does not come back."""
+
+    def __init__(self, at_ofs=0x200, **kw):
+        super().__init__(**kw)
+        self.at = cb.CAL_ADDR + at_ofs
+
+    def _words(self, addr, n):
+        if addr == self.at:
+            self.lost = True
+            return b""
+        return super()._words(addr, n)
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
@@ -339,6 +389,40 @@ class TestBackup(Base):
         dev = self.device(unit)
         self.assertEqual(cb.read_cal_page(dev), good)
         self.assertEqual(len([x for x in unit.lines if x.startswith("mem read")]), 64)
+
+    def serial_device(self, unit, reopen_wait):
+        from openscope.link import SerialLink
+
+        def open_():
+            raise NoDevice("no OpenScope found on USB 2e3c:5740 (AT32 VCP)")
+        link = SerialLink(port="FAKE7", reopen_wait=reopen_wait)
+        link._ser = PySerialOver(unit)
+        link.open = open_
+        dev = Device(link, timeout=0.3, sleep=self.clock.sleep)
+        if unit.binary:
+            dev._check_version()
+        return dev
+
+    def test_port_lost_in_the_cal_read_is_a_backup_error(self):
+        """G-410: was AttributeError ('NoneType' has no 'reset_input_buffer')."""
+        for binary, fmt in ((True, "ours"), (False, "v041")):
+            for wait in (0, 0.3):
+                with self.subTest(binary=binary, reopen_wait=wait):
+                    unit = LosesPortInCalRead(binary=binary, fmt=fmt)
+                    dev = self.serial_device(unit, wait)
+                    with mock.patch("openscope.link.time.sleep"):
+                        with self.assertRaises(cb.BackupError) as cm:
+                            cb.read_cal_page(dev)
+                    self.assertIn("cal page read failed two times", str(cm.exception))
+                    self.assertFalse(dev.link.is_open)
+
+    def test_port_lost_in_make_backup_saves_nothing(self):
+        unit = LosesPortInCalRead()
+        dev = self.serial_device(unit, 0)
+        with self.assertRaises(cb.BackupError):
+            cb.make_backup(dev, root=self.tmp, now=WHEN)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+        self.assert_read_only(unit)
 
     def test_cal_status_crc_mismatch_saves_nothing(self):
         unit = FakeUnit()

@@ -24,6 +24,15 @@ class NoDevice(Exception):
     """No OpenScope port found. The message says where we looked."""
 
 
+class PortClosed(OSError):
+    """A read or write on a link that is not open: the port was lost and the
+    reopen failed (G-410). An OSError, so callers handle it like any other
+    lost port (reopen once, or report it) and never see AttributeError."""
+
+    def __init__(self, msg: str = "port lost (not open: the reopen failed)"):
+        super().__init__(msg)
+
+
 def candidate_ports() -> List[str]:
     """OpenScope ports by VID:PID; falls back to the usual globs if pyserial's
     port listing is unavailable. Other USB serial devices are ignored."""
@@ -89,6 +98,15 @@ class SerialLink:
             raise NoDevice(f"cannot open {port}: {open_error_words(e)}") from None
         self.port = port
 
+    @property
+    def is_open(self) -> bool:
+        return self._ser is not None
+
+    def _port(self):
+        if self._ser is None:
+            raise PortClosed()
+        return self._ser
+
     def close(self) -> None:
         if self._ser is not None:
             try:
@@ -118,14 +136,15 @@ class SerialLink:
     def write(self, data: bytes) -> None:
         """OSError = nothing may have been sent; FlushFailed = the bytes were
         handed to the OS and may well have reached the device."""
-        self._ser.write(data)
+        ser = self._port()
+        ser.write(data)
         # Not ser.flush(): on POSIX that is an unbounded tcdrain, and the device
         # only re-arms its OUT endpoint when the shell task polls, so a busy or
         # wedged device would hang the host with no timeout at all. Wait for
         # the OS queue to empty, but only up to a deadline.
         deadline = time.monotonic() + self.drain_timeout
         try:
-            while self._ser.out_waiting:
+            while ser.out_waiting:
                 if time.monotonic() > deadline:
                     raise FlushFailed(f"device not accepting data after {self.drain_timeout:.0f} s")
                 time.sleep(0.005)
@@ -137,10 +156,11 @@ class SerialLink:
     def discard_input(self) -> None:
         """Drop the bytes the OS holds for us (a late reply, old text). Never
         blocks; bytes still on the wire are not affected."""
-        self._ser.reset_input_buffer()
+        self._port().reset_input_buffer()
 
     def read(self, n: int = 4096) -> bytes:
-        return self._ser.read(max(1, min(n, self._ser.in_waiting or 1)))
+        ser = self._port()
+        return ser.read(max(1, min(n, ser.in_waiting or 1)))
 
     def drain(self, quiet: float = 0.15, max_wait: float = 1.5) -> bytes:
         """Swallow whatever the device is still saying (banner, old output)."""

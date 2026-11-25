@@ -205,7 +205,7 @@ def read_cal_page(dev: Device, progress: Optional[Callable[[int, int], None]] = 
             b = _page_once(dev, progress, cancel, CAL_LEN)
         except (Cancelled, Refused):
             raise
-        except DeviceError as e:
+        except (DeviceError, NoDevice) as e:     # NoDevice: the port did not come back (G-410)
             last = str(e)
             continue
         if a == b:

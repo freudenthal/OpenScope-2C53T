@@ -214,6 +214,11 @@ class Device:
             self._verified = True
 
     def _ensure_verified(self) -> None:
+        if not getattr(self.link, "is_open", True):
+            # G-410: an earlier reopen failed and left the port closed. Look
+            # for it again (NoDevice if it does not come back) instead of
+            # sending into a closed port.
+            self._reopen()
         if not getattr(self, "_verified", True):
             try:
                 self._check_version()

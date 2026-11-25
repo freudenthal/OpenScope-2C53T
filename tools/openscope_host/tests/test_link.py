@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from openscope.link import FlushFailed, NoDevice, SerialLink  # noqa: E402
+from openscope.link import FlushFailed, NoDevice, PortClosed, SerialLink  # noqa: E402
 
 
 class FakeSer:
@@ -138,6 +138,30 @@ class TestReopen(unittest.TestCase):
         ser = FakeSer(drains_after=0)
         link(ser).discard_input()
         self.assertEqual(ser.resets, 1)
+
+
+class TestClosedLink(unittest.TestCase):
+    """G-410: after a failed reopen `_ser` is None. Every call must raise an
+    OSError (PortClosed), never AttributeError."""
+
+    def test_every_call_on_a_closed_link_is_port_closed(self):
+        l = SerialLink(reopen_wait=0)
+        self.assertFalse(l.is_open)
+        for call in (l.discard_input, l.read, lambda: l.write(b"x"), l.drain):
+            with self.assertRaises(PortClosed) as cm:
+                call()
+            self.assertIsInstance(cm.exception, OSError)
+            self.assertIn("port lost", str(cm.exception))
+
+    def test_after_a_failed_reopen(self):
+        l = link(FakeSer(drains_after=0))
+        l.reopen_wait = 0
+        self.assertTrue(l.is_open)
+        with self.assertRaises(NoDevice):
+            l.reopen()
+        self.assertFalse(l.is_open)
+        with self.assertRaises(PortClosed):
+            l.discard_input()
 
 
 if __name__ == "__main__":

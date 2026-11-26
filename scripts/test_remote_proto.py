@@ -281,7 +281,12 @@ MUTATIONS: tuple[Mutation, ...] = (
     # ── stage-190: DESCRIPTION section 7 (identity) ──
     Mutation(
         name="identity: text not cut to ESP_DESC_TEXT_MAX",
-        old="        while (n < ESP_DESC_TEXT_MAX && s[n] != '\\0')",
+        old="    p = put_text(p, d.build_target, ESP_DESC_TEXT_MAX);",
+        new="    p = put_text(p, d.build_target, 255);",
+    ),
+    Mutation(
+        name="description texts never cut (put_text ignores max)",
+        old="        while (n < max && s[n] != '\\0')",
         new="        while (s[n] != '\\0')",
     ),
     Mutation(
@@ -303,6 +308,42 @@ MUTATIONS: tuple[Mutation, ...] = (
         name="SET_PROBE: channel 0 accepted",
         old="    if ((pkt->payload[0] != 1 && pkt->payload[0] != 2) ||\n        (pkt->payload[1] != 1",
         new="    if ((pkt->payload[0] > 2) ||\n        (pkt->payload[1] != 1",
+    ),
+    # ── stage-272: SET_METER_MODE, DESCRIPTION section 5 ──
+    Mutation(
+        name="SET_METER_MODE: function 11 accepted",
+        old="    if (pkt->payload[0] >= ESP_METER_FUNCTIONS) {",
+        new="    if (pkt->payload[0] > ESP_METER_FUNCTIONS) {",
+    ),
+    Mutation(
+        name="SET_METER_MODE: provider BAD_ARG sent as NOT_READY",
+        old="    case ESP_CTRL_BAD_ARG:    esp_comm_send_nak(ESP_ERR_BAD_ARG); break;\n",
+        new="",
+    ),
+    Mutation(
+        name="SET_METER_MODE: not dispatched",
+        old="    case ESP_CMD_SET_METER_MODE:    handle_set_meter_mode(pkt); break;\n",
+        new="",
+    ),
+    Mutation(
+        name="meter section: usable flag sent raw",
+        old="            *p++ = d.meter_usable[i] ? 1u : 0u;",
+        new="            *p++ = d.meter_usable[i];",
+    ),
+    Mutation(
+        name="meter section: unit not cut to ESP_DESC_METER_UNIT_MAX",
+        old="            p = put_text(p, d.meter_unit[i], ESP_DESC_METER_UNIT_MAX);",
+        new="            p = put_text(p, d.meter_unit[i], ESP_DESC_METER_NAME_MAX);",
+    ),
+    Mutation(
+        name="meter section: length left at 0",
+        old="        put_u16(&meter[1], (uint16_t)(p - meter - 3));\n",
+        new="",
+    ),
+    Mutation(
+        name="meter section: sent with no functions",
+        old="    if (d.meter_n) {",
+        new="    if (1) {",
     ),
     Mutation(
         name="SCOPE_STATE: provider probe sent raw",

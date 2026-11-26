@@ -225,7 +225,7 @@ Existing codes are kept as-is. New codes for remote view/control start at `0x20`
 | `0x25` | `SET_TIMEBASE` | `u8 index` | index into `timebase_table[]`, 0..20 |
 | `0x26` | `SET_VDIV` | `u8 channel`, `u8 index` | index into `vdiv_table[]`, 0..9 |
 | `0x27` | `SET_TRIGGER` | `u8 mode`, `u8 edge`, `u8 source`, `i16 level` | mirrors `trigger_state_t` |
-| `0x28` | `SET_METER_MODE` | `u8 submode`, `u8 layout` | submode 0..9, layout 0..3 |
+| `0x28` | `SET_METER_MODE` | `u8 function` | 0..10 (`meter_modes[]` order, §9.3); `BAD_ARG` for 11 and up or a function not usable on this image, `UNSUPPORTED_IN_MODE` outside meter mode (nothing changes). ACK = queued; METER_FRAME `submode` shows the function in force |
 | `0x29` | `RUN_STOP` | `u8 running` | mirrors `scope_state.running` |
 | `0x2A` | `GET_DESCRIPTION` | — | the unit's tables in one reply (`DESCRIPTION`, §9.1) |
 | `0x2B` | `SET_PROBE` | `u8 channel`, `u8 factor` | channel 1\|2, factor 1\|10; `BAD_ARG` otherwise (§9.1) |
@@ -602,8 +602,8 @@ also draws it.
 
 ### 9.2 Unit identity and API level (stage-190)
 
-**DESCRIPTION section 7 "identity".** Appended after section 4 (ids 5 and 6 are kept for the
-meter and the generator). A host from before this stage skips it by the rule of §9.1.
+**DESCRIPTION section 7 "identity".** Appended after section 4 (id 5 is the meter, §9.3; id 6
+is kept for the generator). A host from before this stage skips it by the rule of §9.1.
 
 ```
 u8[12] uid           MCU unique ID: the words at 0x1FFFF7E8, 0x1FFFF7EC, 0x1FFFF7F0,
@@ -616,7 +616,8 @@ u8     rev_len       then char rev[rev_len]: git revision, e.g. "0a1af35", "0a1a
 
 The texts have no NUL and are cut to 31 bytes. Fields added later go at the end; a host reads
 the fields it knows and ignores the rest. The reply is 280 bytes for "guest-coldtrace" and a
-7-digit revision (286 with "-dirty"), 320 bytes at most. The USB serial number that Windows shows is made from the
+7-digit revision (286 with "-dirty"), 320 bytes at most (stage-272 appends section 5: 444
+bytes, 610 at most, §9.3). The USB serial number that Windows shows is made from the
 same ID by the vendor CDC code (`cdc_desc.c` `get_serial_num()`): 8 hex digits of
 `(ID1 + ID3) mod 2^32`, then 4 hex digits of `ID2 >> 16`. It is a hash: the ID cannot be
 calculated from it.
@@ -625,6 +626,7 @@ calculated from it.
 
 * A host reads "no section 7" (or no `GET_DESCRIPTION`) as level 0.
 * Level 1 = this stage: sections 1-4 and 7, `SET_PROBE`, every command before them.
+* Level 2 = stage-272: `SET_METER_MODE` and section 5 (§9.3).
 * Raise the level by 1 in the change that adds a command, a section or a field that the GUI
   uses. Never lower it. A fix that does not change the link does not raise it.
 * The GUI states the lowest level that it needs. Below that level it asks for a firmware
@@ -639,3 +641,54 @@ calculated from it.
 core.filemode=false`, so a WSL build of a Windows checkout is not always "dirty". A
 non-`clean` incremental `make all` keeps the revision of its last full compile of
 `usb_debug.c`; every guest target cleans first.
+
+### 9.3 Meter function over the link (stage-272)
+
+**DESCRIPTION section 5 "meter".** Sent after section 7 (a host walks the sections by id, so
+the order does not matter; sections 1-4 and 7 are unchanged). Left out when the firmware gives
+no functions.
+
+```
+u8   n               11 on this tree (METER_SUBMODE_COUNT)
+then per function:
+u8   id              the SET_METER_MODE argument and the METER_FRAME submode
+u8   usable          1 = bench-checked on this image, 0 = SET_METER_MODE refuses it
+u8   name_len        then char name[name_len]: as the LCD shows it, e.g. "DC Voltage"
+u8   unit_len        then char unit[unit_len]: e.g. "V", "kOhm"
+```
+
+The texts have no NUL; a name is cut to 15 bytes, a unit to 7. Names and units come from the
+LCD's table (`meter_ui.c` `meter_modes[]`), the usable flags from one table in
+`fpga_meter_plan.c` that cites its bench record: on `guest-coldtrace` from stage-272 DC V,
+AC V, resistance, continuity and diode are usable (stage-270 bench, unit #1); DC mA, DC A,
+AC mA, AC A, capacitance and temperature are not checked (G-470) and are refused. An image
+that never sends a function selector (a warm-handoff build without `FPGA_METER_SUBMODES`)
+marks DC V only. The section is 161 bytes (164 with its header) for the 11 functions of this
+tree. A host from before this stage skips id 5 (`test_end_to_end.py` runs the stage-086 and
+stage-270 parsers against the new encoder).
+
+**`SET_METER_MODE` (`0x28`): `u8 function`.** The same path as the meter's Function softkey:
+`meter_submode`, the meter screen's resets (min/max, hold, relative), then
+`fpga_request_meter_mode()` to the meter poll task. Replies:
+
+* `ACK` when the request is queued. The meter chip takes about 1.4 s (up to about 4.5 s), and
+  `GET_METER` answers `NOT_READY` meanwhile; a METER_FRAME whose `submode` equals the request
+  is from the new function. Resistance and AC V show their autorange values (`OL`, 0.0000 V)
+  for about 1.3-2 s more (`testing.md` C-310 in the agent notes).
+* The function in force already: `ACK`, nothing changes (no new chip transition; the min/max
+  stay). So a resend after a lost reply is safe.
+* `BAD_LENGTH` (not 1 byte), `BAD_ARG` for 11 and up (provider not called), `BAD_ARG` for a
+  function that section 5 marks not usable (in any mode), then `UNSUPPORTED_IN_MODE` outside
+  meter mode. Nothing changes after a refusal. The unit's Function key still reaches all 11.
+* Like every host set, no flash write: the settings store saves `meter_submode` on the next
+  button press, MENU, or power-off countdown.
+
+The old `u8 layout` byte of the planned row is gone: the layout is an LCD view, and a host has
+its own views.
+
+Host library: `proto.MeterFunction`, `Description.meter_functions` (empty for older
+firmware), `Description.meter_function(id_or_name)`, `Description.meter_function_name(submode)`,
+`Device.set_meter_function(id_or_name)`. Names match with case, `-`, `_` and spaces ignored.
+CLI: `openscope set meter <name>` (for example `dc-voltage`, `resistance`; exit 64 for a name
+the firmware does not list, nothing sent; exit 2 for a refusal), `openscope describe` lists the
+functions, `openscope meter` prints the function name of each reading.

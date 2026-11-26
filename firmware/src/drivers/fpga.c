@@ -2704,6 +2704,13 @@ static volatile int16_t   meter_mode_request = -1;
  * selector resends (sent by the poll task). See fpga_meter_plan.h. */
 fpga_meter_auto_recover_t fpga_meter_auto_recover;
 
+/* stage-272: false when this image never sends a function selector (a warm
+ * handoff build without FPGA_METER_SUBMODES: the chip stays in DC V). */
+bool fpga_meter_functions_switch(void)
+{
+    return !(FPGA_WARM_HANDOFF_TEST && !FPGA_METER_SUBMODES);
+}
+
 void fpga_request_meter_mode(uint8_t submode)
 {
 #if FPGA_WARM_HANDOFF_TEST && !FPGA_METER_SUBMODES

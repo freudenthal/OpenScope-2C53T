@@ -795,6 +795,20 @@ static void test_auto_recover_counts_frames_and_limits_resends(void)
     EXPECT_EQ_U16("run saturates", s.auto_run, 0xFFFF);
 }
 
+/* stage-272: the host-selectable set is the stage-270 bench record exactly:
+ * DC V, AC V, resistance, continuity, diode. */
+static void test_usable_functions_are_the_stage270_bench_record(void)
+{
+    static const uint8_t want[11] = { 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
+    char name[40];
+    for (uint8_t s = 0; s < 11; s++) {
+        snprintf(name, sizeof(name), "usable %u", (unsigned)s);
+        EXPECT_EQ_U8(name, fpga_meter_submode_is_usable(s), want[s]);
+    }
+    EXPECT_EQ_U8("11 is not usable", fpga_meter_submode_is_usable(11), 0);
+    EXPECT_EQ_U8("255 is not usable", fpga_meter_submode_is_usable(255), 0);
+}
+
 int main(void)
 {
     test_measured_word_map_is_one_distinct_word_per_submode();
@@ -815,6 +829,7 @@ int main(void)
     test_rx_frame_gate_preserves_discard_budget_while_busy();
     test_every_submode_transition_drains_before_accepting_frames();
     test_auto_recover_counts_frames_and_limits_resends();
+    test_usable_functions_are_the_stage270_bench_record();
 
     if (failures) {
         printf("%d fpga meter plan test(s) failed\n", failures);

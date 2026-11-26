@@ -233,6 +233,7 @@ void     meter_hold_toggle_now(void);     /* OK: freeze the shown reading / back
 void     meter_hold_release(void);
 bool     meter_hold_is_on(void);
 void     meter_function_step(int8_t dir); /* next/previous function (MOVE, LEFT/RIGHT) */
+void     meter_function_select(uint8_t m); /* stage-272: host set, same path as the softkey */
 void     meter_limits_nudge(int8_t dir);  /* UP/DOWN in the Limits view */
 bool     meter_softkey_press(int8_t slot);
 void     meter_softkeys_draw(void);
@@ -255,6 +256,7 @@ void fuse_prev_rating(void);
 void fuse_next_type(void);
 void fuse_prev_type(void);
 const char *meter_submode_name(uint8_t submode);
+const char *meter_submode_unit(uint8_t submode);
 const char *startup_mode_name(startup_mode_t mode);
 void startup_mode_set(startup_mode_t mode);
 void startup_mode_adjust(int dir);

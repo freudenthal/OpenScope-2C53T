@@ -47,6 +47,7 @@
 #define ESP_CMD_SET_TIMEBASE    0x25    /* u8 reg 0x01 code 0..ESP_TIMEBASE_CODES-1 */
 #define ESP_CMD_SET_VDIV        0x26    /* u8 channel 1|2, u8 range 0..ESP_VDIV_RANGES-1 */
 #define ESP_CMD_SET_TRIGGER     0x27    /* u8 mode, u8 edge, u8 source, i16 level */
+#define ESP_CMD_SET_METER_MODE  0x28    /* stage-272: u8 function 0..ESP_METER_FUNCTIONS-1 */
 #define ESP_CMD_RUN_STOP        0x29    /* u8 running 0|1 */
 #define ESP_CMD_GET_DESCRIPTION 0x2A    /* stage-086: -> DESCRIPTION (layout below) */
 #define ESP_CMD_SET_PROBE       0x2B    /* stage-086: u8 channel 1|2, u8 factor 1|10 */
@@ -287,10 +288,17 @@ typedef esp_wave_result_t (*esp_wave_fn)(uint8_t channel_mask, esp_wave_snapshot
  *                 1 falling), u8 source (0 CH1, 1 CH2), i16 level -100..100
  *   RUN_STOP      u8 running (0 stop, 1 run)
  *   SET_PROBE     u8 channel (1|2), u8 factor (1|10)              (stage-086)
+ *   SET_METER_MODE u8 function 0..ESP_METER_FUNCTIONS-1 (meter_modes[] order,
+ *                 description section 5)                          (stage-272)
  * Replies: ACK once the setting is in force. NAK BAD_LENGTH / BAD_ARG for a
  * malformed request (provider not called), NOT_READY when the provider could
  * not apply it (nothing changed), UNSUPPORTED_IN_MODE when the provider needs
  * another mode, UNSUPPORTED when no provider is bound.
+ * SET_METER_MODE is the exception to "in force": ACK = the request is queued
+ * (the meter chip takes ~1.4 s, up to ~4.5 s); METER_FRAME `submode` shows the
+ * function in force. Its provider answers BAD_ARG (ESP_CTRL_BAD_ARG) for a
+ * function that is not usable on this image, in any mode, before the mode
+ * check.
  *
  * SCOPE_STATE payload v1, explicit little-endian layout (not a struct dump):
  *   [0]      u8   version         ESP_SCOPE_STATE_VERSION
@@ -374,8 +382,14 @@ typedef struct {
  *               shows them), u16 api_level (ESP_API_LEVEL), u8 target_len,
  *               char target[target_len], u8 rev_len, char rev[rev_len]
  *               (no NUL; each text cut to ESP_DESC_TEXT_MAX). Fields added
- *               later go at the end. Ids 5 and 6 are kept for the meter and
- *               the generator (stages 272, 282).
+ *               later go at the end. Id 6 is kept for the generator
+ *               (stage 282).
+ *   5 meter     (stage-272, sent after section 7; left out when the provider
+ *               gives no functions) u8 n, then per function: u8 id (the
+ *               SET_METER_MODE argument), u8 usable (1 = bench-checked on this
+ *               image), u8 name_len, char name[name_len], u8 unit_len,
+ *               char unit[unit_len] (no NUL; name cut to
+ *               ESP_DESC_METER_NAME_MAX, unit to ESP_DESC_METER_UNIT_MAX).
  * The encoder zeroes a value whose tier is NONE and sends tier NONE for a
  * zero value, as everywhere else on this link. */
 #define ESP_DESCRIPTION_VERSION 1
@@ -391,16 +405,25 @@ typedef struct {
 #define ESP_DESC_TEXT_MAX       31u     /* target and rev bytes on the wire */
 #define ESP_DESC_UID_LEN        12u
 #define ESP_DESC_IDENTITY_MAX   (ESP_DESC_UID_LEN + 2u + 1u + ESP_DESC_TEXT_MAX + 1u + ESP_DESC_TEXT_MAX) /* 78 */
-/* The largest reply: version + 5 section headers + the sections = 320. The
- * identity section is shorter when the texts are: the reply length is the
- * bytes written. Sections 1-4 alone are 239 B (stage-086). */
-#define ESP_DESCRIPTION_LEN     (1u + 5u * 3u + ESP_DESC_TB_LEN + ESP_DESC_RANGES_LEN + \
-                                 ESP_DESC_TRIGGER_LEN + ESP_DESC_PROBE_LEN + ESP_DESC_IDENTITY_MAX)
+#define ESP_DESC_SEC_METER      5
+#define ESP_METER_FUNCTIONS     11      /* METER_SUBMODE_COUNT (usb_debug.c asserts) */
+#define ESP_DESC_METER_NAME_MAX 15u
+#define ESP_DESC_METER_UNIT_MAX 7u
+#define ESP_DESC_METER_MAX      (1u + ESP_METER_FUNCTIONS * \
+                                 (4u + ESP_DESC_METER_NAME_MAX + ESP_DESC_METER_UNIT_MAX)) /* 287 */
+/* The largest reply: version + 6 section headers + the sections = 610. The
+ * identity and meter sections are shorter when the texts are: the reply
+ * length is the bytes written. Sections 1-4 alone are 239 B (stage-086). */
+#define ESP_DESCRIPTION_LEN     (1u + 6u * 3u + ESP_DESC_TB_LEN + ESP_DESC_RANGES_LEN + \
+                                 ESP_DESC_TRIGGER_LEN + ESP_DESC_PROBE_LEN + ESP_DESC_IDENTITY_MAX + \
+                                 ESP_DESC_METER_MAX)
 
 /* Link API level (stage-190, remote_protocol.md §9.2). A host reads "no
  * section 7" as level 0. Raise it by 1 when the link gets a command, a section
- * or a field that the GUI uses. Never lower it. */
-#define ESP_API_LEVEL           1
+ * or a field that the GUI uses. Never lower it.
+ *   1  stage-190: sections 1-4 and 7, SET_PROBE
+ *   2  stage-272: SET_METER_MODE, section 5 (the GUI meter panel, stage-275) */
+#define ESP_API_LEVEL           2
 
 typedef struct {
     uint16_t samples_per_div;
@@ -419,12 +442,19 @@ typedef struct {
     uint8_t     uid[ESP_DESC_UID_LEN];
     const char *build_target;   /* NUL-terminated make goal, e.g. "guest-coldtrace" */
     const char *git_rev;        /* NUL-terminated, e.g. "0a1af35" or "0a1af35-dirty" */
+    /* stage-272: section 5. meter_n 0 = no section; function i has id i.
+     * NULL texts are sent empty. */
+    uint8_t     meter_n;
+    uint8_t     meter_usable[ESP_METER_FUNCTIONS];
+    const char *meter_name[ESP_METER_FUNCTIONS];
+    const char *meter_unit[ESP_METER_FUNCTIONS];
 } esp_description_t;
 
 typedef enum {
     ESP_CTRL_OK = 0,
     ESP_CTRL_NOT_READY,         /* could not apply (e.g. acq task would not park): nothing changed */
     ESP_CTRL_WRONG_MODE,        /* the setting needs another device mode */
+    ESP_CTRL_BAD_ARG,           /* stage-272: an argument this image refuses (NAK BAD_ARG) */
 } esp_ctrl_result_t;
 
 /* All members may be NULL: the matching command then answers UNSUPPORTED.
@@ -440,6 +470,8 @@ typedef struct {
     /* stage-086. Appended: an older table that stops at run_stop stays valid. */
     void              (*get_description)(esp_description_t *out);
     esp_ctrl_result_t (*set_probe)(uint8_t channel, uint8_t factor);
+    /* stage-272. Appended: function < ESP_METER_FUNCTIONS already checked. */
+    esp_ctrl_result_t (*set_meter_function)(uint8_t function);
 } esp_control_ops_t;
 /* Inject a button press (id 1..15 = button_id_t). Return false if it could
  * not be queued, so the host gets NAK instead of a false ACK. */

@@ -73,7 +73,37 @@ static esp_ctrl_result_t c_run(bool r) { rec(5, r, 0, 0, 0); if (!ctrl_result) c
 static esp_description_t ds;
 static void c_desc(esp_description_t *o) { *o = ds; o->probe[0] = cs.ch[0].probe; o->probe[1] = cs.ch[1].probe; }
 static esp_ctrl_result_t c_probe(uint8_t ch, uint8_t f) { rec(6, ch, f, 0, 0); if (!ctrl_result) cs.ch[ch - 1].probe = f; return (esp_ctrl_result_t)ctrl_result; }
-static const esp_control_ops_t ctrl_ops = { c_get, c_mode, c_tb, c_vdiv, c_trig, c_run, c_desc, c_probe };
+/* stage-272: SET_METER_MODE (which = 7) as usb_debug.c answers it: a function
+ * the description marks not usable -> BAD_ARG (any mode), then meter mode
+ * only; OK puts the function in the METER_FRAME submode. ctrl_result != 0
+ * overrides the answer, as for the other sets. */
+static esp_ctrl_result_t c_meter_fn(uint8_t f)
+{
+    rec(7, f, 0, 0, 0);
+    if (ctrl_result) return (esp_ctrl_result_t)ctrl_result;
+    if (f >= ds.meter_n || !ds.meter_usable[f]) return ESP_CTRL_BAD_ARG;
+    if (cs.mode != 1) return ESP_CTRL_WRONG_MODE;
+    mt.submode = f;
+    return ESP_CTRL_OK;
+}
+static const esp_control_ops_t ctrl_ops = { c_get, c_mode, c_tb, c_vdiv, c_trig, c_run, c_desc, c_probe,
+                                            c_meter_fn };
+/* section 5 with the names, units and usable flags of guest-coldtrace c78f889+
+ * (meter_ui.c meter_modes[], fpga_meter_plan.c); n = 0 removes the section. */
+void shim_set_desc_meter(int n)
+{
+    static const char *names[ESP_METER_FUNCTIONS] = {
+        "DC Voltage", "AC Voltage", "DC mA", "DC Current", "AC mA", "AC Current",
+        "Resistance", "Continuity", "Diode", "Capacitance", "Temperature" };
+    static const char *units[ESP_METER_FUNCTIONS] = {
+        "V", "V", "mA", "A", "mA", "A", "kOhm", "Ohm", "V", "nF", "C" };
+    static const uint8_t usable[ESP_METER_FUNCTIONS] = { 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
+    ds.meter_n = (uint8_t)n;
+    for (int i = 0; i < ESP_METER_FUNCTIONS; i++) {
+        ds.meter_name[i] = names[i]; ds.meter_unit[i] = units[i]; ds.meter_usable[i] = usable[i];
+    }
+}
+int shim_meter_submode(void) { return mt.submode; }
 void shim_set_desc_rate(int code, uint32_t rate, int tier) { ds.tb_rate_hz[code] = rate; ds.tb_tier[code] = (uint8_t)tier; }
 void shim_set_desc_range(int ch, int r, uint32_t uv, int tier) { ds.uv_per_div_bnc[ch ? 1 : 0][r] = uv; ds.vdiv_tier[ch ? 1 : 0][r] = (uint8_t)tier; }
 void shim_set_scope_probe(int ch, int f) { cs.ch[ch ? 1 : 0].probe = (uint8_t)f; }

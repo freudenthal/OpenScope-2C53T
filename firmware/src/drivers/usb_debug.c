@@ -9168,6 +9168,15 @@ static esp_ctrl_result_t remote_run_stop(bool running)
  * in its own section, so a host never has to undo a factor. */
 _Static_assert((int)SCOPE_TIMEBASE_SAMPLES_PER_DIV == 32 && (int)SCOPE_CAL_COUNTS_PER_DIV == 32,
                "the u16 grid fields are whole numbers");
+_Static_assert((int)METER_SUBMODE_COUNT == (int)ESP_METER_FUNCTIONS, "one meter function list");
+
+/* stage-272: a function a host may select. The bench table is in
+ * fpga_meter_plan.c; an image that never sends a selector has DC V only. */
+static bool remote_meter_usable(uint8_t f)
+{
+    return fpga_meter_submode_is_usable(f) && (f == 0u || fpga_meter_functions_switch());
+}
+
 static void remote_description(esp_description_t *o)
 {
     o->samples_per_div = (uint16_t)SCOPE_TIMEBASE_SAMPLES_PER_DIV;
@@ -9197,6 +9206,13 @@ static void remote_description(esp_description_t *o)
     cal_backup_read_uid(o->uid);
     o->build_target = OPENSCOPE_BUILD_TARGET;
     o->git_rev      = OPENSCOPE_GIT_REV;
+    /* stage-272: section 5, from the LCD's own table (meter_modes[]) */
+    o->meter_n = ESP_METER_FUNCTIONS;
+    for (uint8_t f = 0; f < ESP_METER_FUNCTIONS; f++) {
+        o->meter_usable[f] = remote_meter_usable(f) ? 1u : 0u;
+        o->meter_name[f]   = meter_submode_name(f);
+        o->meter_unit[f]   = meter_submode_unit(f);
+    }
 }
 
 /* The same write the probe menu rows and the PRM-key cycle make: the field in
@@ -9218,6 +9234,23 @@ static esp_ctrl_result_t remote_set_probe(uint8_t ch, uint8_t factor)
     return ESP_CTRL_OK;
 }
 
+/* stage-272 SET_METER_MODE: the Function softkey's path (meter_submode, the
+ * meter screen's resets, fpga_request_meter_mode() to the poll task). ACK
+ * when queued; METER_FRAME submode shows the function in force. Order: an
+ * argument this image refuses first (any mode), then the mode. The function
+ * in force already: ACK, nothing changes (no new transition, the min/max
+ * stay). No flash write: the settings store saves meter_submode later. */
+static esp_ctrl_result_t remote_set_meter_function(uint8_t f)
+{
+    if (!remote_meter_usable(f))
+        return ESP_CTRL_BAD_ARG;
+    if (current_mode != MODE_MULTIMETER)
+        return ESP_CTRL_WRONG_MODE;
+    if (meter_submode != f)
+        meter_function_select(f);
+    return ESP_CTRL_OK;
+}
+
 static const esp_control_ops_t remote_control = {
     .get_state       = remote_scope_state,
     .set_mode        = remote_set_mode,
@@ -9227,6 +9260,7 @@ static const esp_control_ops_t remote_control = {
     .run_stop        = remote_run_stop,
     .get_description = remote_description,
     .set_probe       = remote_set_probe,
+    .set_meter_function = remote_set_meter_function,
 };
 
 static void remote_to_shell(const uint8_t *data, uint16_t len, void *ctx)

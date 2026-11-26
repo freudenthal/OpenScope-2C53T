@@ -130,6 +130,35 @@ bool fpga_meter_submode_is_valid(uint8_t submode)
     return submode < FPGA_METER_LOCAL_SUBMODE_COUNT;
 }
 
+/*
+ * Functions a host may select (SET_METER_MODE, description section 5;
+ * stage-272). The bench record is stage-270 Run 1 (2026-11-25, unit #1,
+ * guest-coldtrace c78f889): DC V 3.254 V, AC V 1.6232 V at 50 Hz, resistance /
+ * continuity / diode "OL" open and ~0 Ohm shorted. Not checked there (G-470):
+ * DC mA, DC A, AC mA, AC A (no source or load; AC current decode not checked
+ * anywhere), capacitance (no capacitor fixture), temperature (no probe).
+ * The Function softkey still reaches all 11. Mark a function usable only with
+ * a bench record that names it.
+ */
+static const uint8_t meter_submode_usable[FPGA_METER_LOCAL_SUBMODE_COUNT] = {
+    1,  /* 0  DC voltage */
+    1,  /* 1  AC voltage */
+    0,  /* 2  DC mA */
+    0,  /* 3  DC A */
+    0,  /* 4  AC mA */
+    0,  /* 5  AC A */
+    1,  /* 6  resistance */
+    1,  /* 7  continuity */
+    1,  /* 8  diode */
+    0,  /* 9  capacitance */
+    0,  /* 10 temperature */
+};
+
+bool fpga_meter_submode_is_usable(uint8_t submode)
+{
+    return fpga_meter_submode_is_valid(submode) && meter_submode_usable[submode] != 0u;
+}
+
 bool fpga_meter_logical_function_is_valid(uint8_t function)
 {
     return function < FPGA_METER_LOGICAL_FUNCTION_COUNT;

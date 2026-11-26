@@ -51,7 +51,8 @@ IDEMPOTENT = frozenset({proto.CMD_PING, proto.CMD_STATUS, proto.CMD_GET_METER,
                         proto.CMD_GET_WAVEFORM, proto.CMD_GET_SCOPE_STATE,
                         proto.CMD_SET_MODE, proto.CMD_SET_TIMEBASE, proto.CMD_SET_VDIV,
                         proto.CMD_SET_TRIGGER, proto.CMD_RUN_STOP,
-                        proto.CMD_GET_DESCRIPTION, proto.CMD_SET_PROBE})
+                        proto.CMD_GET_DESCRIPTION, proto.CMD_SET_PROBE,
+                        proto.CMD_SET_METER_MODE})   # the function in force again: no change
 
 # Shell commands that only read. The shell also has commands that reset the
 # device (fwapply, fwswap, reboot bootloader) or write flash, so a shell line
@@ -361,6 +362,25 @@ class Device:
         payload = proto.payload_set_probe(channel, factor)
         self._description = None    # its probe section is now stale
         self._request_slow(proto.CMD_SET_PROBE, payload, self.SET_TIMEOUT_S)
+
+    # ── meter function (stage-272) ────────────────────────────────
+    def meter_function(self, id_or_name) -> proto.MeterFunction:
+        """The function `id_or_name` names on this firmware (description
+        section 5): an id 0..10, or a name with case, '-', '_' and spaces
+        ignored ('dc-voltage', 'Resistance'). ValueError when the firmware
+        does not list it (firmware before stage-272 lists none)."""
+        return self.description().meter_function(id_or_name)
+
+    def set_meter_function(self, id_or_name) -> proto.MeterFunction:
+        """Select a meter function, as the Function softkey does. Needs meter
+        mode (else Nak UNSUPPORTED_IN_MODE). ACK means queued: the meter chip
+        takes ~1.4 s (up to ~4.5 s) and reads NOT_READY meanwhile; a reading
+        whose `submode` equals the id is from the new function. Refused
+        (Nak BAD_ARG) for a function the firmware marks not usable."""
+        f = self.meter_function(id_or_name)
+        self._request_slow(proto.CMD_SET_METER_MODE, proto.payload_set_meter_mode(f.id),
+                           self.SET_TIMEOUT_S)
+        return f
 
     # ── ASCII shell (same port; §3.2 keeps it alive next to the protocol) ──
     def shell(self, line: str, timeout: float = 3.0) -> str:

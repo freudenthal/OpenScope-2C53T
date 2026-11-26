@@ -479,5 +479,66 @@ class TestDescription(unittest.TestCase):
         self.assertEqual(s.ch[0].uv_per_div, 42950)     # uv_per_div keeps its meaning
 
 
+METER_11 = tuple(proto.MeterFunction(i, i in (0, 1, 6, 7, 8), n, u) for i, (n, u) in enumerate((
+    ("DC Voltage", "V"), ("AC Voltage", "V"), ("DC mA", "mA"), ("DC Current", "A"), ("AC mA", "mA"),
+    ("AC Current", "A"), ("Resistance", "kOhm"), ("Continuity", "Ohm"), ("Diode", "V"),
+    ("Capacitance", "nF"), ("Temperature", "C"))))
+
+
+class TestMeterFunctions(unittest.TestCase):
+    """stage-272: DESCRIPTION section 5 and SET_METER_MODE."""
+
+    def test_section_5_round_trip(self):
+        d = sample_description(meter_functions=METER_11)
+        p = proto.encode_description(d)
+        back = proto.parse_description(p)
+        self.assertEqual(back, d)
+        self.assertEqual(back.skipped, ())
+        self.assertEqual([f.name for f in back.meter_functions if f.usable],
+                         ["DC Voltage", "AC Voltage", "Resistance", "Continuity", "Diode"])
+
+    def test_old_firmware_lists_no_functions(self):
+        d = proto.parse_description(proto.encode_description(sample_description()))
+        self.assertEqual(d.meter_functions, ())
+        with self.assertRaisesRegex(ValueError, "does not list meter functions"):
+            d.meter_function("dc-voltage")
+        self.assertEqual(d.meter_function_name(6), "function 6")
+
+    def test_name_matching_ignores_case_dash_underscore_space(self):
+        d = sample_description(meter_functions=METER_11)
+        for name in ("dc-voltage", "DC Voltage", "dc_voltage", "DCVOLTAGE", " dc voltage ", 0, "0"):
+            self.assertEqual(d.meter_function(name).id, 0, name)
+        self.assertEqual(d.meter_function("resistance").unit, "kOhm")
+        self.assertEqual(d.meter_function("ac-ma").id, 4)
+        self.assertEqual(d.meter_function(10).name, "Temperature")
+        for bad in ("voltage", "dc", "ohm", 11, "11", -1, True):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                d.meter_function(bad)
+        with self.assertRaisesRegex(ValueError, "dc-voltage, ac-voltage, dc-ma"):
+            d.meter_function("nope")
+        self.assertEqual(METER_11[3].cli_name, "dc-current")
+        self.assertEqual(d.meter_function_name(7), "Continuity")
+        self.assertEqual(d.meter_function_name(99), "function 99")
+
+    def test_payload_set_meter_mode(self):
+        self.assertEqual(proto.payload_set_meter_mode(0), b"\x00")
+        self.assertEqual(proto.payload_set_meter_mode(10), b"\x0a")
+        for bad in (11, -1, 255, "1", 1.0, True, None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                proto.payload_set_meter_mode(bad)
+
+    def test_texts_cut_appended_bytes_ignored_malformed_refused(self):
+        long = (proto.MeterFunction(0, True, "N" * 20, "U" * 9),)
+        back = proto.parse_description(proto.encode_description(sample_description(meter_functions=long)))
+        self.assertEqual((back.meter_functions[0].name, back.meter_functions[0].unit), ("N" * 15, "U" * 7))
+        sec = b"\x01\x00\x01\x02ab\x01V" + b"\x99"      # a later field after the list
+        f = proto.parse_description(bytes([1]) + struct.pack("<BH", 5, len(sec)) + sec).meter_functions
+        self.assertEqual(f, (proto.MeterFunction(0, True, "ab", "V"),))
+        for bad in (b"", b"\x01", b"\x01\x00\x01", b"\x01\x00\x01\x05ab", b"\x01\x00\x01\x01a",
+                    b"\x02\x00\x01\x01a\x00"):        # empty, no entry, no name len, cut, no unit, 2nd missing
+            with self.assertRaises(proto.ProtocolError, msg=bad.hex()):
+                proto.parse_description(bytes([1]) + struct.pack("<BH", 5, len(bad)) + bad)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -79,6 +79,10 @@ def _meter(dev: Device, a) -> int:
     continuous = a.count == 0
     last = None
     n = 0
+    try:                                    # names of METER_FRAME submode (stage-272 section 5)
+        desc: Optional[proto.Description] = dev.description()
+    except Nak:                             # firmware before stage-086
+        desc = None
     # A frozen update_count means the meter is not producing readings (wrong
     # mode, meter chip silent). A finite --count must not poll forever.
     stale_limit = max(3.0, 20 * a.interval)
@@ -89,8 +93,11 @@ def _meter(dev: Device, a) -> int:
                 m = dev.meter()
             except (Nak, Timeout) as e:
                 # A long log must survive a range change (NOT_READY) or one
-                # lost reply; a one-shot read reports it.
-                if not continuous:
+                # lost reply. A finite count waits through NOT_READY too (a
+                # function change shows dashes for ~1.5-4.5 s, G-220), until
+                # the stale limit; any other refusal ends it.
+                not_ready = isinstance(e, Nak) and proto.ERRORS.get(e.code) == "NOT_READY"
+                if not continuous and not (not_ready and _now() - last_new <= stale_limit):
                     raise
                 print(f"# {e}", file=sys.stderr, flush=True)
                 _t.sleep(max(a.interval, 0.5))
@@ -102,7 +109,9 @@ def _meter(dev: Device, a) -> int:
             if m.update_count != last:          # only new readings, not re-reads
                 last = m.update_count
                 last_new = _now()
-                print(f"{m.display} {m.unit}   ({m.result}, raw {m.raw_bcd}, #{m.update_count})", flush=True)
+                fname = desc.meter_function_name(m.submode) if desc else f"function {m.submode}"
+                print(f"{m.display} {m.unit}   {fname}   ({m.result}, raw {m.raw_bcd}, #{m.update_count})",
+                      flush=True)
                 if writer:
                     writer.writerow([f"{_t.time():.3f}", m.update_count, m.value, m.unit, m.display,
                                      m.raw_bcd, m.decimal_pos, m.result, m.submode,
@@ -174,7 +183,7 @@ def write_capture_npz(path: str, captures) -> None:
 
 def nak_explained(e: Nak) -> str:
     name = proto.ERRORS.get(e.code, "")
-    hint = proto.NAK_HINTS.get(name)
+    hint = proto.NAK_HINTS_BY_CMD.get((e.cmd, name)) or proto.NAK_HINTS.get(name)
     return f"{e}: {hint}" if hint else str(e)
 
 
@@ -306,6 +315,13 @@ def describe_lines(d: proto.Description) -> List[str]:
                      f"{t.counts_per_level:.3f} ADC counts per level step")
     if d.probe:
         lines.append("probe     " + ", ".join(f"CH{i + 1} x{f}" for i, f in enumerate(d.probe)))
+    if d.meter_functions:
+        lines.append("meter     (`openscope set meter <name>`; not usable = not bench-checked, refused)")
+        lines.append(f"  {'name':<16}{'unit':<7}{'usable':<8}id")
+        for f in d.meter_functions:
+            lines.append(f"  {f.cli_name:<16}{f.unit:<7}{'yes' if f.usable else 'no':<8}{f.id}")
+    else:
+        lines.append("meter     functions not reported (firmware before stage-272)")
     lines.extend(identity_lines(d.identity))
     if d.skipped:
         lines.append("sections this tool does not read: " + ", ".join(str(s) for s in d.skipped))
@@ -320,7 +336,8 @@ def _describe(dev: Device, _a) -> int:
 
 SET_USAGE = ("set timebase <code 0x00-0x14> | set vdiv <1|2> <0-9> | "
              "set trigger <auto|normal|single> [rising|falling] [ch1|ch2] [level -100..100] | "
-             "set run | set stop | set mode <scope|meter|siggen|settings> | set probe <1|2> <1|10>")
+             "set run | set stop | set mode <scope|meter|siggen|settings> | set probe <1|2> <1|10> | "
+             "set meter <function name or id, e.g. dc-voltage, resistance>")
 
 
 def _int(text: str) -> int:
@@ -343,6 +360,18 @@ def _set(dev: Device, a) -> int:
             ch, factor = _int(v[0]), _int(v[1])
             proto.payload_set_probe(ch, factor)
             action = lambda: dev.set_probe(ch, factor)  # noqa: E731
+        elif what == "meter" and v:
+            # Names come from the firmware (description section 5): checked
+            # before SET_METER_MODE is sent. Several words: "dc voltage".
+            func = dev.meter_function(" ".join(v))
+            try:
+                dev.set_meter_function(func.id)
+            except Nak as e:
+                print(f"refused: {nak_explained(e)}", file=sys.stderr)
+                return EXIT_DEVICE_ERROR
+            print(f"meter     {func.name} ({func.unit}) requested; the meter chip takes about "
+                  "1.5 s (up to 4.5 s), the readings show it then")
+            return EXIT_OK
         elif what in ("run", "stop") and not v:
             action = lambda: dev.run_stop(what == "run")  # noqa: E731
         elif what == "mode" and len(v) == 1:
@@ -634,9 +663,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("state", help="scope settings: mode, timebase, volts/div, probe, trigger, run/stop")
     sub.add_parser("describe", help="time/div of every timebase code, volts/div of every range, "
                                     "trigger scale, probe (practical units; codes last)")
-    p = sub.add_parser("set", help="change a scope setting; prints the state in force after it",
-                       description=SET_USAGE)
-    p.add_argument("what", choices=["timebase", "vdiv", "trigger", "run", "stop", "mode", "probe"])
+    p = sub.add_parser("set", help="change a scope setting (prints the state in force after it) "
+                                   "or the meter function", description=SET_USAGE)
+    p.add_argument("what", choices=["timebase", "vdiv", "trigger", "run", "stop", "mode", "probe",
+                                    "meter"])
     p.add_argument("values", nargs="*", metavar="VALUE")
     p = sub.add_parser("shell", help="run one ASCII debug-shell command")
     p.add_argument("line", nargs="+")

@@ -553,6 +553,13 @@ const char *meter_submode_name(uint8_t submode)
     return meter_modes[submode].name;
 }
 
+/* stage-272: description section 5 names the unit the LCD shows. */
+const char *meter_submode_unit(uint8_t submode)
+{
+    if (submode >= METER_SUBMODE_COUNT) return "";
+    return meter_modes[submode].unit;
+}
+
 void meter_screen_invalidate(void)
 {
     meter_screen_retained_valid = false;
@@ -963,6 +970,14 @@ static void meter_function_set(uint8_t m)
     meter_hold_release();
     if (meter_rel_enabled) meter_toggle_relative();     /* a reference in another function means nothing */
     fpga_request_meter_mode(meter_submode);             /* in the background: the UI shows dashes meanwhile */
+}
+
+/* stage-272 SET_METER_MODE: the Function softkey's path (no flash write; the
+ * settings store saves meter_submode like any other change). */
+void meter_function_select(uint8_t m)
+{
+    if (m < METER_SUBMODE_COUNT)
+        meter_function_set(m);
 }
 
 void meter_function_step(int8_t dir)

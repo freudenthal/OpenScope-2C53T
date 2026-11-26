@@ -83,6 +83,8 @@ typedef struct {
 } fpga_meter_mux_gpio_state_t;
 
 bool fpga_meter_submode_is_valid(uint8_t submode);
+/* stage-272: bench-checked on guest-coldtrace (table and record in the .c). */
+bool fpga_meter_submode_is_usable(uint8_t submode);
 bool fpga_meter_logical_function_is_valid(uint8_t function);
 bool fpga_meter_logical_function_is_supported(uint8_t function);
 bool fpga_meter_logical_function_is_unresolved(uint8_t function);

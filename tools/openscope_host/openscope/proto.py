@@ -37,6 +37,7 @@ CMD_SET_MODE = 0x24
 CMD_SET_TIMEBASE = 0x25
 CMD_SET_VDIV = 0x26
 CMD_SET_TRIGGER = 0x27
+CMD_SET_METER_MODE = 0x28      # stage-272: u8 function (description section 5)
 CMD_RUN_STOP = 0x29
 CMD_GET_DESCRIPTION = 0x2A     # stage-086
 CMD_SET_PROBE = 0x2B
@@ -599,6 +600,16 @@ def payload_set_probe(channel: int, factor: int) -> bytes:
     return bytes([channel, factor])
 
 
+METER_FUNCTIONS_MAX = 11            # ESP_METER_FUNCTIONS: ids 0..10 on the wire
+
+
+def payload_set_meter_mode(function_id: int) -> bytes:
+    if isinstance(function_id, bool) or not isinstance(function_id, int) \
+            or not 0 <= function_id < METER_FUNCTIONS_MAX:
+        raise ValueError(f"meter function {function_id!r}: 0..{METER_FUNCTIONS_MAX - 1}")
+    return bytes([function_id])
+
+
 @dataclass(frozen=True)
 class ScopeChannel:
     enabled: bool
@@ -683,7 +694,10 @@ def parse_scope_state(payload: bytes) -> ScopeState:
 # later firmware can append sections without a version change.
 DESCRIPTION_VERSION = 1
 DESC_SEC_TIMEBASE, DESC_SEC_RANGES, DESC_SEC_TRIGGER, DESC_SEC_PROBE = 1, 2, 3, 4
-DESC_SEC_IDENTITY = 7       # stage-190; 5 and 6 are kept for the meter and the generator
+DESC_SEC_IDENTITY = 7       # stage-190; 6 is kept for the generator
+DESC_SEC_METER = 5          # stage-272 (sent after section 7)
+DESC_METER_NAME_MAX = 15    # name and unit bytes, as the firmware cuts them
+DESC_METER_UNIT_MAX = 7
 DESC_UID_LEN = 12
 DESC_TEXT_MAX = 31          # target and git revision bytes, as the firmware cuts them
 _DESC_ENTRY = struct.Struct("<IB")          # u32 value, u8 tier
@@ -745,6 +759,30 @@ class Identity:
         return f"{(w1 + w3) & 0xFFFFFFFF:08X}{w2 >> 16:04X}"
 
 
+def meter_key(name: str) -> str:
+    """How a meter function name is matched: case, '-', '_' and spaces ignored
+    ('dc-voltage' == 'DC Voltage')."""
+    return "".join(c for c in str(name).lower() if c not in "-_ \t")
+
+
+@dataclass(frozen=True)
+class MeterFunction:
+    """DESCRIPTION section 5 (stage-272): one meter function of this image."""
+    id: int                         # the SET_METER_MODE argument; METER_FRAME submode
+    usable: bool                    # bench-checked on this image; False = SET_METER_MODE refuses it
+    name: str                       # as the LCD shows it, e.g. "DC Voltage"
+    unit: str                       # e.g. "V", "kOhm"
+
+    @property
+    def key(self) -> str:
+        return meter_key(self.name)
+
+    @property
+    def cli_name(self) -> str:
+        """'DC Voltage' -> 'dc-voltage' (what `openscope set meter` prints)."""
+        return "-".join(self.name.lower().split())
+
+
 @dataclass(frozen=True)
 class Description:
     """The unit's fixed tables, in one request. Volts are at the BNC: the
@@ -758,11 +796,36 @@ class Description:
     probe: Optional[Tuple[int, ...]] = None          # per channel, factor 1|10
     skipped: Tuple[int, ...] = ()                    # section ids this tool does not know
     identity: Optional[Identity] = None              # section 7; None = firmware before stage-190
+    meter_functions: Tuple[MeterFunction, ...] = ()  # section 5; () = firmware before stage-272
 
     @property
     def api_level(self) -> int:
         """0 for firmware without section 7 (remote_protocol.md §9.2)."""
         return self.identity.api_level if self.identity else 0
+
+    def meter_function(self, id_or_name) -> MeterFunction:
+        """By id (int or '6') or by name (meter_key() match). ValueError names
+        the choices, or says the firmware lists none."""
+        if not self.meter_functions:
+            raise ValueError("this firmware does not list meter functions (needs stage-272 "
+                             "firmware, API level 2)")
+        if isinstance(id_or_name, int) and not isinstance(id_or_name, bool):
+            want_id: Optional[int] = id_or_name
+        else:
+            s = str(id_or_name).strip()
+            want_id = int(s) if s.isdigit() else None
+        for f in self.meter_functions:
+            if (f.id == want_id) if want_id is not None else (f.key == meter_key(id_or_name)):
+                return f
+        raise ValueError(f"meter function {id_or_name!r}: one of "
+                         + ", ".join(f.cli_name for f in self.meter_functions))
+
+    def meter_function_name(self, submode: int) -> str:
+        """Name for MeterReading.submode; 'function N' when not listed."""
+        for f in self.meter_functions:
+            if f.id == submode:
+                return f.name
+        return f"function {submode}"
 
     def sample_rate(self, code: int) -> Optional[int]:
         if 0 <= code < len(self.rates) and self.rates[code][0]:
@@ -848,6 +911,33 @@ def _parse_identity(data: bytes) -> Identity:
     return Identity(bytes(data[:DESC_UID_LEN]), level, target, rev)
 
 
+def _parse_meter(data: bytes) -> Tuple[MeterFunction, ...]:
+    if not data:
+        raise ProtocolError("DESCRIPTION meter section is empty")
+    n, pos, out = data[0], 1, []
+
+    def text(what: str) -> str:
+        nonlocal pos
+        if pos >= len(data):
+            raise ProtocolError(f"DESCRIPTION meter section: no {what} length")
+        ln = data[pos]
+        raw = data[pos + 1:pos + 1 + ln]
+        if len(raw) != ln:
+            raise ProtocolError(f"DESCRIPTION meter section: {what} of {ln} B does not fit")
+        pos += 1 + ln
+        return raw.decode("ascii", "replace")
+
+    for _ in range(n):
+        if pos + 2 > len(data):
+            raise ProtocolError(f"DESCRIPTION meter section: {n} functions do not fit in {len(data)} B")
+        fid, usable = data[pos], data[pos + 1]
+        pos += 2
+        name = text("name")
+        unit = text("unit")
+        out.append(MeterFunction(fid, bool(usable), name, unit))
+    return tuple(out)
+
+
 def parse_description(payload: bytes) -> Description:
     if not payload:
         raise ProtocolError("DESCRIPTION is empty")
@@ -892,6 +982,8 @@ def parse_description(payload: bytes) -> Description:
             f["probe"] = tuple(data)
         elif sid == DESC_SEC_IDENTITY:
             f["identity"] = _parse_identity(data)
+        elif sid == DESC_SEC_METER:
+            f["meter_functions"] = _parse_meter(data)
         else:
             skipped.append(sid)
     f["skipped"] = tuple(skipped)
@@ -929,6 +1021,13 @@ def encode_description(d: Description) -> bytes:
         rev = i.git_rev.encode("ascii")[:DESC_TEXT_MAX]
         section(DESC_SEC_IDENTITY, bytes(i.uid) + struct.pack("<H", i.api_level)
                 + bytes([len(tgt)]) + tgt + bytes([len(rev)]) + rev)
+    if d.meter_functions:
+        body = bytearray([len(d.meter_functions)])
+        for m in d.meter_functions:
+            name = m.name.encode("ascii")[:DESC_METER_NAME_MAX]
+            unit = m.unit.encode("ascii")[:DESC_METER_UNIT_MAX]
+            body += bytes([m.id, 1 if m.usable else 0, len(name)]) + name + bytes([len(unit)]) + unit
+        section(DESC_SEC_METER, bytes(body))
     return bytes(out)
 
 
@@ -955,6 +1054,14 @@ NAK_HINTS = {
                  "acquisition task would not pause for); nothing changed, try again",
     "BAD_ARG": "a value is out of range; nothing changed",
     "UNSUPPORTED": "this firmware does not implement the request",
+}
+# A hint that depends on the command (looked up before NAK_HINTS).
+NAK_HINTS_BY_CMD = {
+    (CMD_SET_METER_MODE, "UNSUPPORTED_IN_MODE"):
+        "the unit is not in meter mode (`openscope set mode meter` first); nothing changed",
+    (CMD_SET_METER_MODE, "BAD_ARG"):
+        "this function is not usable on this firmware (not bench-checked; `openscope describe` "
+        "lists the usable ones; the unit's Function key still reaches it); nothing changed",
 }
 
 

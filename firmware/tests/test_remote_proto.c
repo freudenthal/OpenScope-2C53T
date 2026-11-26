@@ -142,10 +142,19 @@ static esp_ctrl_result_t ctl_set_probe(uint8_t ch, uint8_t f)
     probe_calls++; probe_ch_seen = ch; probe_factor_seen = f;
     return ESP_CTRL_OK;
 }
+static int meter_fn_calls;
+static uint8_t meter_fn_seen;
+static esp_ctrl_result_t meter_fn_result;
+static esp_ctrl_result_t ctl_set_meter_function(uint8_t f)
+{
+    meter_fn_calls++; meter_fn_seen = f;
+    return meter_fn_result;
+}
 static const esp_control_ops_t ctl_ops = {
     .get_state = ctl_get_state,
     .get_description = ctl_get_description,
     .set_probe = ctl_set_probe,
+    .set_meter_function = ctl_set_meter_function,
 };
 
 static void desc_defaults(void)
@@ -770,7 +779,7 @@ static void test_description_layout(void)
     CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n) == ESP_RSP_DESCRIPTION, "DESCRIPTION reply");
     /* 239 B of sections 1-4, + 3 + 12 + 2 + (1 + 15) + (1 + 13) of section 7 */
     CHECK(n == 239 + 3 + 12 + 2 + 16 + 14, "286 bytes");
-    CHECK(ESP_DESCRIPTION_LEN == 320, "the largest reply is 320 bytes");
+    CHECK(ESP_DESCRIPTION_LEN == 610, "the largest reply is 610 bytes (stage-272)");
     CHECK(pl[0] == ESP_DESCRIPTION_VERSION, "version byte");
 
     /* walk the sections the way a host does */
@@ -811,14 +820,109 @@ static void test_description_layout(void)
             seen |= 16;
             CHECK(len == 12 + 2 + 16 + 14, "identity len = bytes written");
             CHECK(d[0] == 0xA0 && d[11] == 0xAB, "uid bytes in order");
-            CHECK(rd_u16(d + 12) == ESP_API_LEVEL && ESP_API_LEVEL == 1, "api level 1");
+            CHECK(rd_u16(d + 12) == ESP_API_LEVEL && ESP_API_LEVEL == 2, "api level 2 (stage-272)");
             CHECK(d[14] == 15 && memcmp(d + 15, "guest-coldtrace", 15) == 0, "target");
             CHECK(d[30] == 13 && memcmp(d + 31, "0a1af35-dirty", 13) == 0, "git rev");
         }
         p = d + len;
     }
     CHECK(p == end, "sections end exactly at the payload end");
-    CHECK(seen == 31, "all five sections");
+    CHECK(seen == 31, "all five sections (no section 5: the provider gave no functions)");
+}
+
+/* stage-272: section 5 after section 7; names and units cut; usable is 0/1. */
+static void test_description_meter_section(void)
+{
+    static const char *names[ESP_METER_FUNCTIONS] = {
+        "DC Voltage", "AC Voltage", "DC mA", "DC Current", "AC mA", "AC Current",
+        "Resistance", "Continuity", "Diode", "Capacitance", "Temperature" };
+    static const char *units[ESP_METER_FUNCTIONS] = {
+        "V", "V", "mA", "A", "mA", "A", "kOhm", "Ohm", "V", "nF", "C" };
+    static const uint8_t usable[ESP_METER_FUNCTIONS] = { 1, 7, 0, 0, 0, 0, 1, 1, 1, 0, 0 };
+    uint8_t pl[1024]; uint16_t n = 0, n0 = 0;
+    reset();
+    esp_comm_set_control_provider(&ctl_ops);
+    CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n0) == ESP_RSP_DESCRIPTION, "reply without section 5");
+    fake_desc.meter_n = ESP_METER_FUNCTIONS;
+    for (unsigned i = 0; i < ESP_METER_FUNCTIONS; i++) {
+        fake_desc.meter_name[i] = names[i];
+        fake_desc.meter_unit[i] = units[i];
+        fake_desc.meter_usable[i] = usable[i];
+    }
+    CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n) == ESP_RSP_DESCRIPTION, "reply with section 5");
+    const uint8_t *d = pl + n0;                          /* sections 1-4, 7 unchanged before it */
+    unsigned want = 1;
+    for (unsigned i = 0; i < ESP_METER_FUNCTIONS; i++)
+        want += 4u + (unsigned)strlen(names[i]) + (unsigned)strlen(units[i]);
+    CHECK(d[0] == ESP_DESC_SEC_METER, "section 5 comes after section 7");
+    CHECK(rd_u16(d + 1) == want, "section 5 len = bytes written");
+    CHECK(n == n0 + 3u + want, "reply ends after section 5");
+    CHECK(d[3] == ESP_METER_FUNCTIONS, "n = 11");
+    const uint8_t *e = d + 4;
+    for (unsigned i = 0; i < ESP_METER_FUNCTIONS; i++) {
+        size_t ln = strlen(names[i]), lu = strlen(units[i]);
+        CHECK(e[0] == i, "id = index");
+        CHECK(e[1] == (usable[i] ? 1 : 0), "usable sent as 0/1");
+        CHECK(e[2] == ln && memcmp(e + 3, names[i], ln) == 0, "name");
+        CHECK(e[3 + ln] == lu && memcmp(e + 4 + ln, units[i], lu) == 0, "unit");
+        e += 4 + ln + lu;
+    }
+    CHECK(e == pl + n, "11 entries fill the section");
+
+    /* cut to 15 / 7 bytes; NULL is empty; n above 11 is sent as 11 */
+    fake_desc.meter_n = 200;
+    fake_desc.meter_name[0] = "A very long function name";
+    fake_desc.meter_unit[0] = "kilo-Ohm";
+    fake_desc.meter_name[1] = 0;
+    fake_desc.meter_unit[1] = 0;
+    CHECK(request(ESP_CMD_GET_DESCRIPTION, 0, 0, pl, &n) == ESP_RSP_DESCRIPTION, "reply 3");
+    CHECK(d[3] == ESP_METER_FUNCTIONS, "n capped at 11");
+    e = d + 4;
+    CHECK(e[2] == ESP_DESC_METER_NAME_MAX && memcmp(e + 3, "A very long fun", 15) == 0, "name cut to 15");
+    CHECK(e[18] == ESP_DESC_METER_UNIT_MAX && memcmp(e + 19, "kilo-Oh", 7) == 0, "unit cut to 7");
+    e += 4 + 15 + 7;
+    CHECK(e[0] == 1 && e[2] == 0 && e[3] == 0, "NULL name and unit sent empty");
+    CHECK(ESP_DESC_METER_MAX == 287, "section 5 at most 287 bytes");
+    desc_defaults();
+}
+
+/* stage-272: SET_METER_MODE argument checks; the provider's answers. */
+static void test_set_meter_mode(void)
+{
+    uint8_t pl[16]; uint16_t n = 0; uint8_t f;
+    static const uint8_t two[2] = { 0, 0 };
+    reset();
+    CHECK(request(ESP_CMD_SET_METER_MODE, two, 1, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_UNSUPPORTED,
+          "no provider: UNSUPPORTED");
+    esp_comm_set_control_provider(&ctl_ops);
+    meter_fn_calls = 0; meter_fn_result = ESP_CTRL_OK;
+    for (f = 0; f < ESP_METER_FUNCTIONS; f++) {
+        CHECK(request(ESP_CMD_SET_METER_MODE, &f, 1, pl, &n) == ESP_RSP_ACK, "0..10 reach the provider");
+        CHECK(meter_fn_seen == f, "provider got the function");
+    }
+    CHECK(meter_fn_calls == ESP_METER_FUNCTIONS, "11 calls");
+    {
+        static const uint8_t bad[] = { 11, 12, 20, 0x80, 255 };
+        for (unsigned i = 0; i < sizeof(bad); i++)
+            CHECK(request(ESP_CMD_SET_METER_MODE, &bad[i], 1, pl, &n) == ESP_RSP_NAK &&
+                  pl[0] == ESP_ERR_BAD_ARG, "11 and up: BAD_ARG");
+    }
+    CHECK(request(ESP_CMD_SET_METER_MODE, two, 2, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_BAD_LENGTH,
+          "2 bytes: BAD_LENGTH");
+    CHECK(request(ESP_CMD_SET_METER_MODE, 0, 0, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_BAD_LENGTH,
+          "0 bytes: BAD_LENGTH");
+    CHECK(meter_fn_calls == ESP_METER_FUNCTIONS, "a refused request never reaches the provider");
+    f = 3;
+    meter_fn_result = ESP_CTRL_BAD_ARG;
+    CHECK(request(ESP_CMD_SET_METER_MODE, &f, 1, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_BAD_ARG,
+          "provider BAD_ARG (not usable): NAK BAD_ARG");
+    meter_fn_result = ESP_CTRL_WRONG_MODE;
+    CHECK(request(ESP_CMD_SET_METER_MODE, &f, 1, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_UNSUPPORTED_IN_MODE,
+          "provider WRONG_MODE: UNSUPPORTED_IN_MODE");
+    meter_fn_result = ESP_CTRL_NOT_READY;
+    CHECK(request(ESP_CMD_SET_METER_MODE, &f, 1, pl, &n) == ESP_RSP_NAK && pl[0] == ESP_ERR_NOT_READY,
+          "provider NOT_READY: NOT_READY");
+    meter_fn_result = ESP_CTRL_OK;
 }
 
 /* stage-190: section 7 texts are cut to ESP_DESC_TEXT_MAX; NULL is empty. */
@@ -1306,6 +1410,8 @@ int main(void)
     test_description_identity_texts();
     test_description_refusals();
     test_set_probe();
+    test_description_meter_section();
+    test_set_meter_mode();
     test_scope_state_probe_append();
     test_host_active_clock();
     test_acq_owner_two_requesters();

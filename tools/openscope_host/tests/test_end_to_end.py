@@ -67,6 +67,7 @@ def lib():
         L.shim_set_desc_range.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint32, ctypes.c_int]
         L.shim_set_scope_probe.argtypes = [ctypes.c_int, ctypes.c_int]
         L.shim_set_desc_identity.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+        L.shim_set_desc_meter.argtypes = [ctypes.c_int]
         _LIB = L
     return _LIB
 
@@ -245,6 +246,37 @@ class TestMeter(unittest.TestCase):
                 mock.patch("time.sleep"), redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
             self.assertEqual(cli.main(["meter", "--count", "0"]), 0)
         self.assertIn("1.000 V", out.getvalue())
+
+    def test_finite_count_waits_through_not_ready(self):
+        # stage-272 (G-220): right after a function change the meter reads
+        # NOT_READY for ~1.5-4.5 s; `meter --count N` waits, up to the stale limit.
+        dev = device()
+        calls = {"n": 0}
+        real = dev.meter
+
+        def changing():
+            calls["n"] += 1
+            if calls["n"] <= 3:
+                raise Nak(proto.CMD_GET_METER, 0x07)
+            dev.link.L.shim_set_meter(calls["n"], 1.0, 1000, 3, 1, 0, b"V", b"1.000")
+            return real()
+        dev.meter = changing
+        with mock.patch.object(cli.Device, "open", return_value=dev), mock.patch("time.sleep"), \
+                redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["meter", "--count", "2"]), 0)
+        self.assertEqual(out.getvalue().count("1.000 V"), 2)
+
+        clock = {"t": 1000.0}
+
+        def fake_time():
+            clock["t"] += 1.0
+            return clock["t"]
+        dev2 = device()                                  # never a reading: gives up, exit 2
+        with mock.patch.object(cli.Device, "open", return_value=dev2), mock.patch("time.sleep"), \
+                mock.patch.object(cli, "_now", fake_time), redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(cli.main(["meter", "--count", "1"]), cli.EXIT_DEVICE_ERROR)
+        self.assertIn("NOT_READY", err.getvalue())
 
     def test_outside_meter_mode_is_refused_not_frozen(self):
         dev = device()
@@ -1000,15 +1032,15 @@ class TestDescription(unittest.TestCase):
         self.assertEqual((d.trigger.code(0), d.trigger.code(-100), d.trigger.record_offset), (128, 4, -28))
         self.assertEqual(d.skipped, ())
         # stage-190: section 7 through the firmware encoder
-        self.assertEqual(d.identity, proto.Identity(UNIT1_UID, 1, "guest-coldtrace", "0a1af35-dirty"))
-        self.assertEqual(d.api_level, 1)
+        self.assertEqual(d.identity, proto.Identity(UNIT1_UID, 2, "guest-coldtrace", "0a1af35-dirty"))
+        self.assertEqual(d.api_level, 2)
         self.assertEqual(d.identity.usb_serial, "0B41262E6E00")
 
     def test_identity_texts_cut_and_null_through_the_firmware_encoder(self):
         dev = desc_device()
         dev.link.L.shim_set_desc_identity(UNIT1_UID, b"g" * 40, None)
         i = dev.description(refresh=True).identity
-        self.assertEqual((i.target, i.git_rev, i.api_level), ("g" * 31, "", 1))
+        self.assertEqual((i.target, i.git_rev, i.api_level), ("g" * 31, "", 2))
 
     def test_stage086_host_skips_section_7(self):
         old = old_proto("0a1af35")
@@ -1024,7 +1056,7 @@ class TestDescription(unittest.TestCase):
             self.assertEqual(rc, 0, argv)
             self.assertIn("unit ID   0374920E 6E008000 07CC9420 (USB serial 0B41262E6E00)", out)
             self.assertIn("build     guest-coldtrace at git 0a1af35-dirty", out)
-            self.assertIn("API level 1", out)
+            self.assertIn("API level 2", out)
 
     def test_cli_info_on_firmware_without_description(self):
         dev = desc_device()
@@ -1108,6 +1140,122 @@ class TestDescription(unittest.TestCase):
             self.assertEqual(rc, cli.EXIT_USAGE, argv)
         self.assertEqual(dev.link.L.shim_last_ctrl(0), 6)
         self.assertEqual(dev.link.L.shim_ctrl_calls(), 1)
+
+
+def meter_device(mode=1):
+    """desc_device() with section 5 (the guest-coldtrace list) in `mode`."""
+    dev = desc_device()
+    dev.link.L.shim_set_desc_meter(11)
+    dev.link.L.shim_set_scope_state(mode, 1, 0x10, 0x10, 2, 12490, 0, 0, 0, 0, 0x5A)
+    return dev
+
+
+USABLE = ["DC Voltage", "AC Voltage", "Resistance", "Continuity", "Diode"]
+
+
+class TestMeterFunction(unittest.TestCase):
+    """stage-272 against the real esp_comm.c: SET_METER_MODE and section 5."""
+
+    def test_section_5_through_the_firmware_encoder(self):
+        d = meter_device().description()
+        self.assertEqual(len(d.meter_functions), 11)
+        self.assertEqual([f.id for f in d.meter_functions], list(range(11)))
+        self.assertEqual([f.name for f in d.meter_functions if f.usable], USABLE)
+        self.assertEqual([f.unit for f in d.meter_functions],
+                         ["V", "V", "mA", "A", "mA", "A", "kOhm", "Ohm", "V", "nF", "C"])
+        self.assertEqual(d.skipped, ())
+        self.assertEqual(d.api_level, 2)
+
+    def test_older_hosts_skip_section_5(self):
+        raw = meter_device().request(proto.CMD_GET_DESCRIPTION, expect=(proto.RSP_DESCRIPTION,)).payload
+        d086 = old_proto("0a1af35").parse_description(raw)       # stage-086 library
+        self.assertEqual(d086.skipped, (7, 5))
+        self.assertEqual((d086.sample_rate(0x10), d086.probe), (12490, (10, 1)))
+        d270 = old_proto("c78f889").parse_description(raw)       # stage-270 library (has section 7)
+        self.assertEqual(d270.skipped, (5,))
+        self.assertEqual(d270.identity.api_level, 2)
+
+    def test_set_by_name_or_id_reaches_the_provider(self):
+        dev = meter_device()
+        L = dev.link.L
+        for arg, fid in (("dc-voltage", 0), ("Resistance", 6), ("ac_voltage", 1), (8, 8), ("7", 7)):
+            f = dev.set_meter_function(arg)
+            self.assertEqual(f.id, fid, arg)
+            self.assertEqual([L.shim_last_ctrl(0), L.shim_last_ctrl(1)], [7, fid])
+            self.assertEqual(L.shim_meter_submode(), fid)
+        L.shim_set_meter(9, 0.12, 12, 2, 1, 0, b"Ohm", b"0.12")
+        m = dev.meter()
+        self.assertEqual(dev.description().meter_function_name(m.submode), "Continuity")
+
+    def test_refusals_change_nothing(self):
+        dev = meter_device(mode=0)                                # scope mode
+        L = dev.link.L
+        with self.assertRaises(Nak) as cm:
+            dev.set_meter_function("resistance")
+        self.assertEqual(proto.ERRORS[cm.exception.code], "UNSUPPORTED_IN_MODE")
+        for name in ("capacitance", "dc-ma", "temperature"):     # not usable: refused in any mode
+            for mode in (0, 1):
+                L.shim_set_scope_state(mode, 1, 0x10, 0x10, 2, 12490, 0, 0, 0, 0, 0x5A)
+                with self.assertRaises(Nak) as cm:
+                    dev.set_meter_function(name)
+                self.assertEqual(proto.ERRORS[cm.exception.code], "BAD_ARG", (name, mode))
+        self.assertEqual(L.shim_meter_submode(), 0)
+        calls = L.shim_ctrl_calls()
+        for bad in ("bogus", 11, "voltage"):                       # not listed: nothing sent
+            with self.assertRaises(ValueError):
+                dev.set_meter_function(bad)
+        with self.assertRaises(Nak) as cm:                         # 11 on the wire: esp_comm refuses
+            dev.request(proto.CMD_SET_METER_MODE, b"\x0b")
+        self.assertEqual(proto.ERRORS[cm.exception.code], "BAD_ARG")
+        self.assertEqual(L.shim_ctrl_calls(), calls)               # the provider never saw them
+
+    def test_firmware_without_section_5(self):
+        dev = desc_device()                                        # no section 5
+        with self.assertRaisesRegex(ValueError, "does not list meter functions"):
+            dev.set_meter_function("dc-voltage")
+        self.assertEqual(dev.link.L.shim_ctrl_calls(), 0)
+
+    def test_cli_set_meter(self):
+        dev = meter_device()
+        rc, out, _ = run_cli(dev, ["set", "meter", "dc", "voltage"])
+        self.assertEqual(rc, 0)
+        self.assertIn("meter     DC Voltage (V) requested", out)
+        rc, out, _ = run_cli(dev, ["set", "meter", "Resistance"])
+        self.assertEqual((rc, dev.link.L.shim_meter_submode()), (0, 6))
+        rc, _, err = run_cli(dev, ["set", "meter", "capacitance"])
+        self.assertEqual(rc, cli.EXIT_DEVICE_ERROR)
+        self.assertIn("BAD_ARG: this function is not usable on this firmware", err)
+        calls = dev.link.L.shim_ctrl_calls()
+        for argv in (["set", "meter", "bogus"], ["set", "meter"], ["set", "meter", "11"]):
+            rc, _, err = run_cli(dev, argv)
+            self.assertEqual(rc, cli.EXIT_USAGE, argv)
+        self.assertEqual(dev.link.L.shim_ctrl_calls(), calls)
+        self.assertIn("dc-voltage, ac-voltage", err)                # names the choices
+
+    def test_cli_set_meter_in_scope_mode_exits_2(self):
+        dev = meter_device(mode=0)
+        rc, _, err = run_cli(dev, ["set", "meter", "resistance"])
+        self.assertEqual(rc, cli.EXIT_DEVICE_ERROR)
+        self.assertIn("UNSUPPORTED_IN_MODE: the unit is not in meter mode", err)
+        self.assertEqual(dev.link.L.shim_meter_submode(), 0)
+
+    def test_cli_describe_and_meter_print_the_functions(self):
+        dev = meter_device()
+        rc, out, _ = run_cli(dev, ["describe"])
+        self.assertEqual(rc, 0)
+        rows = [x.split() for x in out.splitlines() if x.startswith("  ") and len(x.split()) == 4
+                and x.split()[2] in ("yes", "no")]
+        self.assertEqual(len(rows), 11)
+        self.assertEqual(rows[6], ["resistance", "kOhm", "yes", "6"])
+        self.assertEqual(rows[9], ["capacitance", "nF", "no", "9"])
+        rc, out, _ = run_cli(desc_device(), ["describe"])    # the shim is one global: reset
+        self.assertIn("meter     functions not reported (firmware before stage-272)", out)
+        dev = meter_device()
+        dev.link.L.shim_set_meter(3, 1.6232, 16232, 4, 1, 0x02, b"V", b"1.6232")
+        dev.set_meter_function("ac-voltage")
+        rc, out, _ = run_cli(dev, ["meter"])
+        self.assertEqual(rc, 0)
+        self.assertIn("1.6232 V   AC Voltage   (normal", out)
 
 
 if __name__ == "__main__":

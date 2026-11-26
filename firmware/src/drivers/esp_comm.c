@@ -599,7 +599,8 @@ static void ctrl_reply(esp_ctrl_result_t r)
     switch (r) {
     case ESP_CTRL_OK:         esp_comm_send_ack(); break;
     case ESP_CTRL_WRONG_MODE: esp_comm_send_nak(ESP_ERR_UNSUPPORTED_IN_MODE); break;
-    default:                  esp_comm_send_nak(ESP_ERR_NOT_READY); break;   /* nothing changed */
+    case ESP_CTRL_BAD_ARG:    esp_comm_send_nak(ESP_ERR_BAD_ARG); break;
+    default:                 esp_comm_send_nak(ESP_ERR_NOT_READY); break;   /* nothing changed */
     }
 }
 
@@ -688,12 +689,12 @@ static uint8_t *put_section(uint8_t *p, uint8_t id, uint16_t len)
     return p + 3;
 }
 
-/* u8 len, then the text without its NUL, cut to ESP_DESC_TEXT_MAX. */
-static uint8_t *put_text(uint8_t *p, const char *s)
+/* u8 len, then the text without its NUL, cut to `max` bytes. */
+static uint8_t *put_text(uint8_t *p, const char *s, uint8_t max)
 {
     uint8_t n = 0;
     if (s)
-        while (n < ESP_DESC_TEXT_MAX && s[n] != '\0')
+        while (n < max && s[n] != '\0')
             n++;
     *p++ = n;
     if (n)
@@ -704,11 +705,11 @@ static uint8_t *put_text(uint8_t *p, const char *s)
 static void handle_get_description(const esp_packet_t *pkt)
 {
     esp_description_t d;
-    /* static: 320 B off the usb_dbg task stack; only that task dispatches
+    /* static: 610 B off the usb_dbg task stack; only that task dispatches
      * frames, and the reply is sent before the next one is parsed. */
     static uint8_t out[ESP_DESCRIPTION_LEN];
     uint8_t *p = out;
-    uint8_t *ident;
+    uint8_t *ident, *meter;
     unsigned i, c;
 
     if (!ctrl_len_ok(pkt, 0, control_ops && control_ops->get_description))
@@ -751,11 +752,39 @@ static void handle_get_description(const esp_packet_t *pkt)
     p = put_section(p, ESP_DESC_SEC_IDENTITY, 0);
     memcpy(p, d.uid, ESP_DESC_UID_LEN); p += ESP_DESC_UID_LEN;
     put_u16(p, ESP_API_LEVEL); p += 2;
-    p = put_text(p, d.build_target);
-    p = put_text(p, d.git_rev);
+    p = put_text(p, d.build_target, ESP_DESC_TEXT_MAX);
+    p = put_text(p, d.git_rev, ESP_DESC_TEXT_MAX);
     put_u16(&ident[1], (uint16_t)(p - ident - 3));
 
+    /* stage-272: meter functions, after section 7 (a host walks by id). */
+    if (d.meter_n) {
+        const uint8_t n = (d.meter_n < ESP_METER_FUNCTIONS) ? d.meter_n : ESP_METER_FUNCTIONS;
+        meter = p;
+        p = put_section(p, ESP_DESC_SEC_METER, 0);
+        *p++ = n;
+        for (i = 0; i < n; i++) {
+            *p++ = (uint8_t)i;
+            *p++ = d.meter_usable[i] ? 1u : 0u;
+            p = put_text(p, d.meter_name[i], ESP_DESC_METER_NAME_MAX);
+            p = put_text(p, d.meter_unit[i], ESP_DESC_METER_UNIT_MAX);
+        }
+        put_u16(&meter[1], (uint16_t)(p - meter - 3));
+    }
+
     esp_comm_send_response(ESP_RSP_DESCRIPTION, out, (uint16_t)(p - out));
+}
+
+/* stage-272: ACK = queued, see esp_comm.h. Usability and mode are the
+ * provider's (it knows the image and the device mode). */
+static void handle_set_meter_mode(const esp_packet_t *pkt)
+{
+    if (!ctrl_len_ok(pkt, 1, control_ops && control_ops->set_meter_function))
+        return;
+    if (pkt->payload[0] >= ESP_METER_FUNCTIONS) {
+        esp_comm_send_nak(ESP_ERR_BAD_ARG);
+        return;
+    }
+    ctrl_reply(control_ops->set_meter_function(pkt->payload[0]));
 }
 
 static void handle_set_probe(const esp_packet_t *pkt)
@@ -1032,6 +1061,7 @@ void esp_comm_process(const esp_packet_t *pkt)
     case ESP_CMD_RUN_STOP:          handle_run_stop(pkt); break;
     case ESP_CMD_GET_DESCRIPTION:   handle_get_description(pkt); break;
     case ESP_CMD_SET_PROBE:         handle_set_probe(pkt); break;
+    case ESP_CMD_SET_METER_MODE:    handle_set_meter_mode(pkt); break;
 #if ESP_COMM_TRANSFER_STUBS
     /* ESP32 co-processor staging. The flash writes are still TODO, so these
      * are compiled only where that is understood (the legacy flow tests). */

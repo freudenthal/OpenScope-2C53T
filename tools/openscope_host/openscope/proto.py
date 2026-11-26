@@ -10,6 +10,7 @@ values inside payloads are little-endian (§3.3).
 """
 from __future__ import annotations
 
+import statistics
 import struct
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -433,11 +434,24 @@ class Waveform:
             out["vpp_volts"] = None
             out["vpp_note"] = (f"range {self.vdiv_idx} has no measured volts/div: "
                                "amplitudes are raw ADC counts")
-        period = estimate_period(body)
+        periods = single_periods(body)
+        period = mean_within_median(periods)
         out["period_samples"] = None if period is None else round(period, 2)
         if period is None:
             out["period_note"] = "no repeating crossings found (flat, noise, or < 2 periods in the record)"
-        elif self.sample_rate_hz:
+        else:
+            # G-240: a record that is not time-ordered may hold a seam, which cuts one
+            # period; the median filter drops it. The value uses the filter either way.
+            out["period_method"] = "time_ordered" if self.time_ordered else "median_filtered"
+            if not self.time_ordered:
+                med = statistics.median(periods)
+                kept = sum(1 for p in periods if abs(p - med) < 0.1 * med)
+                out["period_note"] = (
+                    "record is not time-ordered (it may hold a seam): the period is the mean of "
+                    f"the single periods within 10 % of their median ({kept} of {len(periods)} kept)")
+        if period is None:
+            return out
+        if self.sample_rate_hz:
             out["frequency_hz"] = round(self.sample_rate_hz / period, 3)
             out["frequency_note"] = f"timebase rate {self.timebase_tier} (bench unit #1)"
         else:
@@ -450,15 +464,33 @@ class Waveform:
 
 
 def estimate_period(samples, min_span: int = 4) -> Optional[float]:
-    """Mean period, in samples, between rising crossings of the midpoint, with
+    """Period, in samples, from the rising crossings of the midpoint, with
     hysteresis of a quarter of the span so noise near the level cannot add
-    crossings. Linear interpolation puts each crossing between samples. None
-    when the record is flat (< min_span counts) or holds < 2 full periods."""
-    if len(samples) < 3:
+    crossings. Linear interpolation puts each crossing between samples. The
+    value is the mean of the single periods within 10 % of their median
+    (openscope-bench/capture_stats.py, stage-255): a seam that cuts one period
+    cannot bias it (G-240). None when the record is flat (< min_span counts),
+    holds < 2 full periods, or no period lies near the median."""
+    return mean_within_median(single_periods(samples, min_span))
+
+
+def mean_within_median(periods: List[float]) -> Optional[float]:
+    """Mean of the values within 10 % of their median; None if < 2 values or none."""
+    if len(periods) < 2:
         return None
+    med = statistics.median(periods)
+    good = [p for p in periods if abs(p - med) < 0.1 * med]
+    return sum(good) / len(good) if good else None
+
+
+def single_periods(samples, min_span: int = 4) -> List[float]:
+    """Intervals between successive rising crossings (estimate_period's rule);
+    empty when the record is flat or holds < 2 full periods."""
+    if len(samples) < 3:
+        return []
     lo, hi = min(samples), max(samples)
     if hi - lo < min_span:
-        return None
+        return []
     mid = (lo + hi) / 2.0
     hyst = (hi - lo) / 4.0
     armed = False
@@ -471,8 +503,8 @@ def estimate_period(samples, min_span: int = 4) -> Optional[float]:
             crossings.append(i - 1 + (mid - a) / (b - a))
             armed = False
     if len(crossings) < 3:              # >= 2 full periods
-        return None
-    return (crossings[-1] - crossings[0]) / (len(crossings) - 1)
+        return []
+    return [b - a for a, b in zip(crossings, crossings[1:])]
 
 
 def parse_waveform(payload: bytes) -> Waveform:

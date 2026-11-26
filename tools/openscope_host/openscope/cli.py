@@ -185,10 +185,11 @@ def _wave_line(wf: proto.Waveform) -> str:
         parts.append(f"counts {sm['min_counts']}..{sm['max_counts']} (mean {sm['mean_counts']})")
     if sm.get("vpp_volts") is not None:
         parts.append(f"~{sm['vpp_volts']:.3g} Vpp ({wf.vdiv_tier} gain, uncalibrated)")
+    seam = " (seam-filtered)" if sm.get("period_method") == "median_filtered" else ""
     if sm.get("frequency_hz"):
-        parts.append(f"~{sm['frequency_hz']:.4g} Hz")
+        parts.append(f"~{sm['frequency_hz']:.4g} Hz{seam}")
     elif sm.get("period_samples"):
-        parts.append(f"period {sm['period_samples']} samples")
+        parts.append(f"period {sm['period_samples']} samples{seam}")
     rate = (f"{wf.sample_rate_hz} S/s {wf.timebase_tier}" if wf.sample_rate_hz
             else f"code 0x{wf.timebase_idx:02X}: no trustworthy rate")
     parts.append(rate)

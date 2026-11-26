@@ -223,7 +223,9 @@ def build_server(session: ScopeSession):
         the same capture (same frame_id). Each channel: header (sample rate and volts/div
         only where bench-measured, else null with the reason), a summary (min/max/mean
         counts, approximate Vpp, period and frequency estimate - computed after the
-        record-head defect), and the 1024 raw ADC-count samples. Call again: a new
+        record-head defect; the period is the mean of the single periods within 10 % of
+        their median, and period_method is "median_filtered" when the record is not
+        time-ordered and may hold a seam), and the 1024 raw ADC-count samples. Call again: a new
         frame_id means a new capture. NO_CAPTURE_DATA means the scope has no real capture
         (it never sends its demo trace); UNSUPPORTED_IN_MODE means it is not in scope mode."""
         return expected(lambda: session.waveform(channels))()

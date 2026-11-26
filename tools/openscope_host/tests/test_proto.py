@@ -217,6 +217,53 @@ class TestPeriodEstimate(unittest.TestCase):
         self.assertIsNone(proto.estimate_period([127, 128, 129, 128] * 225), "span below the floor")
         one = [200 if 300 <= i < 600 else 50 for i in range(900)]
         self.assertIsNone(proto.estimate_period(one), "one edge is not a period")
+        two = [200 if (300 <= i < 400 or 500 <= i < 600) else 50 for i in range(900)]
+        self.assertIsNone(proto.estimate_period(two), "two rising crossings: one period")
+
+    # stage-255 (G-240 host side)
+    @staticmethod
+    def seamed_square(cut=10, at=405, n=1024):
+        sq = [200 if (i // 25) % 2 else 50 for i in range(n + cut)]
+        return sq[:at] + sq[at + cut:]          # a seam inside a low phase: one period loses `cut` samples
+
+    def test_seam_cut_period_does_not_bias(self):
+        x = self.seamed_square()
+        self.assertEqual(proto.estimate_period(x), 50.0)
+        p = proto.single_periods(x)
+        self.assertEqual(sum(1 for v in p if abs(v - 50) > 1), 1, "exactly one cut period")
+        # negative control: the stage-250 estimate (last - first) / (n - 1) is biased
+        xs = [i for i in range(1, len(x)) if x[i - 1] < 125 <= x[i]]
+        self.assertGreater(abs((xs[-1] - xs[0]) / (len(xs) - 1) / 50.0 - 1), 0.005)    # 1 %
+
+    def test_small_noisy_sine_with_hysteresis(self):
+        import math
+        import random
+        rnd = random.Random(7)
+        for counts in (10, 20):
+            x = [int(round(128 + counts / 2 * math.sin(2 * math.pi * i / 37.3) + rnd.randint(-1, 1)))
+                 for i in range(900)]
+            self.assertAlmostEqual(proto.estimate_period(x) / 37.3, 1.0, delta=0.01, msg=f"{counts} counts")
+
+    def test_summary_names_the_period_method(self):
+        x = bytes(self.seamed_square())
+        for flags, method in ((proto.WAVE_FLAG_TB_MEASURED, "median_filtered"),
+                              (proto.WAVE_FLAG_TB_MEASURED | proto.WAVE_FLAG_TIME_ORDERED, "time_ordered")):
+            w = proto.Waveform(1, 0, flags, 0x10, 6, len(x), 24, 12500, 0, 32, 0, x)
+            sm = w.summary()
+            self.assertEqual(sm["period_method"], method)
+            self.assertEqual(sm["period_samples"], 50.0)
+            self.assertEqual(sm["frequency_hz"], 250.0)
+            if method == "median_filtered":
+                self.assertIn("not time-ordered", sm["period_note"])
+                self.assertIn("(19 of 20 kept)", sm["period_note"])
+            else:
+                self.assertNotIn("period_note", sm)
+            from openscope import cli
+            self.assertEqual("(seam-filtered)" in cli._wave_line(w), method == "median_filtered")
+        flat = proto.Waveform(1, 0, 0, 0x10, 6, 900, 24, 12500, 0, 32, 0, bytes([128] * 900))
+        sm = flat.summary()
+        self.assertNotIn("period_method", sm)
+        self.assertIn("no repeating crossings", sm["period_note"])
 
 
 class TestButtons(unittest.TestCase):

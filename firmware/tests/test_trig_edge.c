@@ -8,9 +8,15 @@
  * [3] synthetic sweep, sines and squares from 0.2 to 31 periods per record,
  *     both edges, random rotation: never wrong; integer periods (seam
  *     invisible by construction) must be refused, not guessed.
+ * [7] level-crossing seam finder (stage-250, G-240): squares with 1-sample
+ *     edges (about 16 and 40 edges per record), rotated by random k, with
+ *     and without 1 LSB noise: no period cut inside the rotated record and a
+ *     crossing within 12 of index 512; integer periods and a level off the
+ *     signal are refused.
  */
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include "trig_edge.h"
 #include "fixtures/trig_edge_records.h"
@@ -43,6 +49,54 @@ static void synth(uint8_t *rec, double periods, int want, int square, double amp
         if (v > 227) v = 227;
         rec[(n + rot) & 1023u] = (uint8_t)(v + 0.5);
     }
+}
+
+/* [7] A sharp square, time-ordered, trigger crossing at index 512 + dj
+ * (EXP-53: 501..520), then rotated by a random k. 1-sample edges: every edge
+ * is a full step, so the value step and the predictor have nothing to find. */
+static void synth_sq(uint8_t *rec, double per, int rising, int noise, int amp, int dj)
+{
+    uint32_t rot = (uint32_t)(urand() * 1024.0) & 1023u;
+    last_rot = rot;
+    for (int n = 0; n < 1024; n++) {
+        /* phase so the crossing of 128 sits at sample 512 + dj */
+        double ph = (n - 512 - dj) / per;
+        ph -= floor(ph);
+        int hi = rising ? (ph < 0.5) : (ph >= 0.5);
+        int v = 128 + (hi ? amp : -amp);
+        if (noise) v += (int)(urand() * 3.0) - 1;          /* -1, 0, +1 */
+        rec[(n + rot) & 1023u] = (uint8_t)v;
+    }
+}
+
+/* The rotated record r[t] = rec[k + t]: same-direction crossing intervals
+ * inside it (no wrap), and the crossing nearest 512. cut = intervals below
+ * 90 % of the median (the stage-250 cut-period rule). */
+static void judge(const uint8_t *rec, uint32_t k, int *cut, int *trig_ok, int *periods)
+{
+    int xs[2][256], nx[2] = { 0, 0 }, best = 9999;
+    int prev = rec[k & 1023u];
+    for (int t = 1; t < 1024; t++) {
+        int s = rec[(k + (uint32_t)t) & 1023u];
+        int dir = (prev < 128 && s >= 128) ? 0 : (prev > 128 && s <= 128) ? 1 : -1;
+        if (dir >= 0 && nx[dir] < 256) xs[dir][nx[dir]++] = t;
+        if (dir >= 0 && abs(t - 512) < abs(best - 512)) best = t;
+        prev = s;
+    }
+    *cut = 0; *periods = 0;
+    for (int d = 0; d < 2; d++) {
+        int iv[256], n = 0;
+        for (int i = 1; i < nx[d]; i++) iv[n++] = xs[d][i] - xs[d][i - 1];
+        if (n == 0) continue;
+        int srt[256];
+        for (int i = 0; i < n; i++) {
+            int j = i; while (j > 0 && srt[j - 1] > iv[i]) { srt[j] = srt[j - 1]; j--; } srt[j] = iv[i];
+        }
+        int med = srt[n / 2];
+        for (int i = 0; i < n; i++) if (iv[i] * 10 < med * 9) (*cut)++;
+        *periods += n;
+    }
+    *trig_ok = abs(best - 512) <= 12;
 }
 
 int main(void)
@@ -167,6 +221,53 @@ int main(void)
         if (d == 0) s_exact++; else s_bad++;
     }
     CHECK(s_bad == 0 && s_found >= 300, "with a stray sample 0: %d found, %d exact, %d wrong", s_found, s_exact, s_bad);
+
+    printf("[7] level-crossing seam finder (stage-250, G-240)\n");
+    {
+        /* 0x14: 10 Hz at 500 S/s = 50 samples per period (about 40 edges);
+         * 0x13: 125 samples per period (about 16 edges). */
+        const double pers[] = { 50.0, 49.3, 125.0, 37.7 };
+        for (int noise = 0; noise <= 1; noise++) {
+            int tot = 0, other = 0, found = 0, wrong = 0, cut_sum = 0, per_sum = 0;
+            for (int i = 0; i < 2000; i++) {
+                int rising = i & 1;
+                synth_sq(rec, pers[i % 4], rising, noise, 20 + (int)(urand() * 40.0),
+                         (int)(urand() * 20.0) - 10);
+                if (last_rot < 2u) continue;              /* keep sample 0 inside the record */
+                tot++;
+                uint32_t k;
+                if (trig_edge_find_seam_any(rec, &k)) { other++; continue; }
+                if (!trig_edge_find_seam_xing(rec, 128, rising, &k)) continue;
+                found++;
+                int cut, trig_ok, np;
+                judge(rec, k, &cut, &trig_ok, &np);
+                cut_sum += cut; per_sum += np;
+                if (cut || !trig_ok) wrong++;
+            }
+            CHECK(other * 2 < tot, "noise %d: value step and predictor answer few (%d of %d)", noise, other, tot);
+            CHECK(wrong == 0 && cut_sum == 0, "noise %d: %d found, %d wrong, %d cut periods in %d",
+                  noise, found, wrong, cut_sum, per_sum);
+            CHECK(found * 10 >= (tot - other) * 9, "noise %d: finds >= 90%% of the rest (%d of %d)",
+                  noise, found, tot - other);
+        }
+        int refused = 1;
+        for (int i = 0; i < 200; i++) {                   /* 32 or 16 periods: no seam */
+            synth_sq(rec, (i & 1) ? 32.0 : 64.0, i & 2, (i >> 2) & 1, 40, 0);
+            uint32_t k;
+            if (trig_edge_find_seam_xing(rec, 128, -1, &k)) refused = 0;
+        }
+        CHECK(refused, "integer periods (no outlier interval) refused");
+        int off = 1;
+        for (int i = 0; i < 200; i++) {                   /* level above the signal */
+            synth_sq(rec, 50.0, i & 1, 1, 30, 0);
+            uint32_t k;
+            if (trig_edge_find_seam_xing(rec, 200, -1, &k)) off = 0;
+        }
+        CHECK(off, "level off the signal refused");
+        uint32_t k = 777u;
+        for (int i = 0; i < 1024; i++) rec[i] = (uint8_t)(128 + ((i * 37) % 11) - 5);
+        CHECK(!trig_edge_find_seam_xing(rec, 128, -1, &k) && k == 777u, "noise around the level refused, k untouched");
+    }
 
     printf("\n%s\n", fails ? "FAILED" : "all passed");
     return fails ? 1 : 0;

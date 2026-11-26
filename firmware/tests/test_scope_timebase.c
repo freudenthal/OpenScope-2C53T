@@ -7,7 +7,8 @@
  *
  *   1. The table holds the EXP-74 ladder (2026-11-09): every code fold-tested
  *      against a crystal-locked source. A slip back to any superseded figure
- *      fails here.
+ *      fails here. Tier: MEASURED where our own bench agrees within 0.2 %
+ *      (0x0C-0x14, stage-250), PROVISIONAL where it cannot check (0x00-0x0B).
  *   2. Code 0x08 is 5 MS/s. The three kS/s figures once published for it were
  *      read-path artifacts; re-entering any of them fails the build.
  *   3. Out-of-range codes refuse rather than wrap.
@@ -52,8 +53,11 @@ static void test_measured_codes(void)
         CHECK(fabsf(got / exp74[i].fs - 1.0f) < 1e-5f,
               "code 0x%02X: expected %.1f S/s (EXP-74), got %.1f",
               exp74[i].code, (double)exp74[i].fs, (double)got);
-        CHECK(scope_timebase_get_tier(exp74[i].code) == SCOPE_TB_MEASURED,
-              "code 0x%02X should be MEASURED", exp74[i].code);
+        const scope_tb_tier_t want = (exp74[i].code >= 0x0C) ? SCOPE_TB_MEASURED
+                                                             : SCOPE_TB_PROVISIONAL;
+        CHECK(scope_timebase_get_tier(exp74[i].code) == want,
+              "code 0x%02X should be %s", exp74[i].code,
+              want == SCOPE_TB_MEASURED ? "MEASURED" : "PROVISIONAL");
     }
 
     /* 0x14 was fold-tested last, in its own EXP-74 run. */
@@ -118,8 +122,8 @@ static void test_every_code_has_a_rate(void)
     for (uint8_t c = 0; c < SCOPE_TIMEBASE_CODE_COUNT; c++) {
         CHECK(scope_timebase_sample_rate(c) > 0.0f,
               "code 0x%02X has no rate, but every code was measured", c);
-        CHECK(scope_timebase_get_tier(c) == SCOPE_TB_MEASURED,
-              "code 0x%02X should be MEASURED", c);
+        CHECK(scope_timebase_get_tier(c) != SCOPE_TB_NONE,
+              "code 0x%02X has a rate, so it must not be NONE", c);
     }
 }
 
@@ -161,14 +165,14 @@ static void test_derived_quantities(void)
 static void test_labels(void)
 {
     const struct { uint8_t code; const char *want; } lbl[] = {
-        { 0x04, "256ns" },   /* 32 / 125 MS/s */
-        { 0x05, "640ns" },
-        { 0x06, "1.28us" },
-        { 0x07, "2.56us" },
-        { 0x08, "6.40us" },
-        { 0x09, "12.8us" },
-        { 0x0A, "25.6us" },
-        { 0x0B, "64.0us" },
+        { 0x04, "~256ns" },  /* 32 / 125 MS/s; PROVISIONAL on this unit */
+        { 0x05, "~640ns" },
+        { 0x06, "~1.28us" },
+        { 0x07, "~2.56us" },
+        { 0x08, "~6.40us" },
+        { 0x09, "~12.8us" },
+        { 0x0A, "~25.6us" },
+        { 0x0B, "~64.0us" },
         { 0x0C, "128us" },
         { 0x0E, "640us" },
         { 0x0F, "1.28ms" },
@@ -187,9 +191,16 @@ static void test_labels(void)
     scope_timebase_label(0x10, buf, sizeof(buf));
     CHECK(strcmp(buf, "1ms") != 0, "0x10 must not read as the nominal 1ms");
 
-    /* Nothing is provisional any more, so nothing carries the marker. */
-    scope_timebase_label(0x0D, buf, sizeof(buf));
-    CHECK(buf[0] != '~', "0x0D is MEASURED and must not be marked, got \"%s\"", buf);
+    /* 0x0C-0x14 are MEASURED and carry no marker; 0x0B and below do. */
+    for (uint8_t c = 0x0C; c < SCOPE_TIMEBASE_CODE_COUNT; c++) {
+        scope_timebase_label(c, buf, sizeof(buf));
+        CHECK(buf[0] != '~', "0x%02X is MEASURED and must not be marked, got \"%s\"", c, buf);
+    }
+    for (uint8_t c = 0x00; c < 0x0C; c++) {
+        scope_timebase_label(c, buf, sizeof(buf));
+        CHECK(buf[0] == '~', "0x%02X is PROVISIONAL and must be marked, got \"%s\"", c, buf);
+        CHECK(strlen(buf) < 12, "0x%02X label must fit the 12-byte UI buffers", c);
+    }
 
     /* Truncation must be safe. */
     char small[3];

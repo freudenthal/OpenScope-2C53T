@@ -1087,6 +1087,9 @@ static void cmd_status(void)
     );
     usb_debug_printf("acq park: resumes by a non-holder refused %lu\r\n",
                      (unsigned long)fpga_acq_resume_refused_get());   /* stage-230 */
+    usb_debug_printf("acq seam: by level crossings %lu, none found %lu\r\n",
+                     (unsigned long)fpga.acq_seam_xing,
+                     (unsigned long)fpga.acq_seam_none);              /* stage-250 */
     usb_print_last_tx_frame();
     usb_print_recent_tx_frames();
 

@@ -177,6 +177,158 @@ int trig_edge_find_seam_any(const volatile uint8_t *rec, uint32_t *k)
     return trig_edge_find_seam(rec, k) || trig_edge_find_seam_lpc(rec, k);
 }
 
+/* ── Level-crossing seam finder (see trig_edge.h) ────────────────────── */
+#define XING_HYST   3
+#define XING_MAX    128     /* crossings per direction */
+#define XING_MIN    4
+#define XING_SLACK  12      /* EXP-53: trigger at 501..520 */
+
+static uint16_t xing_r[XING_MAX], xing_f[XING_MAX], xing_tmp[XING_MAX];
+
+typedef struct { uint32_t s; uint32_t len; int info; } xing_arc_t;   /* k in s+1 .. s+len */
+
+static uint32_t xing_iv(const uint16_t *x, uint32_t n, uint32_t j)
+{
+    return ((uint32_t)x[(j + 1u) % n] - (uint32_t)x[j]) & MASK;
+}
+
+/* The arc of the outlier intervals of one direction. Returns 0 when the
+ * outliers are not one contiguous run (or more than 2); arc->info = 0 when
+ * there is none. strict: > max(2 samples, 3 %); else > 10 %. */
+static int xing_arc(const uint16_t *x, uint32_t n, int strict, xing_arc_t *arc)
+{
+    for (uint32_t j = 0; j < n; j++) {               /* insertion sort */
+        uint16_t v = (uint16_t)xing_iv(x, n, j);
+        uint32_t i = j;
+        while (i > 0u && xing_tmp[i - 1u] > v) { xing_tmp[i] = xing_tmp[i - 1u]; i--; }
+        xing_tmp[i] = v;
+    }
+    uint32_t med = xing_tmp[n / 2u];
+    uint32_t tol = strict ? (med * 3u + 99u) / 100u : (med * 10u + 99u) / 100u;
+    if (strict && tol < 2u) tol = 2u;
+    uint32_t first = n, cnt = 0;
+    for (uint32_t j = 0; j < n; j++) {
+        uint32_t d = xing_iv(x, n, j);
+        uint32_t dev = d > med ? d - med : med - d;
+        int out = dev > tol;
+        uint32_t jp = (j + n - 1u) % n;
+        uint32_t dp = xing_iv(x, n, jp);
+        uint32_t devp = dp > med ? dp - med : med - dp;
+        if (out) {
+            cnt++;
+            if (!(devp > tol)) {                     /* a run starts at j */
+                if (first != n) return 0;            /* a second run */
+                first = j;
+            }
+        }
+    }
+    arc->info = 0;
+    if (cnt == 0u) return 1;
+    if (cnt > 2u || first == n) return 0;            /* first == n: every one */
+    arc->info = 1;
+    if (cnt == 2u) {
+        /* Two outliers that share a crossing: the seam step itself crosses
+         * the level, so that crossing IS the oldest sample. Any other k would
+         * leave the step inside the record as a false crossing. */
+        arc->s = ((uint32_t)x[(first + 1u) % n] + MASK) & MASK;
+        arc->len = 1;
+    } else {
+        arc->s = x[first];
+        arc->len = xing_iv(x, n, first);
+    }
+    return 1;
+}
+
+static int xing_intersect(const xing_arc_t *a, const xing_arc_t *b, xing_arc_t *r)
+{
+    if (!a->info) { *r = *b; return b->info; }
+    if (!b->info) { *r = *a; return 1; }
+    uint32_t o = (b->s - a->s) & MASK;
+    if (o < a->len) {
+        r->s = b->s;
+        r->len = (b->len < a->len - o) ? b->len : a->len - o;
+    } else {
+        o = (a->s - b->s) & MASK;
+        if (o >= b->len) return 0;
+        r->s = a->s;
+        r->len = (a->len < b->len - o) ? a->len : b->len - o;
+    }
+    r->info = 1;
+    return r->len > 0u;
+}
+
+/* k for crossing list x inside arc r: 2 = inside, 1 = moved in, 0 = none. */
+static int xing_pick(const uint16_t *x, uint32_t n, const xing_arc_t *r, uint32_t *k)
+{
+    int best = 0;
+    uint32_t bk = 0, bd = MASK;
+    for (uint32_t j = 0; j < n; j++) {
+        uint32_t k0 = ((uint32_t)x[j] + N - (uint32_t)TRIG_POS) & MASK;
+        uint32_t o = (k0 - r->s) & MASK;
+        if (o >= 1u && o <= r->len) {
+            if (best == 2) return 0;                 /* two fit: ambiguous */
+            best = 2; bk = k0; bd = 0;
+            continue;
+        }
+        if (best == 2) continue;
+        uint32_t d_lo = (r->s + 1u - k0) & MASK;     /* k0 before the arc */
+        uint32_t d_hi = (k0 - r->s - r->len) & MASK; /* k0 after it */
+        uint32_t d = d_lo < d_hi ? d_lo : d_hi;
+        if (d <= XING_SLACK && d < bd) {
+            best = 1; bd = d;
+            bk = (d == d_lo) ? ((r->s + 1u) & MASK) : ((r->s + r->len) & MASK);
+        }
+    }
+    if (best) *k = bk;
+    return best;
+}
+
+int trig_edge_find_seam_xing(const volatile uint8_t *rec, int c, int prefer, uint32_t *k_out)
+{
+    if (rec == 0 || c < XING_HYST + 1 || c > 255 - XING_HYST - 1)
+        return 0;
+    /* Two passes around the circle: the first only arms the Schmitt state.
+     * Sample 0 is skipped (stray on unit #1, see trig_edge_find_seam). */
+    uint32_t nr = 0, nf = 0;
+    int arm_r = 0, arm_f = 0;
+    for (uint32_t p = 0; p < 2u * N; p++) {
+        uint32_t i = p & MASK;
+        if (i == 0u) continue;
+        int s = (int)rec[i];
+        if (s <= c - XING_HYST) arm_r = 1;
+        if (s >= c + XING_HYST) arm_f = 1;
+        if (arm_r && s >= c) {
+            arm_r = 0; arm_f = (s >= c + XING_HYST);
+            if (p >= N) { if (nr >= XING_MAX) return 0; xing_r[nr++] = (uint16_t)i; }
+        } else if (arm_f && s <= c) {
+            arm_f = 0; arm_r = (s <= c - XING_HYST);
+            if (p >= N) { if (nf >= XING_MAX) return 0; xing_f[nf++] = (uint16_t)i; }
+        }
+    }
+    if (nr < XING_MIN || nf < XING_MIN)
+        return 0;
+    xing_arc_t ar, af, r;
+    int ok = 0;
+    for (int strict = 1; strict >= 0 && !ok; strict--) {
+        if (!xing_arc(xing_r, nr, strict, &ar) || !xing_arc(xing_f, nf, strict, &af))
+            continue;
+        ok = xing_intersect(&ar, &af, &r);
+        if (!ar.info && !af.info) return 0;          /* no seam to undo */
+    }
+    if (!ok)
+        return 0;
+    uint32_t kr = 0, kf = 0;
+    int gr = xing_pick(xing_r, nr, &r, &kr);
+    int gf = xing_pick(xing_f, nf, &r, &kf);
+    int use_r;
+    if (gr == 0 && gf == 0) return 0;
+    if (gr != gf)          use_r = gr > gf;          /* inside beats moved in */
+    else if (prefer >= 0)  use_r = prefer == 1;
+    else                   use_r = 1;
+    *k_out = use_r ? kr : kf;
+    return 1;
+}
+
 int trig_edge_anchor(const volatile uint8_t *rec, int c, int rising)
 {
     if (rec == 0 || c < 4 || c > 251)

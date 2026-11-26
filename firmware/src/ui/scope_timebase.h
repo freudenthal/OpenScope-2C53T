@@ -62,11 +62,13 @@
  *
  * THE TIERS
  * ---------
- *   MEASURED     every code since EXP-74 (2026-11-09): fold-tested against a
- *                crystal-locked divider on the PlutoSky JP5 header (tones
- *                50 MHz / k), worst miss 0.02 bins of 1024 on 0x04-0x14.
- *                0x00-0x03 deliver 125 MS/s on our configuration, like 0x04.
- *   PROVISIONAL  none at present.
+ *   Every code has the EXP-74 rate (2026-11-09): fold-tested against a
+ *   crystal-locked divider on the PlutoSky JP5 header (tones 50 MHz / k),
+ *   worst miss 0.02 bins of 1024 on 0x04-0x14; 0x00-0x03 deliver 125 MS/s
+ *   on that configuration, like 0x04. A second unit agrees within 0.2 % (#84).
+ *   MEASURED     0x0C-0x14: our own bench agrees within 0.2 % (stage-250).
+ *   PROVISIONAL  0x00-0x0B: our bench sources cannot check them; the label
+ *                carries "~".
  *   NONE         none at present; out-of-range codes only.
  *
  * Before EXP-74 the fast codes were NONE: 0x06-0x09 were called INCOHERENT

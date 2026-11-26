@@ -61,6 +61,37 @@ int trig_edge_find_seam_lpc(const volatile uint8_t *rec, uint32_t *k);
 /* Value step first (never off in any test), else linear prediction. */
 int trig_edge_find_seam_any(const volatile uint8_t *rec, uint32_t *k);
 
+/* The seam by the crossings of the trigger level (stage-250, G-240), for a
+ * STROBED record where both finders above refuse: a square with many equal
+ * edges, where the seam step (if any) is no larger than an edge and every
+ * edge defeats the predictor.
+ *
+ * The crossings of `crossing` (record units, = reg 0x08 code - 28) are found
+ * around the circular record (Schmitt, 3 counts, as trig_edge_anchor). For
+ * each direction the intervals between successive crossings are one period
+ * each, except where the seam joins the newest and the oldest sample: there
+ * one interval differs from the median (the seam lies in it), or two that
+ * share a crossing: then the seam step itself crosses the level and that
+ * crossing is the oldest sample. Both directions must agree. An outlier differs from the median by more than 2 samples and
+ * 3 %; if those are not one contiguous run, the test is repeated at the 10 %
+ * of the stage plan. Then the trigger fixes the rotation: k = c - 512 for a
+ * crossing c that puts k in that arc (a k up to 12 outside is moved to the
+ * arc's end: EXP-53 placed the trigger at 501..520). `prefer` = 1 rising,
+ * 0 falling, -1 either: the direction tried first.
+ *
+ * Refused (returns 0, *k untouched): no outlier in either direction (an
+ * integer number of periods: nothing to undo), outliers that are not one
+ * contiguous run, fewer than 4 crossings per direction, more than 128 (fast
+ * signal: the predictor's domain), or no crossing that fits.
+ *
+ * Any k in the arc puts the seam between the record's last and first
+ * crossings, so no period inside the rotated record is cut. Where the arc is
+ * a flat level on both sides, the true pointer inside it is not in the data;
+ * for an either-edge trigger on a symmetric square the edge at 512 can be the
+ * other direction. Uses static buffers: call from one task only. */
+int trig_edge_find_seam_xing(const volatile uint8_t *rec, int crossing, int prefer,
+                             uint32_t *k);
+
 /* The hardware trigger point of a TIME-ORDERED record: the crossing of
  * `crossing` (record units, = reg 0x08 code - 28, EXP-55/56) in the chosen
  * direction nearest index 512, within +/-48 (EXP-53: 501..520). Schmitt-armed

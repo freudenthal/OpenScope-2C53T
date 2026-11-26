@@ -229,13 +229,30 @@ static const float sample_rate[SCOPE_TIMEBASE_CODE_COUNT] = {
  * Conflating the three would be the same error as treating a floating pin and
  * a pin driven low as one thing, which cost this project weeks.
  */
+/*
+ * SUPERSEDED (the block above is history). What #50, #75 and #84 found:
+ *   - 0x06-0x09 were never INCOHERENT. The records were read through
+ *     `spi3 opread` (a /256 burst laps a fast record) or taken as Auto roll
+ *     reads. Read through the acquisition task, Normal records are coherent
+ *     and reproducible on every code (#75 EXP-74; #84 on a second unit).
+ *   - 0x0A-0x0C were limited by the ESP32 source, not by the device.
+ *   - #84: a second unit agrees with the EXP-74 ladder within 0.2 %.
+ *   - In Auto free-run, CH1 and CH2 are two reads (op 0x04, then 0x05) about
+ *     140 us apart: one moment only in Normal, not on fast codes in Auto.
+ *
+ * Tiers on THIS unit (OpenScope-2C53T local stage-250, 2026-11-25). The rates
+ * are the EXP-74 values for every code. A code is MEASURED here only when our
+ * own bench (Pico 1 kHz / 10 Hz, median-filtered period) agrees within 0.2 %:
+ * 0x0C-0x14. Our sources cannot give two periods in a record at 0x00-0x0B,
+ * so those stay PROVISIONAL ("~" label) until a faster source is at the bench.
+ * 0x00-0x03 also carry the open one-channel question (stock: 250 MS/s).
+ */
 static const scope_tb_tier_t tier_by_code[SCOPE_TIMEBASE_CODE_COUNT] = {
-    /* All MEASURED since EXP-74 (2026-11-09). The commentary above this table
-     * is history: what the tiers USED to be and why. EXP-74 superseded every
-     * NONE and PROVISIONAL in it. */
-    SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED,
-    SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED,
-    SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED,
+    /* 0x00-0x0B: EXP-74 rates, not checked on this unit */
+    SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL,
+    SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL,
+    SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL, SCOPE_TB_PROVISIONAL,
+    /* 0x0C-0x14: EXP-74 rates, our bench within 0.2 % (stage-250) */
     SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED,
     SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED, SCOPE_TB_MEASURED,
     SCOPE_TB_MEASURED,

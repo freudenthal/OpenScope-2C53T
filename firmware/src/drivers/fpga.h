@@ -377,6 +377,8 @@ typedef struct {
     volatile uint32_t pc0_last_cyc;        /* DWT cycle count at the last PC0 edge (EXP-52) */
     volatile uint32_t arm_read_cyc;        /* DWT cycle count at the start of the last 0x04 read */
     volatile int32_t  acq_last_rot;        /* rotation L applied to the last committed record, -1 = none */
+    volatile uint32_t acq_seam_xing;       /* stage-250: strobed records whose seam only the level-crossing finder found */
+    volatile uint32_t acq_seam_none;       /* stage-250: strobed records with no seam found (left as read) */
     volatile uint32_t acq_last_lat_us;     /* arming read -> PC0 edge, microseconds, last cycle */
     volatile uint32_t acq_last_latency_ms; /* edge -> commit of the held record, last cycle */
     volatile uint32_t acq_poll_reads;      /* EXP-54: reads that found the rolling buffer (no strobe), total */

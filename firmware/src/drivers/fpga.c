@@ -3744,11 +3744,14 @@ void fpga_acq_gate_set(bool on)       { acq_gate_enable = on; }
 void fpga_acq_rearm_wait_set(uint16_t ms) { acq_rearm_wait_ms = ms; }
 void fpga_acq_auto_wait_set(uint16_t ms)  { acq_auto_wait_ms = ms; }
 /* AUTO edge-wait budget in force. Override if set; else derived from the
- * timebase in force: 4x the 1024-sample fill at that rate (EXP-42: edges per
- * pair saturate by ~3.6x at 0x10), clamped to [compiled 25 ms, 1000 ms] —
- * codes slower than ~0x12 fall back to free-run reads past the cap rather
- * than freezing AUTO for seconds. Unmeasured codes (rate 0) get the compiled
- * value. */
+ * timebase in force: 3x the 1024-sample fill at that rate + 230 ms (EXP-42:
+ * edges per pair saturate by ~3.6x at 0x10), clamped to [compiled 25 ms,
+ * 1000 ms]. Codes with no rate get the compiled value (none since EXP-74).
+ * stage-250 (A-5): the acquisition task counts it from the FIRST POLL after a
+ * handover (handover + fpga_acq_post_edge_get()), not from the handover: at
+ * 0x14 the post-edge wait (2148 ms) is longer than the cap, so every poll
+ * before the next strobe committed the rolling buffer. With no trigger at
+ * all, AUTO at 0x14 shows a free-run record about every 3.1 s. */
 uint16_t fpga_acq_auto_wait_get(void)
 {
     if (acq_auto_wait_ms) return acq_auto_wait_ms;
@@ -3838,6 +3841,11 @@ int16_t fpga_acq_unrotate_offset_get(void)    { return acq_unrotate_offset; }
  * aligns the display). Free-run reads (not strobed) are left alone: the
  * rolling buffer has no trigger at 512 to put anywhere.
  *
+ * stage-250 (G-240): the trigger source channel is searched first (the level
+ * crosses only there), then the other one; when the value step and the
+ * predictor both refuse (a square with many equal edges), the crossings of
+ * the trigger level on the source channel find it (trig_edge_find_seam_xing).
+ *
  * Returns the rotation applied (0..1023), or -1 when none was. */
 static int32_t fpga_acq_unrotate_staging(bool triggered)
 {
@@ -3848,8 +3856,17 @@ static int32_t fpga_acq_unrotate_staging(bool triggered)
     /* Value step first, then linear prediction (fast periodic records whose
      * segments meet at similar values; bench 2026-09-22: 3/10 records at
      * 201 Hz / 0x10 kept an internal break with the value step alone). */
-    if (!trig_edge_find_seam_any(bufs[0], &k) && !trig_edge_find_seam_any(bufs[1], &k))
-        return -1;
+    const int src = acq_trig_src ? 1 : 0;
+    if (!trig_edge_find_seam_any(bufs[src], &k) && !trig_edge_find_seam_any(bufs[1 - src], &k)) {
+        int prefer = acq_edge_filter
+            ? (fpga_stock_trigger_edge_byte() == (uint8_t)TRIG_RISING ? 1 : 0) : -1;
+        if (!trig_edge_find_seam_xing(bufs[src], (int)acq_trig_code + (int)FPGA_ADC_OFFSET,
+                                      prefer, &k)) {
+            fpga.acq_seam_none++;
+            return -1;
+        }
+        fpga.acq_seam_xing++;
+    }
     if (!acq_unrotate) return (int32_t)k;        /* reported (status), not applied */
     if (k == 0) return 0;
     for (int c = 0; c < 2; c++) {
@@ -4305,8 +4322,11 @@ static void fpga_warmtest_acq_task(void *pv)
                 acq_gate_skips++;                /* GATE ON: never show the roll */
                 continue;
             }
-            uint32_t since = acq_auto_live ? (last_read_tick - last_handover_tick)
-                                           : (last_read_tick - last_commit_tick);
+            /* stage-250 (A-5): live budget from the first poll after the
+             * handover, so a slow code's own fill does not spend it. */
+            uint32_t since = acq_auto_live
+                ? (last_read_tick - (last_handover_tick + fpga_acq_post_edge_get()))
+                : (last_read_tick - last_commit_tick);
             bool budget_up = (int32_t)since >= (int32_t)fpga_acq_auto_wait_get();
             if (!(auto_mode && (budget_up || first_read))) {
                 /* NORMAL/SINGLE (or AUTO inside its budget): the rolling

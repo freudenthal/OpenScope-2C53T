@@ -49,8 +49,8 @@ static int failures = 0;
 /* The codes and ranges the tables call MEASURED, stated here independently of
  * the tables so that retiering a row without revisiting these tests shows up
  * as a failure rather than as a silently weaker test. */
-static const uint8_t measured_codes[]  = { 0x04u, 0x06u, 0x08u, 0x0Au, 0x0Du,
-                                           0x0Eu, 0x0Fu, 0x10u };
+static const uint8_t measured_codes[]  = { 0x0Cu, 0x0Du, 0x0Eu, 0x0Fu, 0x10u,
+                                           0x11u, 0x12u, 0x13u, 0x14u };
 static const uint8_t measured_ranges[] = { 5u, 6u, 7u };
 static const uint8_t provisional_ranges[] = { 4u, 8u, 9u };
 
@@ -275,11 +275,12 @@ static void test_provisional_ranges_are_marked(void)
 
 static void test_provisional_timebase_is_marked(void)
 {
-    /* EXP-74 measured every code, so no timebase is PROVISIONAL any more and
-     * none may carry the tilde. (The tilde path itself stays covered by the
-     * provisional voltage ranges above.) 0x0D was the last provisional code. */
+    /* EXP-74 gives every code a rate. On this unit 0x0C-0x14 are MEASURED
+     * (stage-250 bench within 0.2 %); 0x00-0x0B are PROVISIONAL (our sources
+     * cannot check them) and their readouts carry the tilde. */
     for (uint8_t c = 0; c < SCOPE_TIMEBASE_CODE_COUNT; c++)
-        CHECK(scope_timebase_get_tier(c) == SCOPE_TB_MEASURED,
+        CHECK(scope_timebase_get_tier(c) ==
+                  (c >= 0x0Cu ? SCOPE_TB_MEASURED : SCOPE_TB_PROVISIONAL),
               "0x%02X tier changed; update this test with the evidence", c);
 
     const scope_cursor_reading_t r = scope_cursor_delta_t(0x0Du, 100);
@@ -289,9 +290,12 @@ static void test_provisional_timebase_is_marked(void)
     scope_cursor_format(&r, s, sizeof(s));
     CHECK(s[0] != '~', "0x0D must not carry the tilde, got %s", s);
 
-    /* A 125 MS/s interval is written in ns, not rounded to 0us. */
+    /* A 125 MS/s interval is written in ns, not rounded to 0us, and the
+     * provisional tier shows as the tilde. */
     const scope_cursor_reading_t f = scope_cursor_delta_t(0x04u, 10);
+    CHECK(f.confidence == SCOPE_CURSOR_PROVISIONAL, "0x04 must be provisional");
     scope_cursor_format(&f, s, sizeof(s));
+    CHECK(s[0] == '~', "0x04 must carry the tilde, got %s", s);
     CHECK(strstr(s, "80ns") != NULL, "10 samples at 125 MS/s are 80ns, got %s", s);
 }
 

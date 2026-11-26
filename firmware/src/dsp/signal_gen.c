@@ -7,7 +7,7 @@
  */
 
 #include "signal_gen.h"
-#ifndef EMULATOR_BUILD
+#if SIGGEN_HW
 #include "dac_output.h"
 #endif
 
@@ -24,7 +24,7 @@ static bool g_timing_valid = false;
 
 static uint32_t timer_clock(void)
 {
-#ifndef EMULATOR_BUILD
+#if SIGGEN_HW
     return dac_output_timer_clock_hz();
 #else
     return 240000000u;
@@ -39,7 +39,7 @@ static void rebuild(void)
     siggen_wave_build(g_cycle, g_config.waveform, g_config.amplitude_dv,
                       g_config.duty_pct);
     g_cycle_built = true;
-#ifndef EMULATOR_BUILD
+#if SIGGEN_HW
     memcpy(dac_output_get_buffer(), g_cycle, sizeof g_cycle);
 #endif
 }
@@ -51,7 +51,7 @@ static void apply(void)
     g_timing_valid = g_config.output_enabled &&
                      siggen_timing_compute(g_config.frequency_hz,
                                            timer_clock(), &g_timing);
-#ifndef EMULATOR_BUILD
+#if SIGGEN_HW
     if (g_timing_valid)
         dac_output_apply(&g_timing);
     else
@@ -108,8 +108,19 @@ void siggen_set_duty(uint8_t pct)
 
 void siggen_enable(bool enable)
 {
+#if !defined(EMULATOR_BUILD) && !SIGGEN_HW
+    /* guest-coldtrace: inert generator (see signal_gen.h). */
+    (void)enable;
+#else
     g_config.output_enabled = enable;
     apply();
+#endif
+}
+
+void siggen_mode_left(void)
+{
+    if (g_config.output_enabled)
+        siggen_enable(false);
 }
 
 siggen_waveform_t siggen_cycle_waveform(void)

@@ -438,6 +438,8 @@ uint8_t input_handle_button(button_id_t button, QueueHandle_t dq)
             settings_depth = 0;
             settings_sub_selected = 0;
         } else {
+            if (current_mode == MODE_SIGNAL_GEN)
+                siggen_mode_left();               /* stage-280: output off */
             current_mode = (device_mode_t)((current_mode + 1) % MODE_COUNT);
             if (current_mode == MODE_SETTINGS) {
                 settings_selected = 0;

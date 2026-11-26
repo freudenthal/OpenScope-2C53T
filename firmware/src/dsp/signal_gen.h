@@ -6,7 +6,15 @@
  * cycle (0x08029E14), then re-apply the timer (0x08029D40). The math is in
  * siggen_wave.c, the registers in drivers/dac_output.c.
  *
- * Output runs in every mode; nothing outside this module stops it.
+ * Stage-280 policy: the output goes off when the unit leaves generator mode
+ * (siggen_mode_left(), called by every mode change). Stock may keep it on
+ * (fork 4bf87c07: its apply has no mode-switch caller); stage-282 decides.
+ *
+ * SIGGEN_HW: 1 when this build drives the hardware. The warm-handoff family
+ * (guest-coldtrace) keeps the generator inert unless FPGA_SIGGEN_DAC2 is set
+ * (target guest-coldtrace-siggen): no DAC2, TMR7 or DMA2 access, PA5 left as
+ * reset leaves it, and siggen_enable() changes nothing (the UI never claims
+ * ON). The emulator build has no hardware.
  */
 
 #ifndef SIGNAL_GEN_H
@@ -16,6 +24,12 @@
 #include <stdbool.h>
 
 #include "siggen_wave.h"
+
+#if !defined(EMULATOR_BUILD) && (!FPGA_WARM_HANDOFF_TEST || FPGA_SIGGEN_DAC2)
+#define SIGGEN_HW 1
+#else
+#define SIGGEN_HW 0
+#endif
 
 typedef struct {
     uint8_t  waveform;          /* siggen_waveform_t, 0..12 (E59) */
@@ -40,6 +54,9 @@ void siggen_set_waveform(uint8_t wave);        /* ignored if >= 13 */
 void siggen_set_amplitude_dv(uint8_t amp_dv);  /* clamped to 30 */
 void siggen_set_duty(uint8_t pct);             /* clamped to 100 */
 void siggen_enable(bool enable);
+
+/* The unit left generator mode: output off (stage-280). No-op when off. */
+void siggen_mode_left(void);
 
 siggen_waveform_t siggen_cycle_waveform(void);
 uint8_t siggen_amplitude_up(void);     /* +0.1 V, returns new dV */

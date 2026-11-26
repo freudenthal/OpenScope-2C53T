@@ -1106,8 +1106,12 @@ int main(void)
 #ifndef EMULATOR_BUILD
     /* Initialize signal generator and DAC hardware */
     {
+#if SIGGEN_HW
         extern void dac_output_init(void);
         dac_output_init();
+#endif
+        /* guest-coldtrace (SIGGEN_HW 0): no DAC2/TMR7/DMA2 init, PA5 stays
+         * as reset leaves it; the state below is for the LCD only. */
 
         /* Stock factory values (sine, 1 kHz, 3.0 V, 50 %) but output OFF:
          * stock boots with it ON (0x080294A0) and persists the enable;

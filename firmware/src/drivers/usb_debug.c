@@ -4617,6 +4617,7 @@ static void cmd_mode(const char *args)
     }
 
     if (strcmp(args, "scope") == 0) {
+        if (current_mode == MODE_SIGNAL_GEN) siggen_mode_left();   /* stage-280 */
         current_mode = MODE_OSCILLOSCOPE;
         fpga_enter_scope_mode();
         usb_send_str("mode=scope\r\n");
@@ -4671,6 +4672,7 @@ static void cmd_mode(const char *args)
             return;
         }
 
+        if (current_mode == MODE_SIGNAL_GEN) siggen_mode_left();   /* stage-280 */
         current_mode = MODE_MULTIMETER;
         meter_submode = (uint8_t)submode;
         meter_layout = (uint8_t)layout;
@@ -4865,6 +4867,7 @@ static void cmd_meter_autoscan(const char *args)
     }
     wait_budget_ms = (settle_ms < 2500U) ? 2500U : settle_ms;
 
+    if (current_mode == MODE_SIGNAL_GEN) siggen_mode_left();   /* stage-280 */
     current_mode = MODE_MULTIMETER;
     meter_layout = METER_LAYOUT_FULL;
     usb_debug_printf("autoscan settle_ms=%lu wait_budget_ms=%lu candidates=%u\r\n",
@@ -7910,7 +7913,9 @@ static void cmd_spi3_probe(void)
                      (GPIOC->idt & (1 << 6)) ? 1 : 0);
 }
 
+#if defined(FPGA_SIGGEN_DAC2) && FPGA_SIGGEN_DAC2
 /* ── siggen — signal generator state + the registers behind it ─────────
+ * guest-coldtrace-siggen only (stage-280; stage-282 keeps or removes it).
  * Bench check for parity G1/G3/G4: every field the stock SWD session read
  * (TMR7 DIV/PR/CTRL1, DAC CTRL both halves, DMA2 ch4, flex select, PA5
  * mode) printed next to what we asked for, so a GEN-lead -> CH2 capture
@@ -8015,6 +8020,7 @@ static void cmd_siggen(const char *args)
      * handle on the display queue. */
     siggen_print_state();
 }
+#endif /* FPGA_SIGGEN_DAC2 */
 
 /* ═══════════════════════════════════════════════════════════════════
  * Shell command table (2026-08-20; audit item 8.9)
@@ -8143,6 +8149,60 @@ static void cmd_faulttest(const char *args)
                                "display stall, watchdog reset ~10 s later");
 }
 #endif /* FAULT_SELFTEST == 2 */
+
+#if defined(FPGA_SIGGEN_DAC2) && FPGA_SIGGEN_DAC2
+/* ── dac2 — stage-280 bench probe: a static DAC channel 2 level on PA5 ──
+ * guest-coldtrace-siggen only. Stock V1.2.0 drives the generator from DAC2
+ * (data 0x40007414) through DMA2 channel 4 and TMR7 (master init 0x0802C9E2,
+ * apply 0x08029D40). This command checks the jack with a static level before
+ * any generator code depends on it. It writes only the channel-2 half of
+ * DAC_CTRL (bits 16-31), with interrupts masked around the read-modify-write:
+ * scope_trigger.c owns the channel-1 half (CH1 vertical offset, PA4). */
+#define D2_CTRL      (*(volatile uint32_t *)0x40007400)
+#define D2_SWTRG     (*(volatile uint32_t *)0x40007404)
+#define D2_DHR12R2   (*(volatile uint32_t *)0x40007414)
+#define D2_DOR2      (*(volatile uint32_t *)0x40007430)
+
+static void cmd_dac2(const char *args)
+{
+    if (*args == '\0') {
+        usb_debug_printf("dac2: DAC_CTRL=0x%08lx D2DTH12R=%lu D2ODT=%lu\r\n",
+                         (unsigned long)D2_CTRL,
+                         (unsigned long)(D2_DHR12R2 & 0x0FFFu),
+                         (unsigned long)(D2_DOR2 & 0x0FFFu));
+        return;
+    }
+    char *end = NULL;
+    unsigned long code = strtoul(args, &end, 10);
+    if (end == args || code > 4095u) {
+        usb_send_str("Usage: dac2 [0-4095]   (no argument: show DAC2 state)\r\n");
+        return;
+    }
+    crm_periph_clock_enable(CRM_DAC_PERIPH_CLOCK, TRUE);
+    crm_periph_clock_enable(CRM_GPIOA_PERIPH_CLOCK, TRUE);
+    gpio_init_type g;
+    gpio_default_para_init(&g);
+    g.gpio_pins = GPIO_PINS_5;
+    g.gpio_mode = GPIO_MODE_ANALOG;
+    gpio_init(GPIOA, &g);
+
+    /* Channel 2: software trigger (D2TRGSEL = 7, bits 19-21), trigger on
+     * (bit 18), buffer on (bit 17 clear), no wave, no DMA (bit 28 clear),
+     * then D2EN (bit 16) in its own write, as stock enables channel 1. */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t c = D2_CTRL & 0x0000FFFFu;
+    c |= (7u << 19) | (1u << 18);
+    D2_CTRL = c;
+    D2_CTRL = c | (1u << 16);
+    if (!primask) __enable_irq();
+
+    D2_DHR12R2 = (D2_DHR12R2 & 0xFFFFF000u) | (uint32_t)code;
+    D2_SWTRG |= 2u;                       /* channel-2 software trigger */
+    usb_debug_printf("dac2: code %lu, DAC_CTRL=0x%08lx D2ODT=%lu\r\n", code,
+                     (unsigned long)D2_CTRL, (unsigned long)(D2_DOR2 & 0x0FFFu));
+}
+#endif /* FPGA_SIGGEN_DAC2 */
 
 /* ── fwload / fwstat / fwapply — image loading over this shell ──────────
  * The state machine and every flash touch live in fw_loader.c; these
@@ -8563,6 +8623,10 @@ static const shell_cmd_t shell_cmds[] = {
     CMD_A("faulttest", cmd_faulttest, SC_NEEDARGS,
           "faulttest <1-5> [delay_s]       TEST IMAGE: 1 fault 2 stack 3 stall 4 malloc 5 battery\r\n"),
 #endif
+#if defined(FPGA_SIGGEN_DAC2) && FPGA_SIGGEN_DAC2
+    CMD_A("dac2", cmd_dac2, 0,
+          "dac2 [0-4095]                   BENCH: static DAC2 level on PA5 (no arg: state)\r\n"),
+#endif
     CMD_V("usbstat", cmd_usbstat, SC_EXACT,
           "usbstat                         USB CDC health + remote protocol counters (#39)\r\n"),
     CMD_A("usbstat heal", cmd_usbstat_heal, SC_NEEDARGS,
@@ -8600,10 +8664,12 @@ static const shell_cmd_t shell_cmds[] = {
           "mem write <addr> <value>        Write 32-bit word\r\n"),
     CMD_A("trig2", cmd_scope_trig2, SC_NEEDARGS,
           "trig2 raw <0-4095>              Write CH2 ref: TMR13 CH1 PWM-DAC (PA6)\r\n" "trig2 <range> <level>           CH2 vertical-offset ref via the CH1 cal formula\r\n"),
+#if defined(FPGA_SIGGEN_DAC2) && FPGA_SIGGEN_DAC2
     CMD_A("siggen", cmd_siggen, 0,
           "siggen [wave N] [freq HZ] [amp DV] [duty PCT] [on|off] [dump]\r\n"
           "  Signal generator (DAC2/PA5): wave 0..12, freq 0..50000 (0 = off),\r\n"
           "  amp 0..30 = 0.0..3.0 V, duty 0..100; prints TMR7/DAC/DMA2 ch4 state\r\n"),
+#endif
     CMD_A("trig", cmd_scope_trig, SC_NEEDARGS,
           "trig raw <0-4095>               Write DAC1 (PA4) directly + sw trigger\r\n" "trig <range> <level>            Scope trigger DAC: range 0-9, level -100..100\r\n"),
     CMD_V("flash jedec", cmd_flash_jedec, SC_EXACT,

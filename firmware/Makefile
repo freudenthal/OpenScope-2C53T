@@ -763,7 +763,7 @@ $(BUILD_DIR)/test_siggen: tests/test_siggen.c src/dsp/siggen_wave.c src/dsp/sigg
 test-siggen: $(BUILD_DIR)/test_siggen
 	$<
 
-.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-fft-live test-trig-edge test-acq-cfg test-mask-pf test-fuse test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk guest-configA-gap guest-configA-csdummy guest-configA-gapless guest-bringup guest-bringup-bb guest-bringup-bb-slow guest-coldtrace-hwspi guest-coldtrace-usbtask guest-coldtrace-hwspi-usbtask guest-bringup-bb-faithful fpga-alt-header guest-coldtrace-meter guest-coldtrace-faulttest test-bode test-shmem-layout test-siggen
+.PHONY: all clean disasm size renode soak-test soak-quick flash flash-dfu bootloader flash-bootloader flash-all guest guest-warmtest guest-usart-silent emu test-meter-data test-meter-auto test-meter-voltage-wave test-fpga-meter-plan test-stock-meter-literals test-meter test-scope-measure test-scope-cal test-scope-timebase test-scope-freq test-redraw-gate test-fft-live test-trig-edge test-acq-cfg test-mask-pf test-fuse test-config-persist guest-persist guest-caldump guest-coldtrace-slow guest-coldtrace-la guest-debugclk guest-configA-gap guest-configA-csdummy guest-configA-gapless guest-bringup guest-bringup-bb guest-bringup-bb-slow guest-coldtrace-hwspi guest-coldtrace-usbtask guest-coldtrace-hwspi-usbtask guest-bringup-bb-faithful fpga-alt-header guest-coldtrace-meter guest-coldtrace-faulttest guest-coldtrace-siggen test-bode test-shmem-layout test-siggen
 
 # Bode sweep maths (step frequency, gain/phase, -3 dB bandwidth) and
 # bode_init(), which since the 2026-11-11 RAM diet fills a caller-owned result
@@ -1124,6 +1124,14 @@ guest-coldtrace: clean all
 guest-coldtrace-faulttest: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DOPENSCOPE_WATCHDOG=1 -DFAULT_SELFTEST=2
 guest-coldtrace-faulttest: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace-faulttest: clean all
+
+# Stage-280 (2026-11-26): guest-coldtrace plus the signal generator on DAC
+# channel 2 (PA5), as stock V1.2.0 (DMA2 channel 4, TMR7). FPGA_SIGGEN_DAC2=1
+# also adds the bench shell commands `dac2` and `siggen`. guest-coldtrace keeps
+# the inert generator until stage-282 folds this in.
+guest-coldtrace-siggen: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_METER_SUBMODES=1 -DOPENSCOPE_WATCHDOG=1 -DOPENSCOPE_NO_RTT=1 -DFPGA_SIGGEN_DAC2=1
+guest-coldtrace-siggen: LDSCRIPT = ld/at32f403a_guest.ld
+guest-coldtrace-siggen: clean all
 
 # [M1 2026-09-04] guest-coldtrace-meter — coldtrace plus reachable meter submodes.
 #

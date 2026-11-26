@@ -6947,10 +6947,11 @@ void fpga_enter_scope_mode(void)
 #endif
     if (!fpga.initialized) return;
 
-    /* The signal generator keeps running: it is on DAC2/PA5, clear of the
-     * scope's DAC1, and stock never stops it on a mode change (its apply
-     * 0x08029D40 has no mode-switch caller; the manual has you leave it
-     * running and look at it in scope mode). */
+    /* The signal generator is on DAC2/PA5, clear of the scope's DAC1, so
+     * nothing here stops it. Stage-280: the caller that leaves generator
+     * mode turns the output off (siggen_mode_left()). Fork 4bf87c07 reads
+     * stock as keeping it on (its apply 0x08029D40 has no mode-switch
+     * caller); stage-282 decides. */
 
     fpga_stock_diag_seed_base2();
     fpga_scope_reinit();
@@ -7202,10 +7203,11 @@ void fpga_set_meter_mode(uint8_t submode)
 #endif
     if (!fpga.initialized) return;
 
-    /* The signal generator keeps running: it is on DAC2/PA5, clear of the
-     * scope's DAC1, and stock never stops it on a mode change (its apply
-     * 0x08029D40 has no mode-switch caller; the manual has you leave it
-     * running and look at it in scope mode). */
+    /* The signal generator is on DAC2/PA5, clear of the scope's DAC1, so
+     * nothing here stops it. Stage-280: the caller that leaves generator
+     * mode turns the output off (siggen_mode_left()). Fork 4bf87c07 reads
+     * stock as keeping it on (its apply 0x08029D40 has no mode-switch
+     * caller); stage-282 decides. */
 
     fpga_apply_meter_transition(submode, false);
 }

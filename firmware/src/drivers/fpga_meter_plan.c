@@ -425,3 +425,31 @@ bool fpga_meter_rx_frame_should_parse(bool transition_busy,
     }
     return true;
 }
+
+bool fpga_meter_digits_show_auto(uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3)
+{
+    return d0 == 0x0AU && d1 == 0x0BU && d2 == 0x0CU && d3 == 0x0DU;
+}
+
+void fpga_meter_auto_recover_frame(fpga_meter_auto_recover_t *s, bool shows_auto)
+{
+    if (!shows_auto) {
+        s->auto_run = 0;
+    } else if (s->auto_run < 0xFFFFU) {
+        s->auto_run++;
+    }
+}
+
+bool fpga_meter_auto_recover_due(fpga_meter_auto_recover_t *s, uint32_t now_ms)
+{
+    if (s->auto_run < FPGA_METER_AUTO_RUN_FRAMES) {
+        return false;
+    }
+    if (s->resent && (uint32_t)(now_ms - s->last_resend_ms) < FPGA_METER_AUTO_RESEND_MS) {
+        return false;
+    }
+    s->resent = true;
+    s->last_resend_ms = now_ms;
+    s->resends++;
+    return true;
+}

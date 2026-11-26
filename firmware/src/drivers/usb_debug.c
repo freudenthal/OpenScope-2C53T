@@ -4763,6 +4763,15 @@ static void cmd_meter_dump(const char *args)
     usb_debug_printf("transition_discard_remaining=%u transition_frame_skips=%lu\r\n",
                      (unsigned)meter_frame_discard_count,
                      meter_transition_frame_skip_count);
+    {
+        bool bz_started = false, bz_active = false;
+        uint32_t bz_toggles = 0, bz_fail = 0;
+        continuity_buzzer_snapshot(&bz_started, &bz_active, &bz_toggles, &bz_fail);
+        usb_debug_printf("auto_run=%u auto_resends=%lu buzzer_active=%u buzzer_toggles=%lu\r\n",
+                         (unsigned)fpga_meter_auto_recover.auto_run,
+                         (unsigned long)fpga_meter_auto_recover.resends,
+                         bz_active ? 1U : 0U, (unsigned long)bz_toggles);
+    }
     usb_debug_printf("bcd_value=%d decimal_pos=%u negative=%u unit_variant=%u bar_i100=%ld aux_freq_i10=%ld\r\n",
                      snap.bcd_value,
                      (unsigned)snap.decimal_pos,

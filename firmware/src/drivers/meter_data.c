@@ -234,8 +234,9 @@ static void meter_clear_payload(meter_reading_t *r)
  * the equivalent, extracted by simulating the stock lookup for all 256
  * input values against the V1.2.0 firmware binary.
  *
- * Output codes: 0-9 = BCD digits, 0x0A = OL_hi, 0x0B = OL_lo,
- *   0x0C/0x0D/0x0E/0x0F = special, 0x10 = blank, 0x11 = partial,
+ * Output codes: 0-9 = BCD digits; 0x0A 0x0B 0x0C 0x0D = the glyphs A, U,
+ *   t, o (the SoC's "Auto" function with no input, stage-270 M-1; not
+ *   "OL"); 0x0E = L, 0x0F = special, 0x10 = blank, 0x11 = partial,
  *   0x12 = continuity, 0x13 = mode change, 0x14 = special,
  *   0xFF = invalid/unmapped.
  *
@@ -1564,6 +1565,16 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
         return;
     }
 
+    /* M-2 (stage-270): "Auto" (A U t o) is the SoC's own Auto function with
+     * nothing on the leads. Not a reading, and never "OL", although its first
+     * two codes are the 0x0A 0x0B of the OL test below. fpga.c counts these
+     * frames and sends the function selector again (M-1). */
+    if (fpga_meter_digits_show_auto(digit0, digit1, digit2, digit3)) {
+        r->reject_reason = METER_REJECT_METER_AUTO;
+        METER_REJECT_FRAME();
+        return;
+    }
+
     if (frame_has_zero_detect_status(frame) &&
         submode_accepts_zero_detect_short(submode) &&
         !frame_has_voltage_payload_marker(frame) &&
@@ -1591,8 +1602,11 @@ void meter_data_process_frame(const volatile uint8_t *frame, uint8_t submode)
 
     /* Overload: "OL", and the SoC's other spelling " 0L " (blank, 0, L,
      * blank) -- what resistance shows on open probes, continuity above its
-     * threshold and diode above its range (units #1 and #2). */
-    if ((digit0 == 0x0A && digit1 == 0x0B) ||
+     * threshold and diode above its range (units #1 and #2). The 0x0A 0x0B
+     * form is checked on all four codes: 0A 0B 0C 0D ("Auto") is refused
+     * above, so it never gets here. */
+    if ((digit0 == 0x0A && digit1 == 0x0B &&
+         !(digit2 == 0x0C && digit3 == 0x0D)) ||
         (digit0 == 0x10 && digit1 == 0x00 && digit2 == 0x0E && digit3 == 0x10)) {
         meter_clear_payload(r);
         r->result_class = METER_RESULT_OVERLOAD;

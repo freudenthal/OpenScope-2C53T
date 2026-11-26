@@ -2615,6 +2615,9 @@ static void fpga_usart_rx_task(void *pv)
         meter_data_set_function_confirmed(fpga.meter_soc_wake_ms != 0xFFFFu &&
                                           fpga.meter_selector_confirmed != 0U);
         meter_data_process_frame(event.frame, parse_submode);
+        fpga_meter_auto_recover_frame(&fpga_meter_auto_recover,
+                                      meter_reading.reject_reason ==
+                                          METER_REJECT_METER_AUTO);
 
         /*
          * Range feedback is intentionally not driven from the parsed number.
@@ -2697,6 +2700,10 @@ static void fpga_send_meter_poll_sequence(uint8_t submode)
 static TaskHandle_t       meter_poll_handle;
 static volatile int16_t   meter_mode_request = -1;
 
+/* M-1 (stage-270): "Auto" frames in a row (counted by the RX task) and the
+ * selector resends (sent by the poll task). See fpga_meter_plan.h. */
+fpga_meter_auto_recover_t fpga_meter_auto_recover;
+
 void fpga_request_meter_mode(uint8_t submode)
 {
 #if FPGA_WARM_HANDOFF_TEST && !FPGA_METER_SUBMODES
@@ -2747,6 +2754,22 @@ static void fpga_meter_poll_task(void *pv)
                 else                        usart2_send_cmd_ex(0x05, 0x0A, false);
                 vTaskDelay(pdMS_TO_TICKS(10));
                 usart2_send_cmd_ex(0x05, 0x14, false);  vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (fpga_meter_auto_recover_due(&fpga_meter_auto_recover,
+                                            (uint32_t)(xTaskGetTickCount() *
+                                                       portTICK_PERIOD_MS))) {
+#if FPGA_METER_SUBMODES
+                /* The normal transition: selector with echo check, frontend. */
+                fpga_set_meter_mode(meter_submode);
+                if (current_mode != MODE_MULTIMETER)
+                    fpga_set_meter_mux(false);
+                continue;
+#else
+                /* No transitions in this build: the frontend is DC V, so send
+                 * the obeyed DC V selector only. */
+                fpga_wire_send_word(
+                    fpga_meter_transition_plan_for_submode(0).selector_word, 0);
+#endif
             }
             fpga_send_meter_poll_sequence(meter_submode);
         }

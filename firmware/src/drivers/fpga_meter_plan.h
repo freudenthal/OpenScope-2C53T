@@ -104,4 +104,28 @@ bool fpga_meter_rx_frame_should_parse(bool transition_busy,
                                       volatile uint8_t *discard_count,
                                       volatile uint32_t *transition_skip_count);
 
+/*
+ * M-1 (stage-270): the meter SoC wakes in its own Auto function (word 0x0514)
+ * at every meter entry. In Auto it measures a signal it can detect (3.3 V DC
+ * reads 3.256 V), but with no input it shows the glyphs A, U, t, o: segment
+ * codes 0x0A 0x0B 0x0C 0x0D, `---` on the screen (bench unit #1, 2026-11-25,
+ * V lead open; the DC V word 0x050C then reads -0.0003 V at once). After
+ * FPGA_METER_AUTO_RUN_FRAMES such frames in a row the firmware sends the
+ * function selector again, at most once per FPGA_METER_AUTO_RESEND_MS.
+ */
+#define FPGA_METER_AUTO_RUN_FRAMES  8u
+#define FPGA_METER_AUTO_RESEND_MS   3000u
+
+typedef struct {
+    uint16_t auto_run;        /* Auto frames in a row; 0 after any other frame */
+    bool     resent;          /* last_resend_ms is valid */
+    uint32_t last_resend_ms;
+    uint32_t resends;         /* total, for `meter dump` */
+} fpga_meter_auto_recover_t;
+
+bool fpga_meter_digits_show_auto(uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3);
+void fpga_meter_auto_recover_frame(fpga_meter_auto_recover_t *s, bool shows_auto);
+/* True when the caller must send the selector now; records the resend. */
+bool fpga_meter_auto_recover_due(fpga_meter_auto_recover_t *s, uint32_t now_ms);
+
 #endif /* FPGA_METER_PLAN_H */

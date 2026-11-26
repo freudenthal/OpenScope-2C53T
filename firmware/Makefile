@@ -1096,7 +1096,9 @@ guest-coldtrace-usart: clean all
 
 # stage-177 (O-8): -DOPENSCOPE_NO_RTT=1 compiles RTT out (rtt.c stubs). RDP is
 # set on the unit, so RTT can never be read; the image keeps 1,224 B of RAM.
-guest-coldtrace: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DOPENSCOPE_WATCHDOG=1 -DOPENSCOPE_NO_RTT=1
+# stage-270: -DFPGA_METER_SUBMODES=1 (every meter function; the acceptance test
+# in the guest-coldtrace-meter comment below passed on unit #1, 2026-11-25).
+guest-coldtrace: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_METER_SUBMODES=1 -DOPENSCOPE_WATCHDOG=1 -DOPENSCOPE_NO_RTT=1
 guest-coldtrace: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace: clean all
 
@@ -1130,7 +1132,12 @@ guest-coldtrace-faulttest: clean all
 #   3. mode meter 6, `gpio scan` diff vs step 2 NON-EMPTY    <- the actual fix
 #   4. mode scope, SPI3 OK still climbing, trace still right <- the regression
 # Step 4 is the one that decides whether this ships.
-guest-coldtrace-meter: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_METER_SUBMODES=1 -DOPENSCOPE_WATCHDOG=1
+#
+# stage-270 (2026-11-25, unit #1): steps 1-4 PASS, and 10 of 10 meter -> scope
+# round trips kept SPI3 OK climbing and CH1 1 kHz within 2 %. The flag is now
+# in guest-coldtrace; this name stays for the same flags (same code, its own
+# OPENSCOPE_BUILD_TARGET string), so old notes and scripts still build.
+guest-coldtrace-meter: CFLAGS += -DGUEST_BUILD -DFPGA_WARM_HANDOFF_TEST=1 -DFPGA_USART_SILENT_SCOPE=1 -DFPGA_CONFIG_B=1 -DFPGA_CONFIG_B_ARM=1 -DFPGA_METER_SUBMODES=1 -DOPENSCOPE_WATCHDOG=1 -DOPENSCOPE_NO_RTT=1
 guest-coldtrace-meter: LDSCRIPT = ld/at32f403a_guest.ld
 guest-coldtrace-meter: clean all
 

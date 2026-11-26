@@ -37,6 +37,7 @@ typedef enum {
     METER_REJECT_MISSING_AC_EVIDENCE = 3,
     METER_REJECT_UNRESOLVED_CALIBRATION = 4,
     METER_REJECT_UNSUPPORTED_EXTENSION = 5,
+    METER_REJECT_METER_AUTO = 6,          /* SoC shows "Auto" (A U t o): not ready */
 } meter_reject_reason_t;
 
 /* ═══════════════════════════════════════════════════════════════════

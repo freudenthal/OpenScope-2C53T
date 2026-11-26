@@ -1153,6 +1153,8 @@ typedef struct { uint16_t dt_ms; uint8_t polls; uint8_t edges; } fpga_holdlog_en
 /* Ask the meter poll task to switch the meter chip to `submode` (returns at
  * once; the newest request wins). fpga_set_meter_mode() is the blocking form. */
 void     fpga_request_meter_mode(uint8_t submode);
+/* M-1 (stage-270): Auto-frame run and selector resend count (`meter dump`). */
+extern fpga_meter_auto_recover_t fpga_meter_auto_recover;
 bool     fpga_holdlog_start(void);
 void     fpga_holdlog_stop(void);
 bool     fpga_holdlog_active(void);

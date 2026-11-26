@@ -36,7 +36,12 @@ static bool continuity_short_active(TickType_t now)
     static TickType_t short_latch_until_tick;
     meter_reading_t reading;
 
-    if (meter_submode != 7 || !meter_data_snapshot(&reading) ||
+    /* Meter mode only (stage-270): after a continuity visit the last reading
+     * stays a valid "short" (no frames are decoded outside meter mode), and
+     * meter_submode stays 7, so without this the scope screen beeped without
+     * end (bench unit #1, 2026-11-25, shorted leads, then `mode scope`). */
+    if (current_mode != MODE_MULTIMETER ||
+        meter_submode != 7 || !meter_data_snapshot(&reading) ||
         !reading.valid || reading.submode != 7) {
         short_latch_until_tick = 0;
         return false;

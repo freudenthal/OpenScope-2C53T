@@ -763,6 +763,38 @@ static void test_every_submode_transition_drains_before_accepting_frames(void)
     }
 }
 
+/* M-1 (stage-270): 8 "Auto" frames in a row, then a resend at most once per
+ * 3 s; any other frame restarts the count. */
+static void test_auto_recover_counts_frames_and_limits_resends(void)
+{
+    fpga_meter_auto_recover_t s = {0};
+    uint32_t t = 0xFFFFF000u;                         /* tick wrap inside the test */
+
+    EXPECT_EQ_U8("auto digits", fpga_meter_digits_show_auto(0x0A, 0x0B, 0x0C, 0x0D), 1);
+    EXPECT_EQ_U8("OL is not auto", fpga_meter_digits_show_auto(0x0A, 0x0B, 0x00, 0x00), 0);
+    EXPECT_EQ_U8("digits are not auto", fpga_meter_digits_show_auto(3, 2, 5, 6), 0);
+
+    for (int i = 0; i < 7; i++) fpga_meter_auto_recover_frame(&s, true);
+    EXPECT_EQ_U8("7 frames: not due", fpga_meter_auto_recover_due(&s, t), 0);
+    fpga_meter_auto_recover_frame(&s, false);         /* a reading: count restarts */
+    EXPECT_EQ_U16("run reset", s.auto_run, 0);
+    for (int i = 0; i < 7; i++) fpga_meter_auto_recover_frame(&s, true);
+    EXPECT_EQ_U8("7 after reset: not due", fpga_meter_auto_recover_due(&s, t), 0);
+    fpga_meter_auto_recover_frame(&s, true);
+    EXPECT_EQ_U8("8 frames: due", fpga_meter_auto_recover_due(&s, t), 1);
+    EXPECT_EQ_U16("1 resend", (uint16_t)s.resends, 1);
+    fpga_meter_auto_recover_frame(&s, true);
+    EXPECT_EQ_U8("same tick: not due", fpga_meter_auto_recover_due(&s, t), 0);
+    EXPECT_EQ_U8("2999 ms: not due", fpga_meter_auto_recover_due(&s, t + 2999u), 0);
+    EXPECT_EQ_U8("3000 ms (across the wrap): due",
+                 fpga_meter_auto_recover_due(&s, t + 3000u), 1);
+    EXPECT_EQ_U16("2 resends", (uint16_t)s.resends, 2);
+    fpga_meter_auto_recover_frame(&s, false);
+    EXPECT_EQ_U8("after a reading: not due", fpga_meter_auto_recover_due(&s, t + 9000u), 0);
+    for (int i = 0; i < 0x10010; i++) fpga_meter_auto_recover_frame(&s, true);
+    EXPECT_EQ_U16("run saturates", s.auto_run, 0xFFFF);
+}
+
 int main(void)
 {
     test_measured_word_map_is_one_distinct_word_per_submode();
@@ -782,6 +814,7 @@ int main(void)
     test_fallbacks();
     test_rx_frame_gate_preserves_discard_budget_while_busy();
     test_every_submode_transition_drains_before_accepting_frames();
+    test_auto_recover_counts_frames_and_limits_resends();
 
     if (failures) {
         printf("%d fpga meter plan test(s) failed\n", failures);

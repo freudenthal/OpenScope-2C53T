@@ -2190,6 +2190,47 @@ static int test_special_frames_clear_stale_aux_frequency(void)
     return 1;
 }
 
+/* M-2 (stage-270): the SoC's "Auto" glyphs A U t o (0A 0B 0C 0D). The frame
+ * is the real one from bench unit #1 (2026-11-25, V lead open, SoC in Auto);
+ * the old code read it as reject 1 in DCV and as "OL" in resistance. */
+static const uint8_t soc_auto_frame[12] = {
+    0x5A, 0xA5, 0xE4, 0x2E, 0x63, 0x25, 0x07, 0x00, 0x00, 0x00, 0x01, 0x10
+};
+
+static int test_soc_auto_glyphs_are_not_ready_in_every_function(void)
+{
+    uint8_t frame[12];
+
+    for (uint8_t submode = 0; submode < 11; submode++) {
+        meter_data_init();
+        memcpy(frame, soc_auto_frame, sizeof(frame));
+        process_frame(frame, submode);
+        ASSERT(meter_reading.dbg_raw_digits[0] == 0x0A);
+        ASSERT(meter_reading.dbg_raw_digits[3] == 0x0D);
+        ASSERT(meter_reading.reject_reason == METER_REJECT_METER_AUTO);
+        ASSERT(meter_reading.result_class != METER_RESULT_OVERLOAD);
+        ASSERT(!meter_reading.valid);
+        ASSERT(strcmp(meter_reading.display_str, "OL") != 0);
+    }
+    return 1;
+}
+
+static int test_ol_test_reads_all_four_codes(void)
+{
+    uint8_t overload[12];
+    uint8_t frame[12];
+
+    build_segment_frame(overload, 0x0A, 0x0B, 0, 0, 0x00, 0x00, 0x00, 0x00, 0);
+    meter_data_init();
+    memcpy(frame, soc_auto_frame, sizeof(frame));
+    process_frame(frame, 6);                         /* resistance, SoC in Auto */
+    ASSERT(meter_reading.reject_reason == METER_REJECT_METER_AUTO);
+    process_frame(overload, 6);                      /* OL still reads OL */
+    ASSERT(meter_reading.result_class == METER_RESULT_OVERLOAD);
+    ASSERT_STR_EQ(meter_reading.display_str, "OL");
+    return 1;
+}
+
 static int test_special_frames_clear_stale_payload_fields(void)
 {
     uint8_t normal[12];
@@ -3241,6 +3282,8 @@ int main(void)
     TEST(snapshot_returns_coherent_latest_completed_reading);
     TEST(snapshot_rejects_concurrent_two_writer_window);
     TEST(continuity_threshold_rule);
+    TEST(soc_auto_glyphs_are_not_ready_in_every_function);
+    TEST(ol_test_reads_all_four_codes);
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;
